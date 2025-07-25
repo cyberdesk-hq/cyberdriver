@@ -28,9 +28,10 @@ jobs:
     
     - name: Get version from code
       id: version
+      shell: bash
       run: |
-        $version = python -c "import re; content = open('cyberdriver.py').read(); print(re.search(r'VERSION = \"(.+?)\"', content).group(1))"
-        echo "version=$version" >> $env:GITHUB_OUTPUT
+        VERSION=$(python -c "import re; content = open('cyberdriver.py').read(); print(re.search(r'VERSION = \"(.+?)\"', content).group(1))")
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
     
     - name: Create Release
       id: create_release
