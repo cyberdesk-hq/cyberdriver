@@ -1,0 +1,121 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'  # Trigger on version tags like v0.1.0, v1.0.0, etc.
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+        include:
+          - os: windows-latest
+            artifact_name: cyberdriver.exe
+            asset_name: cyberdriver-windows.exe
+          - os: macos-latest
+            artifact_name: cyberdriver
+            asset_name: cyberdriver-macos
+
+    runs-on: ${{ matrix.os }}
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+    
+    - name: Build executable
+      run: |
+        pyinstaller cyberdriver.spec
+    
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: ${{ matrix.asset_name }}
+        path: dist/${{ matrix.artifact_name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+      with:
+        path: ./artifacts
+    
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Cyberdriver ${{ github.ref_name }}
+        draft: false
+        prerelease: false
+        body: |
+          ## Cyberdriver ${{ github.ref_name }}
+          
+          A comprehensive remote computer control tool.
+          
+          ### 📥 Downloads
+          - **Windows**: `cyberdriver-windows.exe`
+          - **macOS**: `cyberdriver-macos`
+          
+          ### 🚀 Installation
+          
+          #### Windows
+          1. Download `cyberdriver-windows.exe`
+          2. Run from Command Prompt or PowerShell:
+             ```
+             cyberdriver-windows.exe --help
+             ```
+          
+          #### macOS
+          1. Download `cyberdriver-macos`
+          2. Make executable: `chmod +x cyberdriver-macos`
+          3. Run: `./cyberdriver-macos --help`
+          
+          ### 📖 Usage
+          ```bash
+          # Start local server
+          ./cyberdriver start --port 3000
+          
+          # Join remote control server
+          ./cyberdriver join --secret YOUR_API_KEY --host api.cyberdesk.io
+          ```
+          
+          See the [README](https://github.com/${{ github.repository }}/blob/main/README.md) for more information.
+    
+    - name: Upload Windows Release Asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./artifacts/cyberdriver-windows.exe/cyberdriver.exe
+        asset_name: cyberdriver-windows.exe
+        asset_content_type: application/octet-stream
+    
+    - name: Upload macOS Release Asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./artifacts/cyberdriver-macos/cyberdriver
+        asset_name: cyberdriver-macos
+        asset_content_type: application/octet-stream 

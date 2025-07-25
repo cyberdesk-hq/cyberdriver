@@ -1,0 +1,9 @@
+fastapi==0.116.1
+uvicorn[standard]==0.34.0
+websockets==14.1
+httpx==0.28.1
+mss==10.0.0
+pyautogui==0.9.54
+pillow==11.3.0
+numpy==2.2.0
+pydantic==2.11.7
