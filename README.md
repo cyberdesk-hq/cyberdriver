@@ -20,6 +20,7 @@ A comprehensive remote computer control tool with all major features for remote 
 #### Display
 - `GET /computer/display/screenshot` - Capture screen with optional scaling
   - Query params: `width`, `height`, `mode` (exact|aspect_fit|aspect_fill)
+  - Default: 1024x768 (matching Piglet, recommended for Claude)
 - `GET /computer/display/dimensions` - Get screen dimensions
 
 #### Keyboard
@@ -37,7 +38,41 @@ A comprehensive remote computer control tool with all major features for remote 
 
 ## Installation
 
-### Basic Installation
+### Windows PowerShell Installation
+
+The below PowerShell script will install Cyberdriver onto your Windows machine, and add the cyberdriver executable to your PATH.
+
+```powershell
+# Create tool directory
+$toolDir = "$env:USERPROFILE\.cyberdriver"
+New-Item -ItemType Directory -Force -Path $toolDir
+
+# Download cyberdriver
+Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.8/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe"
+
+# Add to PATH if not already there
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if ($userPath -notlike "*$toolDir*") {
+    [Environment]::SetEnvironmentVariable("Path", $userPath + ";" + $toolDir, "User")
+}
+
+Write-Host "Cyberdriver installed! You may need to restart your terminal for PATH changes to take effect."
+```
+
+Cyberdriver can then be started with:
+
+```bash
+cyberdriver start
+```
+
+Or subscribed for remote use via Cyberdesk cloud:
+
+```bash
+cyberdriver join --secret SK-YOUR-SECRET-KEY
+```
+
+### Basic Installation from Source
+
 ```bash
 pip install -r requirements.txt
 ```
@@ -63,7 +98,7 @@ Configuration is stored in:
 The config file contains:
 ```json
 {
-  "version": "0.0.7",
+  "version": "0.0.8",
   "fingerprint": "uuid-v4-string"
 }
 ```

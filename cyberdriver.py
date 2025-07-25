@@ -90,7 +90,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.7"
+VERSION = "0.0.8"
 
 @dataclass
 class Config:
@@ -403,7 +403,13 @@ async def get_screenshot(
         # Convert to PIL Image
         pil_image = Image.frombytes('RGB', img.size, img.bgra, 'raw', 'BGRX')
         
-        # Apply scaling if requested
+        # Default to 1024x768 if no dimensions specified
+        # This fixed resolution is strongly recommended for Claude
+        if width is None and height is None:
+            width = 1024
+            height = 768
+        
+        # Apply scaling - always scale to maintain consistency with Piglet
         if width is not None or height is not None:
             pil_image = scale_image(pil_image, width, height, scale_mode)
         
