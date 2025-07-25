@@ -50,7 +50,6 @@ from io import BytesIO
 
 import httpx
 import mss
-import mss.tools
 import numpy as np
 import pyautogui
 from PIL import Image, ImageDraw

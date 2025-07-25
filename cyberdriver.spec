@@ -1,14 +1,31 @@
 # -*- mode: python ; coding: utf-8 -*-
+import sys
+from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
+
+# Collect all data/binaries from important packages
+datas = []
+binaries = []
+hiddenimports = []
+
+for package in ['fastapi', 'uvicorn', 'mss']:
+    tmp_datas, tmp_binaries, tmp_hiddens = collect_all(package)
+    datas += tmp_datas
+    binaries += tmp_binaries
+    hiddenimports += tmp_hiddens
+
+# Add macOS-specific CoreGraphics framework if on Darwin
+if sys.platform == "darwin":
+    binaries.append(('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics', 'CoreGraphics'))
 
 # Analysis
 a = Analysis(
     ['cyberdriver.py'],
     pathex=[],
-    binaries=[],
-    datas=[],
-    hiddenimports=[
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports + [
         'uvicorn.logging',
         'uvicorn.loops',
         'uvicorn.loops.auto',
@@ -22,6 +39,7 @@ a = Analysis(
         'PIL._tkinter_finder',
         'websockets.legacy',
         'websockets.legacy.client',
+        'websockets.client',
     ],
     hookspath=[],
     hooksconfig={},

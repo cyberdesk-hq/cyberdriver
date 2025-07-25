@@ -21,56 +21,27 @@ def main():
         subprocess.check_call([sys.executable, "-m", "pip", "install", "pyinstaller"])
         print("✅ PyInstaller installed")
     
+    # Check if spec file exists
+    if not os.path.exists("cyberdriver.spec"):
+        print("❌ cyberdriver.spec not found!")
+        print("Please ensure cyberdriver.spec exists in the current directory")
+        return 1
+    
     # Clean previous builds
-    for path in ["build", "dist", "cyberdriver.spec"]:
+    for path in ["build", "dist"]:
         if os.path.exists(path):
             print(f"Cleaning {path}...")
-            if os.path.isdir(path):
-                shutil.rmtree(path)
-            else:
-                os.remove(path)
+            shutil.rmtree(path)
     
-    # PyInstaller command
+    # Build using the spec file
     cmd = [
         "pyinstaller",
-        "--onefile",  # Single executable
-        "--name", "cyberdriver",  # Executable name
-        "--console",  # Console app (not windowed)
         "--clean",  # Clean temp files
         "--noconfirm",  # Overwrite without asking
-        
-        # Include all necessary hidden imports
-        "--hidden-import", "uvicorn.logging",
-        "--hidden-import", "uvicorn.loops",
-        "--hidden-import", "uvicorn.loops.auto",
-        "--hidden-import", "uvicorn.protocols",
-        "--hidden-import", "uvicorn.protocols.http",
-        "--hidden-import", "uvicorn.protocols.http.auto",
-        "--hidden-import", "uvicorn.protocols.websockets",
-        "--hidden-import", "uvicorn.protocols.websockets.auto",
-        "--hidden-import", "uvicorn.lifespan",
-        "--hidden-import", "uvicorn.lifespan.on",
-        "--hidden-import", "PIL._tkinter_finder",
-        "--hidden-import", "websockets.legacy",
-        "--hidden-import", "websockets.legacy.client",
-        "--hidden-import", "websockets.client",
-        
-        # Collect all data from packages
-        "--collect-all", "fastapi",
-        "--collect-all", "uvicorn",
-        "--collect-all", "mss",
-        
-        # macOS specific - include required frameworks
-        "--add-binary", "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics:CoreGraphics" if sys.platform == "darwin" else "",
-        
-        # The main script
-        "cyberdriver.py"
+        "cyberdriver.spec"
     ]
     
-    # Remove empty strings from command
-    cmd = [arg for arg in cmd if arg]
-    
-    print("\nBuilding executable...")
+    print("\nBuilding executable from cyberdriver.spec...")
     print(f"Command: {' '.join(cmd)}")
     
     try:
@@ -78,21 +49,29 @@ def main():
         print("\n✅ Build successful!")
         
         # Check the output
-        if os.path.exists("dist/cyberdriver"):
-            size = os.path.getsize("dist/cyberdriver") / (1024 * 1024)
-            print(f"\nExecutable created: dist/cyberdriver")
+        executable_path = "dist/cyberdriver"
+        if sys.platform == "win32":
+            executable_path += ".exe"
+            
+        if os.path.exists(executable_path):
+            size = os.path.getsize(executable_path) / (1024 * 1024)
+            print(f"\nExecutable created: {executable_path}")
             print(f"Size: {size:.1f} MB")
             print("\nTo run: ./dist/cyberdriver start --port 3000")
         else:
-            print("\n❌ Executable not found in dist/")
+            print(f"\n❌ Executable not found at {executable_path}")
             
     except subprocess.CalledProcessError as e:
         print(f"\n❌ Build failed: {e}")
         print("\nTroubleshooting tips:")
-        print("1. Make sure all dependencies are installed")
-        print("2. Try running in a clean virtual environment")
-        print("3. Check for any import errors in cyberdriver.py")
+        print("1. Check cyberdriver.spec for configuration errors")
+        print("2. Make sure all dependencies are installed")
+        print("3. Try running: pyinstaller cyberdriver.spec --debug all")
+        print("4. Check for any import errors in cyberdriver.py")
+        return 1
+    
+    return 0
 
 
 if __name__ == "__main__":
-    main() 
+    sys.exit(main()) 
