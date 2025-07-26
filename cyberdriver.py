@@ -90,7 +90,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.8"
+VERSION = "0.0.9"
 
 @dataclass
 class Config:
@@ -385,6 +385,16 @@ app = FastAPI(title="Cyberdriver", version=VERSION)
 cursor_overlay = CursorOverlay()
 
 
+@app.middleware("http")
+async def disable_buffering(request, call_next):
+    """Middleware to ensure responses are not buffered."""
+    response = await call_next(request)
+    # Add headers to disable any proxy buffering
+    response.headers["X-Accel-Buffering"] = "no"
+    response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
 @app.get("/computer/display/screenshot", response_class=Response)
 async def get_screenshot(
     width: Optional[int] = Query(None),
@@ -585,7 +595,11 @@ class TunnelClient:
             request_meta = None
             body_buffer = bytearray()
             
-            async with httpx.AsyncClient() as http_client:
+            # Configure httpx client with no buffering and reasonable timeouts
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0, connect=5.0),
+                limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
+            ) as http_client:
                 async for message in websocket:
                     if isinstance(message, str):
                         if message == "end":
@@ -621,17 +635,20 @@ class TunnelClient:
             url += f"?{query}"
         
         try:
-            response = await client.request(
-                method, url, headers=headers, content=body
-            )
-            
-            print(f"{method} {path} -> {response.status_code}")
-            
-            return {
-                "status": response.status_code,
-                "headers": dict(response.headers),
-                "body": await response.aread(),
-            }
+            # IMPORTANT: Use stream=True to avoid buffering the entire response
+            async with client.stream(method, url, headers=headers, content=body) as response:
+                print(f"{method} {path} -> {response.status_code}")
+                
+                # Read the response body immediately to avoid buffering
+                body_chunks = []
+                async for chunk in response.aiter_bytes():
+                    body_chunks.append(chunk)
+                
+                return {
+                    "status": response.status_code,
+                    "headers": dict(response.headers),
+                    "body": b''.join(body_chunks),
+                }
         except Exception as e:
             return {
                 "status": 500,
@@ -670,17 +687,31 @@ def run_server(port: int):
     uvicorn.run(app, host="0.0.0.0", port=port)
 
 
+async def run_server_async(port: int):
+    """Run the FastAPI server asynchronously."""
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
+
+
 async def run_join(host: str, port: int, secret: str, target_port: int):
     """Run both API server and tunnel client."""
     config = get_config()
     
-    # Start API server in background thread
-    loop = asyncio.get_event_loop()
-    server_task = loop.run_in_executor(None, run_server, target_port)
+    # Start API server asynchronously in the same event loop
+    server_task = asyncio.create_task(run_server_async(target_port))
+    
+    # Give server time to start
+    await asyncio.sleep(1)
     
     # Start tunnel client
     tunnel = TunnelClient(host, port, secret, target_port, config)
-    await tunnel.run()
+    
+    # Run both concurrently
+    try:
+        await asyncio.gather(server_task, tunnel.run())
+    except KeyboardInterrupt:
+        print("\nShutting down...")
 
 
 def main():
