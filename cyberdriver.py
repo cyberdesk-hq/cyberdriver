@@ -58,6 +58,52 @@ from fastapi.responses import Response, JSONResponse
 import uvicorn
 import websockets
 
+# -----------------------------------------------------------------------------
+# Windows Console Fix
+# -----------------------------------------------------------------------------
+
+def disable_windows_console_quickedit():
+    """Disable QuickEdit mode in Windows console to prevent output blocking.
+    
+    QuickEdit mode causes console output to block when the console window has focus
+    and is in selection mode. This is a common issue that makes applications appear
+    to hang until Escape or Ctrl+C is pressed.
+    """
+    if platform.system() != "Windows":
+        return
+    
+    try:
+        import ctypes
+        from ctypes import wintypes
+        
+        kernel32 = ctypes.windll.kernel32
+        
+        # Get handle to current console
+        STD_INPUT_HANDLE = -10
+        handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
+        
+        # Get current console mode
+        mode = wintypes.DWORD()
+        kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+        
+        # Disable QuickEdit (0x0040) and Insert mode (0x0020)
+        ENABLE_QUICK_EDIT_MODE = 0x0040
+        ENABLE_INSERT_MODE = 0x0020
+        ENABLE_EXTENDED_FLAGS = 0x0080
+        
+        # First, enable extended flags to make the change
+        kernel32.SetConsoleMode(handle, mode.value | ENABLE_EXTENDED_FLAGS)
+        
+        # Then disable QuickEdit and Insert modes
+        new_mode = mode.value & ~ENABLE_QUICK_EDIT_MODE & ~ENABLE_INSERT_MODE
+        kernel32.SetConsoleMode(handle, new_mode | ENABLE_EXTENDED_FLAGS)
+        
+        print("✓ Disabled Windows console QuickEdit mode")
+    except Exception as e:
+        print(f"Note: Could not disable QuickEdit mode: {e}")
+        print("If output appears stuck, click elsewhere or press Escape in the console")
+
+
 # Define websocket compatibility helper inline
 async def connect_with_headers(uri, headers_dict):
     """Compatibility wrapper for websocket connections with headers."""
@@ -90,7 +136,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.8"
+VERSION = "0.0.10"
 
 @dataclass
 class Config:
@@ -711,6 +757,9 @@ def main():
                            help="Enable cursor overlay")
     
     args = parser.parse_args()
+    
+    # Disable Windows console QuickEdit mode to prevent output blocking
+    disable_windows_console_quickedit()
     
     # Start cursor overlay if requested
     if getattr(args, 'cursor_overlay', False):
