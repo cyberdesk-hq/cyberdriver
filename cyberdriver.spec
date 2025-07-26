@@ -36,6 +36,8 @@ a = Analysis(
         'uvicorn.protocols.websockets.auto',
         'uvicorn.lifespan',
         'uvicorn.lifespan.on',
+        'uvicorn.config',  # Explicitly include Config class
+        'uvicorn.server',  # Explicitly include Server class
         'PIL._tkinter_finder',
         'websockets.legacy',
         'websockets.legacy.client',
