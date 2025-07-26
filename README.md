@@ -5,7 +5,7 @@ A comprehensive remote computer control tool with all major features for remote 
 ## Features
 
 ### Complete Feature Set
-- ✅ **HTTP API Server** - All endpoints for display, keyboard, and mouse control
+- ✅ **HTTP API Server** - All endpoints for display, keyboard, and mouse control 
 - ✅ **WebSocket Tunnel** - Connect to remote control servers with proper protocol
 - ✅ **XDO Keyboard Input** - Support for complex key sequences like `ctrl+c ctrl+v`
 - ✅ **Screenshot Scaling** - Three modes: Exact, AspectFit, AspectFill
