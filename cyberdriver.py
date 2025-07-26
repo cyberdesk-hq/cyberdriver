@@ -43,6 +43,7 @@ import subprocess
 import sys
 import time
 import uuid
+import signal
 from typing import Dict, List, Optional, Tuple, Union, Any
 from enum import Enum
 from dataclasses import dataclass
@@ -57,6 +58,52 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response, JSONResponse
 import uvicorn
 import websockets
+
+# -----------------------------------------------------------------------------
+# Windows Console Fix
+# -----------------------------------------------------------------------------
+
+def disable_windows_console_quickedit():
+    """Disable QuickEdit mode in Windows console to prevent output blocking.
+    
+    QuickEdit mode causes console output to block when the console window has focus
+    and is in selection mode. This is a common issue that makes applications appear
+    to hang until Escape or Ctrl+C is pressed.
+    """
+    if platform.system() != "Windows":
+        return
+    
+    try:
+        import ctypes
+        from ctypes import wintypes
+        
+        kernel32 = ctypes.windll.kernel32
+        
+        # Get handle to current console
+        STD_INPUT_HANDLE = -10
+        handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
+        
+        # Get current console mode
+        mode = wintypes.DWORD()
+        kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+        
+        # Disable QuickEdit (0x0040) and Insert mode (0x0020)
+        ENABLE_QUICK_EDIT_MODE = 0x0040
+        ENABLE_INSERT_MODE = 0x0020
+        ENABLE_EXTENDED_FLAGS = 0x0080
+        
+        # First, enable extended flags to make the change
+        kernel32.SetConsoleMode(handle, mode.value | ENABLE_EXTENDED_FLAGS)
+        
+        # Then disable QuickEdit and Insert modes
+        new_mode = mode.value & ~ENABLE_QUICK_EDIT_MODE & ~ENABLE_INSERT_MODE
+        kernel32.SetConsoleMode(handle, new_mode | ENABLE_EXTENDED_FLAGS)
+        
+        print("✓ Disabled Windows console QuickEdit mode")
+    except Exception as e:
+        print(f"Note: Could not disable QuickEdit mode: {e}")
+        print("If output appears stuck, click elsewhere or press Escape in the console")
+
 
 # Define websocket compatibility helper inline
 async def connect_with_headers(uri, headers_dict):
@@ -90,7 +137,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.9"
+VERSION = "0.0.10"
 
 @dataclass
 class Config:
@@ -714,7 +761,18 @@ async def run_join(host: str, port: int, secret: str, target_port: int):
         print("\nShutting down...")
 
 
+def signal_handler(signum, frame):
+    """Handle Ctrl+C gracefully."""
+    print("\n\nReceived interrupt signal. Shutting down gracefully...")
+    # The finally block in main() will handle cleanup
+    sys.exit(0)
+
+
 def main():
+    # Set up signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     parser = argparse.ArgumentParser(
         description="Cyberdriver: Remote computer control"
     )
@@ -743,6 +801,9 @@ def main():
     
     args = parser.parse_args()
     
+    # Disable Windows console QuickEdit mode to prevent output blocking
+    disable_windows_console_quickedit()
+    
     # Start cursor overlay if requested
     if getattr(args, 'cursor_overlay', False):
         cursor_overlay.start()
@@ -755,9 +816,15 @@ def main():
             asyncio.run(run_join(
                 args.host, args.port, args.secret, args.target_port
             ))
+    except KeyboardInterrupt:
+        print("\n\nKeyboard interrupt received. Shutting down...")
+    except Exception as e:
+        print(f"\nError: {e}")
+        sys.exit(1)
     finally:
         # Cleanup
         cursor_overlay.stop()
+        print("Cleanup complete.")
 
 
 if __name__ == "__main__":
