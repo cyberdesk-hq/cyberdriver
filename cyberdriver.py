@@ -43,6 +43,7 @@ import subprocess
 import sys
 import time
 import uuid
+import signal
 from typing import Dict, List, Optional, Tuple, Union, Any
 from enum import Enum
 from dataclasses import dataclass
@@ -729,7 +730,18 @@ async def run_join(host: str, port: int, secret: str, target_port: int):
     await tunnel.run()
 
 
+def signal_handler(signum, frame):
+    """Handle Ctrl+C gracefully."""
+    print("\n\nReceived interrupt signal. Shutting down gracefully...")
+    # The finally block in main() will handle cleanup
+    sys.exit(0)
+
+
 def main():
+    # Set up signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     parser = argparse.ArgumentParser(
         description="Cyberdriver: Remote computer control"
     )
@@ -773,9 +785,15 @@ def main():
             asyncio.run(run_join(
                 args.host, args.port, args.secret, args.target_port
             ))
+    except KeyboardInterrupt:
+        print("\n\nKeyboard interrupt received. Shutting down...")
+    except Exception as e:
+        print(f"\nError: {e}")
+        sys.exit(1)
     finally:
         # Cleanup
         cursor_overlay.stop()
+        print("Cleanup complete.")
 
 
 if __name__ == "__main__":
