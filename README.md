@@ -59,6 +59,8 @@ if ($userPath -notlike "*$toolDir*") {
 Write-Host "Cyberdriver installed! You may need to restart your terminal for PATH changes to take effect."
 ```
 
+**Note:** Cyberdriver automatically disables PowerShell's QuickEdit Mode on startup. PowerShell has this dumb quirk where focusing your mouse on a running executable can stall the outputs until you unfocus it (it's called "QuickEdit Mode"). Additionally, cyberdriver requires administrator privileges to automate legacy desktop apps that have to be run as admin.
+
 Cyberdriver can then be started with:
 
 ```bash
@@ -68,8 +70,59 @@ cyberdriver start
 Or subscribed for remote use via Cyberdesk cloud:
 
 ```bash
-cyberdriver join --secret SK-YOUR-SECRET-KEY
+cyberdriver join --secret SK-YOUR-SECRET-KEY --host https://cyberdesk-new.fly.dev
 ```
+
+## Common Issues
+
+### TLS Certificate Errors
+
+If you get an error regarding TLS Certificates, CTRL+C and then run the following:
+
+```powershell
+# Check if running as admin
+$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if ($isAdmin) {
+    $store = "Cert:\LocalMachine\Root"
+    Write-Host "Running as Administrator - installing system-wide" -ForegroundColor Green
+} else {
+    $store = "Cert:\CurrentUser\Root"
+    Write-Host "Running as user - installing for current user only" -ForegroundColor Yellow
+}
+
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# Only the working certificate URLs
+$certs = @(
+    @{
+        Name = "ISRG Root X1"
+        Url = "https://letsencrypt.org/certs/isrgrootx1.der"
+    }
+)
+
+foreach ($cert in $certs) {
+    try {
+        Write-Host "Downloading $($cert.Name)..." -ForegroundColor Cyan
+        $tempFile = "$env:TEMP\$($cert.Name -replace ' ','_').der"
+        Invoke-WebRequest -Uri $cert.Url -OutFile $tempFile -UseBasicParsing
+        
+        $certObj = Import-Certificate -FilePath $tempFile -CertStoreLocation $store
+        Write-Host "✓ Installed $($cert.Name)" -ForegroundColor Green
+        
+        Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-Host "✗ Failed to install $($cert.Name): $_" -ForegroundColor Red
+    }
+}
+```
+
+Then retry cyberdriver join!
+
+> If you have any other issues, reach out to the team! We'll get on it asap.
+
+
+
 
 ### Basic Installation from Source
 
@@ -81,12 +134,12 @@ pip install -r requirements.txt
 
 ### Start Local Server
 ```bash
-python cyberdriver.py start --port 3000 --cursor-overlay
+python cyberdriver.py start --port 3000
 ```
 
 ### Join Remote Control Server
 ```bash
-python cyberdriver.py join --secret YOUR_API_KEY --host api.cyberdesk.io --cursor-overlay
+python cyberdriver.py join --secret YOUR_API_KEY --host https://cyberdesk-new.fly.dev
 ```
 
 ## Configuration

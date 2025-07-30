@@ -261,3 +261,5 @@ dist/
 
 # Keep GitHub Actions workflows
 !.github/
+
+test_timeout_fix.py
