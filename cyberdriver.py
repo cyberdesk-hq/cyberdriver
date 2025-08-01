@@ -8,11 +8,20 @@ It includes all features from the original Zig implementation:
 - WebSocket tunnel client for remote control
 - XDO keyboard input support (e.g., 'ctrl+c ctrl+v')
 - Screenshot with scaling modes (Exact, AspectFit, AspectFill)
-- Smooth mouse movement with interpolation
+- Instant mouse movement with pyautogui
 - Mouse button press/release control
 - Configuration persistence (fingerprint, version)
 - Cursor overlay (cross-platform)
 - Exponential backoff reconnection
+- File transfer support (read/write/list any file type through tunnel)
+
+File Transfer Features:
+  - Write any file type to the remote machine (binary safe)
+  - Read files from the remote machine (with size limits)
+  - List directory contents
+  - Automatic path validation for security
+  - Base64 encoding for binary data transport
+  - Support for Drake tax files, medical images, or any binary format
 
 Dependencies:
   - fastapi and uvicorn: HTTP API server
@@ -137,7 +146,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.12"
+VERSION = "0.0.13"
 
 @dataclass
 class Config:
@@ -297,44 +306,6 @@ def execute_xdo_sequence(sequence: str):
 # -----------------------------------------------------------------------------
 # Mouse Movement
 # -----------------------------------------------------------------------------
-
-def smooth_mouse_move(x: int, y: int, steps: int = 10, duration: float = 0.1):
-    """Move mouse smoothly to target position with interpolation."""
-    # IMPORTANT: PyAutoGUI's built-in duration parameter is extremely slow on macOS
-    # (takes ~2.5s minimum). So we always use manual interpolation with instant moves.
-    
-    # Temporarily disable PAUSE for this function to ensure speed
-    original_pause = pyautogui.PAUSE
-    pyautogui.PAUSE = 0
-    
-    try:
-        current_x, current_y = pyautogui.position()
-        
-        # Skip if already at target
-        if abs(current_x - x) < 2 and abs(current_y - y) < 2:
-            return
-        
-        # Use fewer steps for faster movement (10 steps @ 10ms = 100ms total)
-        # This matches Piglet's 100ms timing but with fewer, larger steps
-        sleep_time = duration / steps
-        
-        # Calculate step increments
-        dx = (x - current_x) / steps
-        dy = (y - current_y) / steps
-        
-        # Perform smooth movement with instant moves
-        for i in range(steps):
-            new_x = current_x + dx * (i + 1)
-            new_y = current_y + dy * (i + 1)
-            pyautogui.moveTo(int(new_x), int(new_y), duration=0, _pause=False)
-            time.sleep(sleep_time)
-        
-        # Final move to ensure exact position
-        pyautogui.moveTo(x, y, duration=0, _pause=False)
-    finally:
-        # Restore original PAUSE setting
-        pyautogui.PAUSE = original_pause
-
 
 # -----------------------------------------------------------------------------
 # Cursor Overlay
@@ -515,14 +486,14 @@ async def get_mouse_position() -> Dict[str, int]:
 
 @app.post("/computer/input/mouse/move")
 async def post_mouse_move(payload: Dict[str, int]):
-    """Move the mouse cursor with smooth interpolation."""
+    """Move the mouse cursor instantly."""
     try:
         x = int(payload.get("x"))
         y = int(payload.get("y"))
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="Missing or invalid 'x'/'y'")
     
-    smooth_mouse_move(x, y)
+    pyautogui.moveTo(x, y, duration=0)
     return {}
 
 
@@ -539,7 +510,7 @@ async def post_mouse_click(payload: Dict[str, Any]):
     
     # Move to position if specified
     if x is not None and y is not None:
-        smooth_mouse_move(int(x), int(y))
+        pyautogui.moveTo(int(x), int(y), duration=0)
     
     if down is None:
         # Full click
@@ -552,23 +523,153 @@ async def post_mouse_click(payload: Dict[str, Any]):
     return {}
 
 
-# File system endpoints (marked as not implemented in original)
+# File system endpoints
 @app.get("/computer/fs/list")
 async def get_fs_list(path: str = Query(".")):
     """List directory contents."""
-    raise HTTPException(status_code=501, detail="Not implemented")
+    try:
+        # Resolve and validate path
+        safe_path = pathlib.Path(path).expanduser().resolve()
+        
+        # Security: only allow listing within user's home or temp directories
+        allowed_roots = [
+            pathlib.Path.home(),
+            pathlib.Path("/tmp"),
+            pathlib.Path(os.environ.get("TEMP", "/tmp"))  # Windows temp
+        ]
+        
+        if not any(str(safe_path).startswith(str(root)) for root in allowed_roots):
+            raise HTTPException(status_code=403, detail="Access denied to this directory")
+        
+        if not safe_path.exists():
+            raise HTTPException(status_code=404, detail="Directory not found")
+        
+        if not safe_path.is_dir():
+            raise HTTPException(status_code=400, detail="Path is not a directory")
+        
+        # List directory contents
+        items = []
+        for item in safe_path.iterdir():
+            items.append({
+                "name": item.name,
+                "path": str(item),
+                "is_dir": item.is_dir(),
+                "size": item.stat().st_size if item.is_file() else None,
+                "modified": item.stat().st_mtime
+            })
+        
+        return {
+            "path": str(safe_path),
+            "items": sorted(items, key=lambda x: (not x["is_dir"], x["name"]))
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/computer/fs/read")
 async def get_fs_read(path: str = Query(...)):
     """Read file contents."""
-    raise HTTPException(status_code=501, detail="Not implemented")
+    try:
+        # Resolve and validate path
+        safe_path = pathlib.Path(path).expanduser().resolve()
+        
+        # Security: only allow reading within user's home or temp directories
+        allowed_roots = [
+            pathlib.Path.home(),
+            pathlib.Path("/tmp"),
+            pathlib.Path(os.environ.get("TEMP", "/tmp"))
+        ]
+        
+        if not any(str(safe_path).startswith(str(root)) for root in allowed_roots):
+            raise HTTPException(status_code=403, detail="Access denied to this file")
+        
+        if not safe_path.exists():
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        if not safe_path.is_file():
+            raise HTTPException(status_code=400, detail="Path is not a file")
+        
+        # Check file size (limit to 100MB for safety)
+        if safe_path.stat().st_size > 100 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="File too large (>100MB)")
+        
+        # Read file and encode as base64
+        with open(safe_path, "rb") as f:
+            content = f.read()
+        
+        return {
+            "path": str(safe_path),
+            "content": base64.b64encode(content).decode("utf-8"),
+            "size": len(content)
+        }
+        
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/computer/fs/write")
-async def post_fs_write(payload: Dict[str, str]):
-    """Write file contents."""
-    raise HTTPException(status_code=501, detail="Not implemented")
+async def post_fs_write(payload: Dict[str, Any]):
+    """Write file contents to specified path.
+    
+    Expects:
+    - path: Target file path
+    - content: Base64 encoded file content
+    - mode: (optional) Write mode - "write" (default) or "append"
+    """
+    file_path = payload.get("path")
+    content = payload.get("content")
+    mode = payload.get("mode", "write")
+    
+    if not file_path:
+        raise HTTPException(status_code=400, detail="Missing 'path' field")
+    if not content:
+        raise HTTPException(status_code=400, detail="Missing 'content' field")
+    
+    try:
+        # Decode base64 content
+        file_data = base64.b64decode(content)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid base64 content: {e}")
+    
+    try:
+        # Resolve and validate path
+        safe_path = pathlib.Path(file_path).expanduser().resolve()
+        
+        # Security: only allow writing within user's home or temp directories
+        allowed_roots = [
+            pathlib.Path.home(),
+            pathlib.Path("/tmp"),
+            pathlib.Path(os.environ.get("TEMP", "/tmp"))
+        ]
+        
+        # Check if target path is within allowed directories
+        if not any(str(safe_path).startswith(str(root)) for root in allowed_roots):
+            # If not, default to user's home directory with a cyberdesk subdirectory
+            safe_path = pathlib.Path.home() / "CyberDeskTransfers" / safe_path.name
+        
+        # Create parent directories if they don't exist
+        safe_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Write file
+        write_mode = "ab" if mode == "append" else "wb"
+        with open(safe_path, write_mode) as f:
+            f.write(file_data)
+        
+        # Get file info for response
+        stat = safe_path.stat()
+        
+        return {
+            "success": True,
+            "path": str(safe_path),
+            "size": stat.st_size,
+            "modified": stat.st_mtime
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to write file: {e}")
 
 
 # Shell endpoints (marked as not implemented in original)
