@@ -876,7 +876,11 @@ class TunnelClient:
         # Use compatibility wrapper for connection
         websocket = await connect_with_headers(uri, headers)
         async with websocket:
-            print(f"Connected to control server, forwarding to http://127.0.0.1:{self.target_port}")
+            # Print success message with green checkmark
+            green = '\033[92m'
+            white = '\033[97m'
+            reset = '\033[0m'
+            print(f"{green}✓{reset} {white}Connected!{reset} Forwarding to http://127.0.0.1:{self.target_port}")
             
             # Message handling state
             request_meta = None
@@ -1017,12 +1021,17 @@ def signal_handler(signum, frame):
     sys.exit(0)
 
 
-def print_banner():
-    """Print a cool gradient banner for Cyberdriver."""
+def print_banner(mode="default"):
+    """Print a cool gradient banner for Cyberdriver.
+    
+    Args:
+        mode: "default" for normal banner, "connecting" for join command
+    """
     # Colors
     white = '\033[97m'
     blue = '\033[38;2;0;123;255m'
     purple = '\033[38;2;147;51;234m'
+    green = '\033[92m'
     reset = '\033[0m'
     
     banner = [
@@ -1053,9 +1062,14 @@ def print_banner():
     
     print()
     
-    # Concise tips with selective blue highlighting
-    print(f"{white}Get started:{reset}")
-    print(f"{white}→ {blue}cyberdriver join --secret{reset} {white}YOUR_API_KEY{reset}")
+    # Different messages based on mode
+    if mode == "connecting":
+        print(f"{white}Connecting to Cyberdesk Cloud...{reset}")
+    else:
+        print(f"{white}Get started:{reset}")
+        print(f"{white}→ {blue}cyberdriver join --secret{reset} {white}YOUR_API_KEY{reset}")
+    
+    # Always show help and docs
     print(f"{white}→ Run {blue}-h{reset} {white}for help{reset}")
     print(f"{white}→ Visit {blue}https://docs.cyberdesk.io{reset} for documentation")
     print()
@@ -1123,7 +1137,7 @@ def main():
     
     # Show banner for join command
     if args.command == "join":
-        print_banner()
+        print_banner(mode="connecting")
     
     # Disable Windows console QuickEdit mode to prevent output blocking
     disable_windows_console_quickedit()
