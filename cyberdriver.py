@@ -146,7 +146,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.13"
+VERSION = "0.0.14"
 
 @dataclass
 class Config:
@@ -523,23 +523,13 @@ async def post_mouse_click(payload: Dict[str, Any]):
     return {}
 
 
-# File system endpoints
+# File system endpoints - Full access (localhost only)
 @app.get("/computer/fs/list")
 async def get_fs_list(path: str = Query(".")):
-    """List directory contents."""
+    """List directory contents with full file system access."""
     try:
-        # Resolve and validate path
+        # Resolve path - no restrictions
         safe_path = pathlib.Path(path).expanduser().resolve()
-        
-        # Security: only allow listing within user's home or temp directories
-        allowed_roots = [
-            pathlib.Path.home(),
-            pathlib.Path("/tmp"),
-            pathlib.Path(os.environ.get("TEMP", "/tmp"))  # Windows temp
-        ]
-        
-        if not any(str(safe_path).startswith(str(root)) for root in allowed_roots):
-            raise HTTPException(status_code=403, detail="Access denied to this directory")
         
         if not safe_path.exists():
             raise HTTPException(status_code=404, detail="Directory not found")
@@ -549,40 +539,47 @@ async def get_fs_list(path: str = Query(".")):
         
         # List directory contents
         items = []
-        for item in safe_path.iterdir():
-            items.append({
-                "name": item.name,
-                "path": str(item),
-                "is_dir": item.is_dir(),
-                "size": item.stat().st_size if item.is_file() else None,
-                "modified": item.stat().st_mtime
-            })
+        try:
+            for item in safe_path.iterdir():
+                try:
+                    stat = item.stat()
+                    items.append({
+                        "name": item.name,
+                        "path": str(item),
+                        "is_dir": item.is_dir(),
+                        "size": stat.st_size if item.is_file() else None,
+                        "modified": stat.st_mtime
+                    })
+                except (PermissionError, OSError):
+                    # Skip items we can't access
+                    items.append({
+                        "name": item.name,
+                        "path": str(item),
+                        "is_dir": None,
+                        "size": None,
+                        "modified": None,
+                        "error": "Permission denied"
+                    })
+        except PermissionError:
+            raise HTTPException(status_code=403, detail="Permission denied to list directory")
         
         return {
             "path": str(safe_path),
-            "items": sorted(items, key=lambda x: (not x["is_dir"], x["name"]))
+            "entries": sorted(items, key=lambda x: (x.get("is_dir") is not True, x["name"]))
         }
         
     except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/computer/fs/read")
 async def get_fs_read(path: str = Query(...)):
-    """Read file contents."""
+    """Read file contents with full file system access."""
     try:
-        # Resolve and validate path
+        # Resolve path - no restrictions
         safe_path = pathlib.Path(path).expanduser().resolve()
-        
-        # Security: only allow reading within user's home or temp directories
-        allowed_roots = [
-            pathlib.Path.home(),
-            pathlib.Path("/tmp"),
-            pathlib.Path(os.environ.get("TEMP", "/tmp"))
-        ]
-        
-        if not any(str(safe_path).startswith(str(root)) for root in allowed_roots):
-            raise HTTPException(status_code=403, detail="Access denied to this file")
         
         if not safe_path.exists():
             raise HTTPException(status_code=404, detail="File not found")
@@ -595,8 +592,11 @@ async def get_fs_read(path: str = Query(...)):
             raise HTTPException(status_code=413, detail="File too large (>100MB)")
         
         # Read file and encode as base64
-        with open(safe_path, "rb") as f:
-            content = f.read()
+        try:
+            with open(safe_path, "rb") as f:
+                content = f.read()
+        except PermissionError:
+            raise HTTPException(status_code=403, detail="Permission denied to read file")
         
         return {
             "path": str(safe_path),
@@ -612,7 +612,7 @@ async def get_fs_read(path: str = Query(...)):
 
 @app.post("/computer/fs/write")
 async def post_fs_write(payload: Dict[str, Any]):
-    """Write file contents to specified path.
+    """Write file contents with full file system access.
     
     Expects:
     - path: Target file path
@@ -635,54 +635,211 @@ async def post_fs_write(payload: Dict[str, Any]):
         raise HTTPException(status_code=400, detail=f"Invalid base64 content: {e}")
     
     try:
-        # Resolve and validate path
+        # Resolve path - no restrictions
         safe_path = pathlib.Path(file_path).expanduser().resolve()
         
-        # Security: only allow writing within user's home or temp directories
-        allowed_roots = [
-            pathlib.Path.home(),
-            pathlib.Path("/tmp"),
-            pathlib.Path(os.environ.get("TEMP", "/tmp"))
-        ]
-        
-        # Check if target path is within allowed directories
-        if not any(str(safe_path).startswith(str(root)) for root in allowed_roots):
-            # If not, default to user's home directory with a cyberdesk subdirectory
-            safe_path = pathlib.Path.home() / "CyberDeskTransfers" / safe_path.name
+        # If path doesn't specify a directory, default to CyberdeskTransfers
+        if not safe_path.parent.exists() and str(safe_path.parent) == ".":
+            safe_path = pathlib.Path.home() / "CyberdeskTransfers" / safe_path.name
         
         # Create parent directories if they don't exist
         safe_path.parent.mkdir(parents=True, exist_ok=True)
         
         # Write file
         write_mode = "ab" if mode == "append" else "wb"
-        with open(safe_path, write_mode) as f:
-            f.write(file_data)
+        try:
+            with open(safe_path, write_mode) as f:
+                f.write(file_data)
+        except PermissionError:
+            raise HTTPException(status_code=403, detail="Permission denied to write file")
         
         # Get file info for response
         stat = safe_path.stat()
         
         return {
-            "success": True,
             "path": str(safe_path),
             "size": stat.st_size,
             "modified": stat.st_mtime
         }
         
     except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
         raise HTTPException(status_code=500, detail=f"Failed to write file: {e}")
 
 
-# Shell endpoints (marked as not implemented in original)
-@app.post("/computer/shell/cmd/exec")
-async def post_shell_cmd_exec(payload: Dict[str, str]):
-    """Execute shell command."""
-    raise HTTPException(status_code=501, detail="Not implemented")
+# PowerShell endpoints with session management
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
+# Global dictionary to store PowerShell sessions
+powershell_sessions = {}
+session_lock = asyncio.Lock()
+executor = ThreadPoolExecutor(max_workers=5)
+
+def cleanup_old_sessions():
+    """Clean up sessions older than 30 minutes."""
+    current_time = time.time()
+    expired = []
+    for session_id, session in powershell_sessions.items():
+        if current_time - session['last_used'] > 3600:  # 1 hour
+            expired.append(session_id)
+    
+    for session_id in expired:
+        if session_id in powershell_sessions:
+            try:
+                powershell_sessions[session_id]['process'].terminate()
+            except:
+                pass
+            del powershell_sessions[session_id]
+
+def execute_powershell_command(command: str, session_id: str, working_directory: Optional[str] = None, same_session: bool = True):
+    """Execute PowerShell command in a session."""
+    import subprocess
+    
+    # Clean up old sessions
+    cleanup_old_sessions()
+    
+    if not same_session or session_id not in powershell_sessions:
+        # Create new PowerShell session
+        # Try PowerShell 7 first, fallback to Windows PowerShell
+        powershell_cmd = "pwsh" if platform.system() != "Windows" else "powershell"
+        try:
+            # Test if pwsh is available on Windows
+            subprocess.run(["pwsh", "-Version"], capture_output=True, check=True)
+            powershell_cmd = "pwsh"
+        except:
+            pass
+        
+        # Start PowerShell process
+        startupinfo = None
+        if platform.system() == "Windows":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        
+        process = subprocess.Popen(
+            [powershell_cmd, "-NoLogo", "-NoExit"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=working_directory,
+            startupinfo=startupinfo
+        )
+        
+        session_id = str(uuid.uuid4())
+        powershell_sessions[session_id] = {
+            'process': process,
+            'last_used': time.time()
+        }
+        
+        # Set working directory if specified
+        if working_directory:
+            process.stdin.write(f"Set-Location '{working_directory}'\n")
+            process.stdin.flush()
+    
+    session = powershell_sessions[session_id]
+    session['last_used'] = time.time()
+    process = session['process']
+    
+    # Execute command with unique delimiter
+    delimiter = f"__CYBERDRIVER_OUTPUT_END_{uuid.uuid4().hex}__"
+    process.stdin.write(f"{command}\n")
+    process.stdin.write(f"echo '{delimiter}'\n")
+    process.stdin.write(f"echo 'EXIT_CODE:'$LASTEXITCODE\n")
+    process.stdin.flush()
+    
+    # Read output until delimiter
+    output_lines = []
+    exit_code = 0
+    
+    while True:
+        line = process.stdout.readline()
+        if not line:
+            break
+        line = line.rstrip()
+        if delimiter in line:
+            # Next line should contain exit code
+            exit_line = process.stdout.readline().rstrip()
+            if exit_line.startswith("EXIT_CODE:"):
+                try:
+                    exit_code = int(exit_line.split(":")[-1])
+                except:
+                    exit_code = 0
+            break
+        output_lines.append(line)
+    
+    stdout = "\n".join(output_lines)
+    
+    # Check for any stderr (non-blocking read)
+    stderr_lines = []
+    process.stderr.flush()
+    
+    return {
+        "stdout": stdout,
+        "stderr": "\n".join(stderr_lines),
+        "exit_code": exit_code,
+        "session_id": session_id
+    }
 
 @app.post("/computer/shell/powershell/exec")
-async def post_shell_powershell_exec(payload: Dict[str, str]):
-    """Execute PowerShell command."""
-    raise HTTPException(status_code=501, detail="Not implemented")
+async def post_powershell_exec(payload: Dict[str, Any]):
+    """Execute PowerShell command with optional session management."""
+    command = payload.get("command")
+    same_session = payload.get("same_session", True)
+    working_directory = payload.get("working_directory")
+    session_id = payload.get("session_id", str(uuid.uuid4()))
+    
+    if not command:
+        raise HTTPException(status_code=400, detail="Missing 'command' field")
+    
+    try:
+        async with session_lock:
+            # Run in thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                executor,
+                execute_powershell_command,
+                command,
+                session_id,
+                working_directory,
+                same_session
+            )
+        
+        return result
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to execute command: {e}")
+
+@app.post("/computer/shell/powershell/session")
+async def post_powershell_session(payload: Dict[str, Any]):
+    """Manage PowerShell sessions."""
+    action = payload.get("action")
+    session_id = payload.get("session_id")
+    
+    if action not in ["create", "destroy"]:
+        raise HTTPException(status_code=400, detail="Invalid action. Must be 'create' or 'destroy'")
+    
+    async with session_lock:
+        if action == "create":
+            # Create new session
+            session_id = str(uuid.uuid4())
+            # Session will be created on first command
+            return {"session_id": session_id}
+        
+        elif action == "destroy":
+            if not session_id:
+                raise HTTPException(status_code=400, detail="Missing 'session_id' field")
+            
+            if session_id in powershell_sessions:
+                try:
+                    powershell_sessions[session_id]['process'].terminate()
+                except:
+                    pass
+                del powershell_sessions[session_id]
+                return {"message": "Session destroyed"}
+            else:
+                raise HTTPException(status_code=404, detail="Session not found")
 
 
 # -----------------------------------------------------------------------------
