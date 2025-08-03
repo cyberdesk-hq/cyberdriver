@@ -11,7 +11,6 @@ It includes all features from the original Zig implementation:
 - Instant mouse movement with pyautogui
 - Mouse button press/release control
 - Configuration persistence (fingerprint, version)
-- Cursor overlay (cross-platform)
 - Exponential backoff reconnection
 - File transfer support (read/write/list any file type through tunnel)
 
@@ -19,7 +18,6 @@ File Transfer Features:
   - Write any file type to the remote machine (binary safe)
   - Read files from the remote machine (with size limits)
   - List directory contents
-  - Automatic path validation for security
   - Base64 encoding for binary data transport
   - Support for Drake tax files, medical images, or any binary format
 
@@ -36,8 +34,8 @@ Install dependencies:
     pip install fastapi uvicorn[standard] websockets httpx mss pyautogui pillow numpy
 
 Usage:
-    python cyberdriver.py start [--port 3000] [--cursor-overlay]
-    python cyberdriver.py join --secret API_KEY [--host example.com] [--port 443] [--cursor-overlay]
+    python cyberdriver.py start [--port 3000]
+    python cyberdriver.py join --secret API_KEY [--host example.com] [--port 443]
 """
 
 import argparse
@@ -53,6 +51,7 @@ import sys
 import time
 import uuid
 import signal
+import threading
 from typing import Dict, List, Optional, Tuple, Union, Any
 from enum import Enum
 from dataclasses import dataclass
@@ -62,7 +61,7 @@ import httpx
 import mss
 import numpy as np
 import pyautogui
-from PIL import Image, ImageDraw
+from PIL import Image
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response, JSONResponse
 import uvicorn
@@ -174,19 +173,46 @@ def get_config() -> Config:
     """Load or create configuration."""
     config_dir = get_config_dir()
     config_path = config_dir / CONFIG_FILE
+    should_create = False
+    existing_fingerprint = None
     
-    if config_path.exists():
-        with open(config_path, 'r') as f:
-            data = json.load(f)
-        return Config.from_dict(data)
+    # Create new config if it doesn't exist or version is outdated
+    if not config_path.exists():
+        should_create = True
+    else:
+        try:
+            with open(config_path, 'r') as f:
+                data = json.load(f)
+            # Check if version is outdated
+            if data.get("version") != VERSION:
+                print("Configuration is outdated, creating a new one.")
+                should_create = True
+                # Preserve fingerprint if it exists
+                if "fingerprint" in data:
+                    existing_fingerprint = data["fingerprint"]
+            else:
+                return Config.from_dict(data)
+        except (json.JSONDecodeError, KeyError):
+            print("Configuration is corrupt, creating a new one.")
+            should_create = True
+
+    if should_create:
+        config_dir.mkdir(parents=True, exist_ok=True)
+        fingerprint = existing_fingerprint or str(uuid.uuid4())
+        config = Config(version=VERSION, fingerprint=fingerprint)
+        
+        with open(config_path, 'w') as f:
+            json.dump(config.to_dict(), f, indent=2)
+        
+        return config
     
-    # Create new config
+    # Fallback in case logic fails, though it shouldn't be reached
+    # This can happen if the file is corrupted in a very specific way
+    # between the check and the read.
     config_dir.mkdir(parents=True, exist_ok=True)
     config = Config(version=VERSION, fingerprint=str(uuid.uuid4()))
-    
     with open(config_path, 'w') as f:
         json.dump(config.to_dict(), f, indent=2)
-    
     return config
 
 
@@ -304,87 +330,6 @@ def execute_xdo_sequence(sequence: str):
 
 
 # -----------------------------------------------------------------------------
-# Mouse Movement
-# -----------------------------------------------------------------------------
-
-# -----------------------------------------------------------------------------
-# Cursor Overlay
-# -----------------------------------------------------------------------------
-
-class CursorOverlay:
-    """Cross-platform cursor overlay implementation."""
-    
-    def __init__(self):
-        self.running = False
-        self.overlay_thread = None
-        self.color = (0xFF, 0x00, 0xE5)  # Pig Peach color
-        
-    def start(self):
-        """Start the cursor overlay in a separate thread."""
-        if self.running:
-            return
-        
-        self.running = True
-        import threading
-        self.overlay_thread = threading.Thread(target=self._overlay_loop, daemon=True)
-        self.overlay_thread.start()
-    
-    def stop(self):
-        """Stop the cursor overlay."""
-        self.running = False
-        if self.overlay_thread:
-            self.overlay_thread.join()
-    
-    def _overlay_loop(self):
-        """Main overlay loop - platform specific implementation."""
-        if platform.system() == "Windows":
-            self._windows_overlay()
-        else:
-            # For non-Windows, we'll use a different approach
-            print("Cursor overlay is currently only supported on Windows")
-    
-    def _windows_overlay(self):
-        """Windows-specific overlay using tkinter."""
-        try:
-            import tkinter as tk
-            from tkinter import ttk
-            
-            root = tk.Tk()
-            root.overrideredirect(True)
-            root.attributes('-topmost', True)
-            root.attributes('-transparentcolor', 'white')
-            root.configure(bg='white')
-            
-            # Create cursor image
-            cursor_size = 30
-            canvas = tk.Canvas(root, width=cursor_size, height=cursor_size, 
-                             bg='white', highlightthickness=0)
-            canvas.pack()
-            
-            # Draw cursor shape
-            canvas.create_oval(2, 2, cursor_size-2, cursor_size-2, 
-                             fill=f'#{self.color[0]:02x}{self.color[1]:02x}{self.color[2]:02x}',
-                             outline='')
-            
-            def update_position():
-                if not self.running:
-                    root.quit()
-                    return
-                try:
-                    x, y = pyautogui.position()
-                    root.geometry(f'+{x-cursor_size//2}+{y-cursor_size//2}')
-                except:
-                    pass
-                root.after(16, update_position)  # ~60 FPS
-            
-            update_position()
-            root.mainloop()
-            
-        except ImportError:
-            print("tkinter not available for cursor overlay")
-
-
-# -----------------------------------------------------------------------------
 # PyAutoGUI Configuration
 # -----------------------------------------------------------------------------
 
@@ -398,9 +343,6 @@ pyautogui.FAILSAFE = True
 # -----------------------------------------------------------------------------
 
 app = FastAPI(title="Cyberdriver", version=VERSION)
-
-# Global state
-cursor_overlay = CursorOverlay()
 
 
 @app.middleware("http")
@@ -669,7 +611,6 @@ async def post_fs_write(payload: Dict[str, Any]):
 
 
 # PowerShell endpoints with session management
-import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
 # Global dictionary to store PowerShell sessions
@@ -678,10 +619,11 @@ session_lock = asyncio.Lock()
 executor = ThreadPoolExecutor(max_workers=5)
 
 def cleanup_old_sessions():
-    """Clean up sessions older than 30 minutes."""
+    """Clean up sessions older than 1 hour."""
     current_time = time.time()
     expired = []
-    for session_id, session in powershell_sessions.items():
+    # Use list() to avoid RuntimeError for changing dict size during iteration
+    for session_id, session in list(powershell_sessions.items()):
         if current_time - session['last_used'] > 3600:  # 1 hour
             expired.append(session_id)
     
@@ -689,26 +631,36 @@ def cleanup_old_sessions():
         if session_id in powershell_sessions:
             try:
                 powershell_sessions[session_id]['process'].terminate()
-            except:
-                pass
+            except (ProcessLookupError, OSError):
+                pass # Process already ended
             del powershell_sessions[session_id]
+
+def read_stream(stream, lines_list, delimiter):
+    """Read lines from a stream until a delimiter is found."""
+    for line in iter(stream.readline, ''):
+        if delimiter in line:
+            break
+        lines_list.append(line.strip())
+    # The stream is now at the delimiter, so further reads will be after it.
+
 
 def execute_powershell_command(command: str, session_id: str, working_directory: Optional[str] = None, same_session: bool = True):
     """Execute PowerShell command in a session."""
     import subprocess
+    import threading
     
     # Clean up old sessions
     cleanup_old_sessions()
     
     if not same_session or session_id not in powershell_sessions:
         # Create new PowerShell session
-        # Try PowerShell 7 first, fallback to Windows PowerShell
         powershell_cmd = "pwsh" if platform.system() != "Windows" else "powershell"
         try:
             # Test if pwsh is available on Windows
-            subprocess.run(["pwsh", "-Version"], capture_output=True, check=True)
-            powershell_cmd = "pwsh"
-        except:
+            if platform.system() == "Windows":
+                subprocess.run(["pwsh", "-Version"], capture_output=True, check=True, timeout=5)
+                powershell_cmd = "pwsh"
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
             pass
         
         # Start PowerShell process
@@ -718,13 +670,15 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         
         process = subprocess.Popen(
-            [powershell_cmd, "-NoLogo", "-NoExit"],
+            [powershell_cmd, "-NoLogo", "-NoExit", "-Command", "-"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             cwd=working_directory,
-            startupinfo=startupinfo
+            startupinfo=startupinfo,
+            encoding='utf-8',
+            errors='replace'
         )
         
         session_id = str(uuid.uuid4())
@@ -735,48 +689,63 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
         
         # Set working directory if specified
         if working_directory:
-            process.stdin.write(f"Set-Location '{working_directory}'\n")
+            process.stdin.write(f"Set-Location -Path '{working_directory}'\n")
             process.stdin.flush()
     
     session = powershell_sessions[session_id]
     session['last_used'] = time.time()
     process = session['process']
     
-    # Execute command with unique delimiter
-    delimiter = f"__CYBERDRIVER_OUTPUT_END_{uuid.uuid4().hex}__"
-    process.stdin.write(f"{command}\n")
-    process.stdin.write(f"echo '{delimiter}'\n")
-    process.stdin.write(f"echo 'EXIT_CODE:'$LASTEXITCODE\n")
+    # Execute command with unique delimiters for stdout and stderr
+    stdout_delimiter = f"__CYBERDRIVER_STDOUT_END_{uuid.uuid4().hex}__"
+    stderr_delimiter = f"__CYBERDRIVER_STDERR_END_{uuid.uuid4().hex}__"
+    exit_code_delimiter = f"__CYBERDRIVER_EXIT_CODE_{uuid.uuid4().hex}__"
+
+    full_command = (
+        f"{command}\n"
+        f"echo '{stdout_delimiter}'\n"
+        f"echo '{stderr_delimiter}' >&2\n"
+        f"echo '{exit_code_delimiter}'; echo $LASTEXITCODE\n"
+    )
+    process.stdin.write(full_command)
     process.stdin.flush()
     
-    # Read output until delimiter
-    output_lines = []
-    exit_code = 0
-    
-    while True:
-        line = process.stdout.readline()
-        if not line:
-            break
-        line = line.rstrip()
-        if delimiter in line:
-            # Next line should contain exit code
-            exit_line = process.stdout.readline().rstrip()
-            if exit_line.startswith("EXIT_CODE:"):
-                try:
-                    exit_code = int(exit_line.split(":")[-1])
-                except:
-                    exit_code = 0
-            break
-        output_lines.append(line)
-    
-    stdout = "\n".join(output_lines)
-    
-    # Check for any stderr (non-blocking read)
+    # Read streams in separate threads to prevent blocking
+    stdout_lines = []
     stderr_lines = []
-    process.stderr.flush()
     
+    stdout_thread = threading.Thread(target=read_stream, args=(process.stdout, stdout_lines, stdout_delimiter))
+    stderr_thread = threading.Thread(target=read_stream, args=(process.stderr, stderr_lines, stderr_delimiter))
+    
+    stdout_thread.start()
+    stderr_thread.start()
+    
+    stdout_thread.join(timeout=3600)
+    stderr_thread.join(timeout=3600)
+
+    # After delimiters are hit, the exit code is the only thing left in stdout
+    exit_code_output = []
+    read_stream(process.stdout, exit_code_output, '') # Read remaining output
+
+    exit_code = 0
+    # Find the line after the delimiter and parse the exit code
+    try:
+        # Find the index of the delimiter in the combined output
+        delimiter_index = -1
+        for i, line in enumerate(exit_code_output):
+            if exit_code_delimiter in line:
+                delimiter_index = i
+                break
+        
+        if delimiter_index != -1 and delimiter_index + 1 < len(exit_code_output):
+            exit_code_line = exit_code_output[delimiter_index + 1]
+            exit_code = int(exit_code_line.strip())
+
+    except (ValueError, IndexError):
+        pass # Could not parse exit code, default to 0
+
     return {
-        "stdout": stdout,
+        "stdout": "\n".join(stdout_lines),
         "stderr": "\n".join(stderr_lines),
         "exit_code": exit_code,
         "session_id": session_id
@@ -822,10 +791,9 @@ async def post_powershell_session(payload: Dict[str, Any]):
     
     async with session_lock:
         if action == "create":
-            # Create new session
-            session_id = str(uuid.uuid4())
-            # Session will be created on first command
-            return {"session_id": session_id}
+            # Session is created on the first `exec` command automatically
+            new_session_id = str(uuid.uuid4())
+            return {"session_id": new_session_id, "message": "Session will be created on first use."}
         
         elif action == "destroy":
             if not session_id:
@@ -1034,14 +1002,19 @@ def main():
     parser = argparse.ArgumentParser(
         description="Cyberdriver: Remote computer control"
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument(
+        "-v", "--version",
+        action="version",
+        version=f"%(prog)s {VERSION}",
+        help="Show program's version number and exit"
+    )
+    
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
     
     # start command
     start_parser = subparsers.add_parser("start", help="Start local server")
     start_parser.add_argument("--port", type=int, default=3000, 
                             help="Port for local API server")
-    start_parser.add_argument("--cursor-overlay", action="store_true",
-                            help="Enable cursor overlay")
     
     # join command
     join_parser = subparsers.add_parser("join", 
@@ -1054,17 +1027,16 @@ def main():
                            help="API key for authentication")
     join_parser.add_argument("--target-port", type=int, default=3000,
                            help="Local API port")
-    join_parser.add_argument("--cursor-overlay", action="store_true",
-                           help="Enable cursor overlay")
     
     args = parser.parse_args()
+
+    # If no command is given, print help
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
     
     # Disable Windows console QuickEdit mode to prevent output blocking
     disable_windows_console_quickedit()
-    
-    # Start cursor overlay if requested
-    if getattr(args, 'cursor_overlay', False):
-        cursor_overlay.start()
     
     try:
         if args.command == "start":
@@ -1080,8 +1052,6 @@ def main():
         print(f"\nError: {e}")
         sys.exit(1)
     finally:
-        # Cleanup
-        cursor_overlay.stop()
         print("Cleanup complete.")
 
 
