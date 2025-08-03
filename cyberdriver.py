@@ -718,7 +718,7 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
     full_command = (
         f"{command}\n"
         f"echo '{stdout_delimiter}'\n"
-        f"echo '{stderr_delimiter}' >&2\n"
+        f"[Console]::Error.WriteLine('{stderr_delimiter}')\n"
         f"echo '{exit_code_delimiter}'; echo $LASTEXITCODE\n"
     )
     process.stdin.write(full_command)
