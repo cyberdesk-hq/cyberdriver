@@ -45,7 +45,7 @@ import json
 import os
 import platform
 import pathlib
-import re
+import socket
 import subprocess
 import sys
 import time
@@ -206,15 +206,30 @@ def get_config() -> Config:
         
         return config
     
-    # Fallback in case logic fails, though it shouldn't be reached
-    # This can happen if the file is corrupted in a very specific way
-    # between the check and the read.
+    # Fallback in case logic fails
     config_dir.mkdir(parents=True, exist_ok=True)
     config = Config(version=VERSION, fingerprint=str(uuid.uuid4()))
     with open(config_path, 'w') as f:
         json.dump(config.to_dict(), f, indent=2)
     return config
 
+
+# -----------------------------------------------------------------------------
+# Network Utilities
+# -----------------------------------------------------------------------------
+
+def find_available_port(host: str, start_port: int, max_attempts: int = 50) -> Optional[int]:
+    """Find an available TCP port by trying to bind to it."""
+    for port in range(start_port, start_port + max_attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind((host, port))
+                return port
+            except OSError:
+                if port == start_port:
+                    print(f"Port {port} is in use, searching for an available one...")
+                continue
+    return None
 
 # -----------------------------------------------------------------------------
 # Screenshot Scaling
@@ -374,12 +389,11 @@ async def get_screenshot(
         pil_image = Image.frombytes('RGB', img.size, img.bgra, 'raw', 'BGRX')
         
         # Default to 1024x768 if no dimensions specified
-        # This fixed resolution is strongly recommended for Claude
         if width is None and height is None:
             width = 1024
             height = 768
         
-        # Apply scaling - always scale to maintain consistency with Piglet
+        # Apply scaling
         if width is not None or height is not None:
             pil_image = scale_image(pil_image, width, height, scale_mode)
         
@@ -862,7 +876,7 @@ class TunnelClient:
         # Use compatibility wrapper for connection
         websocket = await connect_with_headers(uri, headers)
         async with websocket:
-            print("Connected to control server")
+            print(f"Connected to control server, forwarding to http://127.0.0.1:{self.target_port}")
             
             # Message handling state
             request_meta = None
@@ -903,7 +917,7 @@ class TunnelClient:
         query = meta.get("query", "")
         headers = meta.get("headers", {})
         
-        url = f"http://localhost:{self.target_port}{path}"
+        url = f"http://127.0.0.1:{self.target_port}{path}"
         if query:
             url += f"?{query}"
         
@@ -962,7 +976,7 @@ def run_server(port: int):
 
 async def run_server_async(port: int):
     """Run the FastAPI server asynchronously."""
-    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="info")
     server = uvicorn.Server(config)
     await server.serve()
 
@@ -971,14 +985,23 @@ async def run_join(host: str, port: int, secret: str, target_port: int):
     """Run both API server and tunnel client."""
     config = get_config()
     
+    # Find an available port for the local server, starting with the one provided
+    actual_target_port = find_available_port("127.0.0.1", target_port)
+    if actual_target_port is None:
+        print(f"Error: Could not find an available port starting from {target_port}.")
+        sys.exit(1)
+    
+    if actual_target_port != target_port:
+        print(f"Using available port {actual_target_port} for local server.")
+
     # Start API server asynchronously in the same event loop
-    server_task = asyncio.create_task(run_server_async(target_port))
+    server_task = asyncio.create_task(run_server_async(actual_target_port))
     
     # Give server time to start
     await asyncio.sleep(1)
     
     # Start tunnel client
-    tunnel = TunnelClient(host, port, secret, target_port, config)
+    tunnel = TunnelClient(host, port, secret, actual_target_port, config)
     
     # Run both concurrently
     try:
@@ -1000,33 +1023,49 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
     
     parser = argparse.ArgumentParser(
-        description="Cyberdriver: Remote computer control"
+        description="Cyberdriver: A tool for remote computer control via the Cyberdesk platform.",
+        epilog="Run 'cyberdriver.py <command> -h' for more details on a specific command.",
+        formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument(
         "-v", "--version",
         action="version",
         version=f"%(prog)s {VERSION}",
-        help="Show program's version number and exit"
+        help="Show program's version number and exit."
     )
     
-    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    subparsers = parser.add_subparsers(title="Available Commands", dest="command", metavar="<command>")
     
     # start command
-    start_parser = subparsers.add_parser("start", help="Start local server")
-    start_parser.add_argument("--port", type=int, default=3000, 
-                            help="Port for local API server")
+    start_parser = subparsers.add_parser(
+        "start", 
+        help="Start a local-only API server.",
+        description="Starts the Cyberdriver API server on the local machine without connecting to the\ncontrol plane. Useful for local testing and development.",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    start_parser.add_argument(
+        "--port", 
+        type=int, 
+        default=3000, 
+        help="Port for the local API server. If in use, Cyberdriver will find the next available port."
+    )
     
     # join command
-    join_parser = subparsers.add_parser("join", 
-                                      help="Join control plane")
-    join_parser.add_argument("--host", default="api.cyberdesk.io", 
-                           help="Control server host")
-    join_parser.add_argument("--port", type=int, default=443, 
-                           help="Control server port")
-    join_parser.add_argument("--secret", required=True, 
-                           help="API key for authentication")
-    join_parser.add_argument("--target-port", type=int, default=3000,
-                           help="Local API port")
+    join_parser = subparsers.add_parser(
+        "join", 
+        help="Connect to the Cyberdesk control plane.",
+        description="Starts the local API server and connects to the Cyberdesk cloud via a reverse tunnel,\nallowing for remote control.",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    join_parser.add_argument("--host", default="api.cyberdesk.io", help="Control server host.")
+    join_parser.add_argument("--port", type=int, default=443, help="Control server port.")
+    join_parser.add_argument("--secret", required=True, help="API key for authentication.")
+    join_parser.add_argument(
+        "--target-port", 
+        type=int, 
+        default=3000,
+        help="Local port to forward traffic to. If in use, Cyberdriver will find the next available one."
+    )
     
     args = parser.parse_args()
 
@@ -1040,8 +1079,14 @@ def main():
     
     try:
         if args.command == "start":
-            print(f"Local server running at http://localhost:{args.port}")
-            run_server(args.port)
+            actual_port = find_available_port("0.0.0.0", args.port)
+            if actual_port is None:
+                print(f"Error: Could not find an available port starting from {args.port}.")
+                sys.exit(1)
+            
+            print(f"✓ Cyberdriver server starting on http://0.0.0.0:{actual_port}")
+            run_server(actual_port)
+
         elif args.command == "join":
             asyncio.run(run_join(
                 args.host, args.port, args.secret, args.target_port
@@ -1049,7 +1094,7 @@ def main():
     except KeyboardInterrupt:
         print("\n\nKeyboard interrupt received. Shutting down...")
     except Exception as e:
-        print(f"\nError: {e}")
+        print(f"\nAn unexpected error occurred: {e}")
         sys.exit(1)
     finally:
         print("Cleanup complete.")
