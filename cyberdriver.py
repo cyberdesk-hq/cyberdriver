@@ -1019,49 +1019,44 @@ def signal_handler(signum, frame):
 
 def print_banner():
     """Print a cool gradient banner for Cyberdriver."""
-    # ANSI color codes for gradient from blue to purple
-    colors = [
-        '\033[38;2;0;123;255m',    # Blue
-        '\033[38;2;51;102;255m',   # Blue-ish
-        '\033[38;2;102;81;255m',   # Blue-Purple
-        '\033[38;2;153;60;255m',   # Purple-ish
-        '\033[38;2;204;39;255m',   # Purple
-        '\033[38;2;255;18;255m',   # Bright Purple
-    ]
+    # Colors
+    white = '\033[97m'
+    blue = '\033[38;2;0;123;255m'
+    purple = '\033[38;2;147;51;234m'
     reset = '\033[0m'
     
     banner = [
-        "  ██████╗██╗   ██╗██████╗ ███████╗██████╗ ██████╗ ██████╗ ██╗██╗   ██╗███████╗██████╗ ",
-        " ██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗██╔══██╗██╔══██╗██║██║   ██║██╔════╝██╔══██╗",
-        " ██║      ╚████╔╝ ██████╔╝█████╗  ██████╔╝██║  ██║██████╔╝██║██║   ██║█████╗  ██████╔╝",
-        " ██║       ╚██╔╝  ██╔══██╗██╔══╝  ██╔══██╗██║  ██║██╔══██╗██║╚██╗ ██╔╝██╔══╝  ██╔══██╗",
-        " ╚██████╗   ██║   ██████╔╝███████╗██║  ██║██████╔╝██║  ██║██║ ╚████╔╝ ███████╗██║  ██║",
-        "  ╚═════╝   ╚═╝   ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝  ╚══════╝╚═╝  ╚═╝"
+        " ██████╗██╗   ██╗██████╗ ███████╗██████╗ ██████╗ ██████╗ ██╗██╗   ██╗███████╗██████╗ ",
+        "██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗██╔══██╗██╔══██╗██║██║   ██║██╔════╝██╔══██╗",
+        "██║      ╚████╔╝ ██████╔╝█████╗  ██████╔╝██║  ██║██████╔╝██║██║   ██║█████╗  ██████╔╝",
+        "██║       ╚██╔╝  ██╔══██╗██╔══╝  ██╔══██╗██║  ██║██╔══██╗██║╚██╗ ██╔╝██╔══╝  ██╔══██╗",
+        "╚██████╗   ██║   ██████╔╝███████╗██║  ██║██████╔╝██║  ██║██║ ╚████╔╝ ███████╗██║  ██║",
+        " ╚═════╝   ╚═╝   ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝  ╚══════╝╚═╝  ╚═╝"
     ]
     
-    # Print banner with gradient
-    for i, line in enumerate(banner):
-        # Calculate color index based on position
-        color_idx = int((i / len(banner)) * len(colors))
-        print(f"{colors[color_idx]}{line}{reset}")
+    # Print banner with left-to-right gradient
+    for line in banner:
+        output = ""
+        line_length = len(line)
+        for i, char in enumerate(line):
+            # Calculate gradient position (0 to 1)
+            position = i / max(line_length - 1, 1)
+            
+            # Interpolate between blue and purple
+            r = int(0 + (147 - 0) * position)
+            g = int(123 + (51 - 123) * position)
+            b = int(255 + (234 - 255) * position)
+            
+            color = f'\033[38;2;{r};{g};{b}m'
+            output += f"{color}{char}"
+        print(f"{output}{reset}")
     
     print()
     
-    # Tips section with gradient
-    tips = [
-        "Tips for getting started:",
-        "1. Connect to Cyberdesk Cloud: cyberdriver join --secret YOUR_API_KEY",
-        "2. Use -h or --help for more information on any command.",
-        "3. Visit docs.cyberdesk.io for complete documentation and troubleshooting."
-    ]
-    
-    for i, tip in enumerate(tips):
-        color_idx = min(int((i / len(tips)) * len(colors)), len(colors) - 1)
-        if i == 1:  # Highlight the main command
-            print(f"{colors[color_idx]}→ {tip}{reset}")
-        else:
-            print(f"{colors[color_idx]}{tip}{reset}")
-    
+    # Concise tips with selective blue highlighting
+    print(f"{white}Get started:{reset}")
+    print(f"{white}→ {blue}cyberdriver join --secret{reset} {white}YOUR_API_KEY{reset}")
+    print(f"{white}→ Run {blue}-h{reset} {white}for help{reset}")
     print()
 
 
