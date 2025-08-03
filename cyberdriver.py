@@ -34,8 +34,8 @@ Install dependencies:
     pip install fastapi uvicorn[standard] websockets httpx mss pyautogui pillow numpy
 
 Usage:
-    python cyberdriver.py start [--port 3000]
-    python cyberdriver.py join --secret API_KEY [--host example.com] [--port 443]
+    cyberdriver start [--port 3000]
+    cyberdriver join --secret YOUR_API_KEY [--host example.com] [--port 443]
 """
 
 import argparse
@@ -1017,10 +1017,62 @@ def signal_handler(signum, frame):
     sys.exit(0)
 
 
+def print_banner():
+    """Print a cool gradient banner for Cyberdriver."""
+    # ANSI color codes for gradient from blue to purple
+    colors = [
+        '\033[38;2;0;123;255m',    # Blue
+        '\033[38;2;51;102;255m',   # Blue-ish
+        '\033[38;2;102;81;255m',   # Blue-Purple
+        '\033[38;2;153;60;255m',   # Purple-ish
+        '\033[38;2;204;39;255m',   # Purple
+        '\033[38;2;255;18;255m',   # Bright Purple
+    ]
+    reset = '\033[0m'
+    
+    banner = [
+        "  ██████╗██╗   ██╗██████╗ ███████╗██████╗ ██████╗ ██████╗ ██╗██╗   ██╗███████╗██████╗ ",
+        " ██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗██╔══██╗██╔══██╗██║██║   ██║██╔════╝██╔══██╗",
+        " ██║      ╚████╔╝ ██████╔╝█████╗  ██████╔╝██║  ██║██████╔╝██║██║   ██║█████╗  ██████╔╝",
+        " ██║       ╚██╔╝  ██╔══██╗██╔══╝  ██╔══██╗██║  ██║██╔══██╗██║╚██╗ ██╔╝██╔══╝  ██╔══██╗",
+        " ╚██████╗   ██║   ██████╔╝███████╗██║  ██║██████╔╝██║  ██║██║ ╚████╔╝ ███████╗██║  ██║",
+        "  ╚═════╝   ╚═╝   ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝  ╚══════╝╚═╝  ╚═╝"
+    ]
+    
+    # Print banner with gradient
+    for i, line in enumerate(banner):
+        # Calculate color index based on position
+        color_idx = int((i / len(banner)) * len(colors))
+        print(f"{colors[color_idx]}{line}{reset}")
+    
+    print()
+    
+    # Tips section with gradient
+    tips = [
+        "Tips for getting started:",
+        "1. Connect to Cyberdesk Cloud: cyberdriver join --secret YOUR_API_KEY",
+        "2. Use -h or --help for more information on any command.",
+        "3. Visit docs.cyberdesk.io for complete documentation and troubleshooting."
+    ]
+    
+    for i, tip in enumerate(tips):
+        color_idx = min(int((i / len(tips)) * len(colors)), len(colors) - 1)
+        if i == 1:  # Highlight the main command
+            print(f"{colors[color_idx]}→ {tip}{reset}")
+        else:
+            print(f"{colors[color_idx]}{tip}{reset}")
+    
+    print()
+
+
 def main():
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Print banner if no arguments or help requested
+    if len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] in ['-h', '--help']):
+        print_banner()
     
     parser = argparse.ArgumentParser(
         description="Cyberdriver: A tool for remote computer control via the Cyberdesk platform.",
