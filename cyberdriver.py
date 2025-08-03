@@ -1057,6 +1057,7 @@ def print_banner():
     print(f"{white}Get started:{reset}")
     print(f"{white}→ {blue}cyberdriver join --secret{reset} {white}YOUR_API_KEY{reset}")
     print(f"{white}→ Run {blue}-h{reset} {white}for help{reset}")
+    print(f"{white}→ Visit {blue}https://docs.cyberdesk.io{reset} for documentation")
     print()
 
 
@@ -1070,56 +1071,59 @@ def main():
         print_banner()
     
     parser = argparse.ArgumentParser(
-        description="Cyberdriver: A tool for remote computer control via the Cyberdesk platform.",
-        epilog="Run 'cyberdriver.py <command> -h' for more details on a specific command.",
-        formatter_class=argparse.RawTextHelpFormatter
+        description="Remote computer control via Cyberdesk",
+        epilog="",
+        formatter_class=argparse.RawTextHelpFormatter,
+        add_help=False  # We'll add custom help
     )
     parser.add_argument(
         "-v", "--version",
         action="version",
-        version=f"%(prog)s {VERSION}",
-        help="Show program's version number and exit."
+        version=f"%(prog)s {VERSION}"
+    )
+    parser.add_argument(
+        "-h", "--help",
+        action="store_true",
+        help="Show help"
     )
     
-    subparsers = parser.add_subparsers(title="Available Commands", dest="command", metavar="<command>")
+    subparsers = parser.add_subparsers(dest="command", metavar="")
     
     # start command
     start_parser = subparsers.add_parser(
         "start", 
-        help="Start a local-only API server.",
-        description="Starts the Cyberdriver API server on the local machine without connecting to the\ncontrol plane. Useful for local testing and development.",
-        formatter_class=argparse.RawTextHelpFormatter
+        help="Start local server",
+        description="Start Cyberdriver API server locally for testing"
     )
-    start_parser.add_argument(
-        "--port", 
-        type=int, 
-        default=3000, 
-        help="Port for the local API server. If in use, Cyberdriver will find the next available port."
-    )
+    start_parser.add_argument("--port", type=int, default=3000, help="Port (default: 3000)")
     
     # join command
     join_parser = subparsers.add_parser(
         "join", 
-        help="Connect to the Cyberdesk control plane.",
-        description="Starts the local API server and connects to the Cyberdesk cloud via a reverse tunnel,\nallowing for remote control.",
-        formatter_class=argparse.RawTextHelpFormatter
+        help="Connect to Cyberdesk Cloud",
+        description="Connect your machine to Cyberdesk Cloud for remote control"
     )
-    join_parser.add_argument("--host", default="api.cyberdesk.io", help="Control server host.")
-    join_parser.add_argument("--port", type=int, default=443, help="Control server port.")
-    join_parser.add_argument("--secret", required=True, help="API key for authentication.")
-    join_parser.add_argument(
-        "--target-port", 
-        type=int, 
-        default=3000,
-        help="Local port to forward traffic to. If in use, Cyberdriver will find the next available one."
-    )
+    join_parser.add_argument("--secret", required=True, help="Your API key from Cyberdesk")
+    join_parser.add_argument("--host", default="api.cyberdesk.io", help="Control server (default: api.cyberdesk.io)")
+    join_parser.add_argument("--port", type=int, default=443, help="Control server port (default: 443)")
+    join_parser.add_argument("--target-port", type=int, default=3000, help="Local port (default: 3000)")
     
     args = parser.parse_args()
 
-    # If no command is given, print help
-    if not args.command:
-        parser.print_help()
+    # Handle help or no command
+    if not args.command or args.help:
+        if not (len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] in ['-h', '--help'])):
+            print_banner()
+        print("Commands:")
+        print("  join --secret KEY  Connect to Cyberdesk Cloud")
+        print("  start              Start local server")
+        print()
+        print("For more info: cyberdriver <command> -h")
         sys.exit(0)
+    
+    # Show banner for join command
+    if args.command == "join":
+        print_banner()
     
     # Disable Windows console QuickEdit mode to prevent output blocking
     disable_windows_console_quickedit()
