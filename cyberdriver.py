@@ -717,6 +717,10 @@ def read_stream(stream, lines_list, delimiter, timeout_event=None):
             read_thread.join(0.1)  # Wait max 0.1 seconds
             
             if not read_thread.is_alive() and line:
+                # Debug: print ALL lines we read
+                if line.strip():
+                    print(f"READ: {line.strip()[:100]}")
+                
                 if delimiter and f"###DELIMITER:{delimiter}###" in line:
                     break
                 if line.strip():  # Only add non-empty lines
@@ -729,6 +733,10 @@ def read_stream(stream, lines_list, delimiter, timeout_event=None):
                     
                     if not (is_prompt or is_init_cmd or is_echo_of_cmd):
                         lines_list.append(stripped)
+                    else:
+                        # Temporary debug: see what we're filtering out
+                        if not is_prompt and not is_init_cmd:
+                            print(f"FILTERED OUT: {stripped[:100]}")
             elif timeout_event and timeout_event.is_set():
                 break
             continue
@@ -753,6 +761,10 @@ def read_stream(stream, lines_list, delimiter, timeout_event=None):
             
             if not (is_prompt or is_init_cmd or is_echo_of_cmd):
                 lines_list.append(stripped)
+            else:
+                # Temporary debug: see what we're filtering out
+                if not is_prompt and not is_init_cmd:
+                    print(f"FILTERED OUT: {stripped[:100]}")
 
 
 def kill_powershell_session(session_id: str):
