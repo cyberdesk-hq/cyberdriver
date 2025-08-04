@@ -687,7 +687,7 @@ def read_stream(stream, lines_list, delimiter, timeout_event=None):
             return
             
         # Debug: print ALL lines we read
-        print(f"READ: {line.strip()[:100]}")
+        #print(f"READ: {line.strip()[:100]}")
         
         # Check for delimiter
         if delimiter and f"###DELIMITER:{delimiter}###" in line:
@@ -973,6 +973,11 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
     # For now, we'll just return what we got
     # TODO: Add proper exit code handling back once basic execution works
 
+    # Debug: print what we collected
+    print(f"DEBUG: Collected {len(stdout_lines)} stdout lines")
+    for i, line in enumerate(stdout_lines[:10]):  # Show first 10 lines
+        print(f"  Line {i}: {line[:50]}...")
+    
     return {
         "stdout": "\n".join(stdout_lines),
         "stderr": "\n".join(stderr_lines),
