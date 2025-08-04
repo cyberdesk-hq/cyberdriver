@@ -681,7 +681,7 @@ def read_stream(stream, lines_list, delimiter, timeout_event=None):
     """Read lines from a stream until a delimiter is found or timeout."""
     import select
     
-    print(f"Starting read_stream, looking for delimiter: {delimiter[:20]}...")
+    # Debug logging removed - function is working properly now
     
     while True:
         # Check if we should stop due to timeout
@@ -717,12 +717,17 @@ def read_stream(stream, lines_list, delimiter, timeout_event=None):
             read_thread.join(0.1)  # Wait max 0.1 seconds
             
             if not read_thread.is_alive() and line:
-                print(f"Read line: {line.strip()[:100]}")
                 if delimiter and delimiter in line:
-                    print(f"Found delimiter!")
                     break
                 if line.strip():  # Only add non-empty lines
-                    lines_list.append(line.strip())
+                    # Skip PowerShell prompts and initialization commands
+                    stripped = line.strip()
+                    is_prompt = stripped.startswith("PS ") and stripped.endswith(">")
+                    is_init_cmd = any(pref in stripped for pref in ["$ProgressPreference", "$ConfirmPreference", "$VerbosePreference", "$DebugPreference", "Set-Location"])
+                    is_echo_of_cmd = stripped.startswith("echo ") or stripped.startswith("Write-Output ")
+                    
+                    if not (is_prompt or is_init_cmd or is_echo_of_cmd):
+                        lines_list.append(stripped)
             elif timeout_event and timeout_event.is_set():
                 break
             continue
@@ -738,7 +743,14 @@ def read_stream(stream, lines_list, delimiter, timeout_event=None):
         if delimiter and delimiter in line:
             break
         if line.strip():  # Only add non-empty lines
-            lines_list.append(line.strip())
+            # Skip PowerShell prompts and initialization commands
+            stripped = line.strip()
+            is_prompt = stripped.startswith("PS ") and stripped.endswith(">")
+            is_init_cmd = any(pref in stripped for pref in ["$ProgressPreference", "$ConfirmPreference", "$VerbosePreference", "$DebugPreference", "Set-Location"])
+            is_echo_of_cmd = stripped.startswith("echo ") or stripped.startswith("Write-Output ")
+            
+            if not (is_prompt or is_init_cmd or is_echo_of_cmd):
+                lines_list.append(stripped)
 
 
 def kill_powershell_session(session_id: str):
@@ -800,7 +812,7 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
             # NO "-Command -" - we want interactive mode!
         ]
         
-        print(f"Starting PowerShell with args: {ps_args}")
+        # Start PowerShell with proper args
         
         process = subprocess.Popen(
             ps_args,
@@ -823,7 +835,6 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
         
         # Give PowerShell a moment to initialize
         time.sleep(0.5)
-        print("PowerShell process initialized")
         
         # Set working directory if specified
         if working_directory:
@@ -855,15 +866,10 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
         f"Write-Output '{stdout_delimiter}'\n"
     )
     
-    print(f"Executing command: {command}")
-    print(f"Full command with delimiters:\n{full_command}")
-    print(f"Process alive: {process.poll() is None}")
-    
     # Write and flush
     try:
         process.stdin.write(full_command)
         process.stdin.flush()
-        print("Command written and flushed successfully")
     except Exception as e:
         print(f"Error writing command: {e}")
         raise
