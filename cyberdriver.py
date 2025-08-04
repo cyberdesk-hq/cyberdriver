@@ -108,7 +108,14 @@ def disable_windows_console_quickedit():
         new_mode = mode.value & ~ENABLE_QUICK_EDIT_MODE & ~ENABLE_INSERT_MODE
         kernel32.SetConsoleMode(handle, new_mode | ENABLE_EXTENDED_FLAGS)
         
-        print("✓ Disabled Windows console QuickEdit mode")
+        # Try to print with checkmark
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+            print("✓ Disabled Windows console QuickEdit mode")
+        except:
+            print("√ Disabled Windows console QuickEdit mode")
     except Exception as e:
         print(f"Note: Could not disable QuickEdit mode: {e}")
         print("If output appears stuck, click elsewhere or press Escape in the console")
@@ -146,7 +153,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.14"
+VERSION = "0.0.15"
 
 @dataclass
 class Config:
@@ -937,10 +944,23 @@ class TunnelClient:
         websocket = await connect_with_headers(uri, headers)
         async with websocket:
             # Print success message with green checkmark
-            green = '\033[92m'
-            white = '\033[97m'
-            reset = '\033[0m'
-            print(f"{green}✓{reset} {white}Connected!{reset} Forwarding to http://127.0.0.1:{self.target_port}")
+            if platform.system() == "Windows":
+                # Check if colors are supported
+                try:
+                    import ctypes
+                    kernel32 = ctypes.windll.kernel32
+                    kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+                    green = '\033[92m'
+                    white = '\033[97m'
+                    reset = '\033[0m'
+                    print(f"{green}✓{reset} {white}Connected!{reset} Forwarding to http://127.0.0.1:{self.target_port}")
+                except:
+                    print(f"√ Connected! Forwarding to http://127.0.0.1:{self.target_port}")
+            else:
+                green = '\033[92m'
+                white = '\033[97m'
+                reset = '\033[0m'
+                print(f"{green}✓{reset} {white}Connected!{reset} Forwarding to http://127.0.0.1:{self.target_port}")
             
             # Message handling state
             request_meta = None
@@ -1081,12 +1101,51 @@ def signal_handler(signum, frame):
     sys.exit(0)
 
 
+def print_banner_no_color(mode="default"):
+    """Print banner without colors for terminals that don't support ANSI."""
+    banner = [
+        " ██████╗██╗   ██╗██████╗ ███████╗██████╗ ██████╗ ██████╗ ██╗██╗   ██╗███████╗██████╗ ",
+        "██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗██╔══██╗██╔══██╗██║██║   ██║██╔════╝██╔══██╗",
+        "██║      ╚████╔╝ ██████╔╝█████╗  ██████╔╝██║  ██║██████╔╝██║██║   ██║█████╗  ██████╔╝",
+        "██║       ╚██╔╝  ██╔══██╗██╔══╝  ██╔══██╗██║  ██║██╔══██╗██║╚██╗ ██╔╝██╔══╝  ██╔══██╗",
+        "╚██████╗   ██║   ██████╔╝███████╗██║  ██║██████╔╝██║  ██║██║ ╚████╔╝ ███████╗██║  ██║",
+        " ╚═════╝   ╚═╝   ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝  ╚══════╝╚═╝  ╚═╝"
+    ]
+    
+    for line in banner:
+        print(line)
+    
+    print()
+    
+    if mode == "connecting":
+        print("Connecting to Cyberdesk Cloud...")
+    else:
+        print("Get started:")
+        print("→ cyberdriver join --secret YOUR_API_KEY")
+    
+    print("→ Run -h for help")
+    print("→ Visit https://docs.cyberdesk.io for documentation")
+    print()
+
+
 def print_banner(mode="default"):
     """Print a cool gradient banner for Cyberdriver.
     
     Args:
         mode: "default" for normal banner, "connecting" for join command
     """
+    # Enable Windows terminal colors if needed
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            # Enable ANSI escape sequences
+            kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+        except:
+            # If we can't enable ANSI, disable colors
+            print_banner_no_color(mode)
+            return
+    
     # Colors
     white = '\033[97m'
     blue = '\033[38;2;0;123;255m'
@@ -1209,7 +1268,17 @@ def main():
                 print(f"Error: Could not find an available port starting from {args.port}.")
                 sys.exit(1)
             
-            print(f"✓ Cyberdriver server starting on http://0.0.0.0:{actual_port}")
+            # Try to print with checkmark
+            if platform.system() == "Windows":
+                try:
+                    import ctypes
+                    kernel32 = ctypes.windll.kernel32
+                    kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+                    print(f"✓ Cyberdriver server starting on http://0.0.0.0:{actual_port}")
+                except:
+                    print(f"√ Cyberdriver server starting on http://0.0.0.0:{actual_port}")
+            else:
+                print(f"✓ Cyberdriver server starting on http://0.0.0.0:{actual_port}")
             run_server(actual_port)
 
         elif args.command == "join":
