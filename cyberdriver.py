@@ -976,7 +976,12 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
     # Debug: print what we collected
     print(f"DEBUG: Collected {len(stdout_lines)} stdout lines")
     for i, line in enumerate(stdout_lines[:10]):  # Show first 10 lines
-        print(f"  Line {i}: {line[:50]}...")
+        print(f"  Line {i}: {repr(line[:50])}...")
+    
+    # Check the joined output
+    joined_output = "\n".join(stdout_lines)
+    print(f"DEBUG: Joined output length: {len(joined_output)} chars")
+    print(f"DEBUG: Joined output preview: {repr(joined_output[:200])}")
     
     return {
         "stdout": "\n".join(stdout_lines),
