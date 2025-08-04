@@ -717,11 +717,7 @@ def read_stream(stream, lines_list, delimiter, timeout_event=None):
             read_thread.join(0.1)  # Wait max 0.1 seconds
             
             if not read_thread.is_alive() and line:
-                # Debug: print what we're reading
-                if "###DELIMITER:" in line:
-                    print(f"DEBUG: Found delimiter line: {line.strip()}")
                 if delimiter and f"###DELIMITER:{delimiter}###" in line:
-                    print(f"DEBUG: Delimiter found!")
                     break
                 if line.strip():  # Only add non-empty lines
                     # TEMPORARILY DISABLED FILTERING FOR DEBUGGING
@@ -739,15 +735,18 @@ def read_stream(stream, lines_list, delimiter, timeout_event=None):
             
         if not line:  # EOF
             break
-        if "###DELIMITER:" in line:
-            print(f"DEBUG: Found delimiter line: {line.strip()}")
         if delimiter and f"###DELIMITER:{delimiter}###" in line:
-            print(f"DEBUG: Delimiter matched!")
             break
         if line.strip():  # Only add non-empty lines
-            # TEMPORARILY DISABLED FILTERING FOR DEBUGGING
-            print(f"DEBUG: Read output line: {line.strip()[:100]}")
-            lines_list.append(line.strip())
+            # Skip PowerShell prompts and initialization commands
+            stripped = line.strip()
+            is_prompt = stripped.startswith("PS ") and stripped.endswith(">")
+            is_init_cmd = any(pref in stripped for pref in ["$ProgressPreference", "$ConfirmPreference", "$VerbosePreference", "$DebugPreference", "Set-Location"])
+            # Don't filter out echo commands with our delimiter marker
+            is_echo_of_cmd = (stripped.startswith("echo ") or stripped.startswith("Write-Output ")) and "###DELIMITER:" not in stripped
+            
+            if not (is_prompt or is_init_cmd or is_echo_of_cmd):
+                lines_list.append(stripped)
 
 
 def kill_powershell_session(session_id: str):
@@ -865,10 +864,8 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
     
     # Write and flush
     try:
-        print(f"DEBUG: Writing command to PowerShell (length: {len(full_command)} chars)")
         process.stdin.write(full_command)
         process.stdin.flush()
-        print(f"DEBUG: Command written successfully")
     except Exception as e:
         print(f"Error writing command: {e}")
         raise
