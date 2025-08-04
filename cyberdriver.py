@@ -685,9 +685,13 @@ def read_stream(stream, lines_list, delimiter, timeout_event=None):
         # Use select with timeout to check if data is available
         if platform.system() != "Windows":
             # Unix-like systems
-            ready, _, _ = select.select([stream], [], [], 0.1)
-            if not ready:
-                continue
+            try:
+                ready, _, _ = select.select([stream], [], [], 0.1)
+                if not ready:
+                    continue
+            except (ValueError, OSError):
+                # Stream might be closed
+                break
         else:
             # Windows doesn't support select on pipes, use a different approach
             # Try to read with a very short timeout
@@ -696,7 +700,10 @@ def read_stream(stream, lines_list, delimiter, timeout_event=None):
             
             def read_line():
                 nonlocal line
-                line = stream.readline()
+                try:
+                    line = stream.readline()
+                except:
+                    line = None
             
             read_thread = threading.Thread(target=read_line)
             read_thread.daemon = True
@@ -704,20 +711,26 @@ def read_stream(stream, lines_list, delimiter, timeout_event=None):
             read_thread.join(0.1)  # Wait max 0.1 seconds
             
             if not read_thread.is_alive() and line:
-                if delimiter in line:
+                if delimiter and delimiter in line:
                     break
-                lines_list.append(line.strip())
+                if line.strip():  # Only add non-empty lines
+                    lines_list.append(line.strip())
             elif timeout_event and timeout_event.is_set():
                 break
             continue
         
         # Read the line
-        line = stream.readline()
+        try:
+            line = stream.readline()
+        except:
+            break
+            
         if not line:  # EOF
             break
-        if delimiter in line:
+        if delimiter and delimiter in line:
             break
-        lines_list.append(line.strip())
+        if line.strip():  # Only add non-empty lines
+            lines_list.append(line.strip())
 
 
 def kill_powershell_session(session_id: str):
@@ -747,7 +760,7 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
     # Check if there's an active execution for this session that's hanging
     if session_id in active_executions:
         # Kill the hanging session
-        print(f"Killing hanging session {session_id}")
+        print(f"WARNING: Killing hanging session {session_id} (started {time.time() - active_executions[session_id]['start_time']:.1f}s ago)")
         kill_powershell_session(session_id)
         if session_id in active_executions:
             del active_executions[session_id]
@@ -769,8 +782,20 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         
+        # Use proper PowerShell flags to prevent hanging
+        ps_args = [
+            powershell_cmd,
+            "-NoLogo",           # No startup banner
+            "-NoProfile",        # Don't load profile (prevents hanging on profile scripts)
+            "-NonInteractive",   # Don't prompt for input
+            "-ExecutionPolicy", "Bypass",  # Allow script execution
+            "-Command", "-"      # Read commands from stdin
+        ]
+        
+        print(f"Starting PowerShell with args: {ps_args}")
+        
         process = subprocess.Popen(
-            [powershell_cmd, "-NoLogo", "-NoExit", "-Command", "-"],
+            ps_args,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -778,10 +803,11 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
             cwd=working_directory,
             startupinfo=startupinfo,
             encoding='utf-8',
-            errors='replace'
+            errors='replace',
+            bufsize=1  # Line buffered
         )
         
-        session_id = str(uuid.uuid4())
+        # Use the provided session_id, don't generate a new one
         powershell_sessions[session_id] = {
             'process': process,
             'last_used': time.time()
@@ -791,6 +817,17 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
         if working_directory:
             process.stdin.write(f"Set-Location -Path '{working_directory}'\n")
             process.stdin.flush()
+        
+        # Set PowerShell preferences to prevent hanging on prompts
+        init_commands = [
+            "$ProgressPreference = 'SilentlyContinue'",  # Disable progress bars
+            "$ConfirmPreference = 'None'",               # Never prompt for confirmation
+            "$VerbosePreference = 'SilentlyContinue'",   # Disable verbose output
+            "$DebugPreference = 'SilentlyContinue'",     # Disable debug output
+        ]
+        for cmd in init_commands:
+            process.stdin.write(f"{cmd}\n")
+        process.stdin.flush()
     
     session = powershell_sessions[session_id]
     session['last_used'] = time.time()
@@ -801,12 +838,24 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
     stderr_delimiter = f"__CYBERDRIVER_STDERR_END_{uuid.uuid4().hex}__"
     exit_code_delimiter = f"__CYBERDRIVER_EXIT_CODE_{uuid.uuid4().hex}__"
 
+    # Wrap command to ensure it completes and we get output
     full_command = (
-        f"{command}\n"
-        f"echo '{stdout_delimiter}'\n"
+        f"$ErrorActionPreference = 'Continue'\n"  # Continue on errors
+        f"try {{\n"
+        f"  {command}\n"
+        f"  $exit_code = $LASTEXITCODE\n"
+        f"  if ($null -eq $exit_code) {{ $exit_code = 0 }}\n"
+        f"}} catch {{\n"
+        f"  Write-Error $_.Exception.Message\n"
+        f"  $exit_code = 1\n"
+        f"}}\n"
+        f"Write-Output '{stdout_delimiter}'\n"
         f"[Console]::Error.WriteLine('{stderr_delimiter}')\n"
-        f"echo '{exit_code_delimiter}'; echo $LASTEXITCODE\n"
+        f"Write-Output '{exit_code_delimiter}'\n"
+        f"Write-Output $exit_code\n"
     )
+    
+    print(f"Executing command: {command}")
     process.stdin.write(full_command)
     process.stdin.flush()
     
