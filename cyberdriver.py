@@ -720,9 +720,15 @@ def read_stream(stream, lines_list, delimiter, timeout_event=None):
                 if delimiter and f"###DELIMITER:{delimiter}###" in line:
                     break
                 if line.strip():  # Only add non-empty lines
-                    # TEMPORARILY DISABLED FILTERING FOR DEBUGGING
-                    print(f"DEBUG: Read output line: {line.strip()[:100]}")
-                    lines_list.append(line.strip())
+                    # Skip PowerShell prompts and initialization commands
+                    stripped = line.strip()
+                    is_prompt = stripped.startswith("PS ") and stripped.endswith(">")
+                    is_init_cmd = any(pref in stripped for pref in ["$ProgressPreference", "$ConfirmPreference", "$VerbosePreference", "$DebugPreference", "Set-Location"])
+                    # Don't filter out echo commands with our delimiter marker
+                    is_echo_of_cmd = (stripped.startswith("echo ") or stripped.startswith("Write-Output ")) and "###DELIMITER:" not in stripped
+                    
+                    if not (is_prompt or is_init_cmd or is_echo_of_cmd):
+                        lines_list.append(stripped)
             elif timeout_event and timeout_event.is_set():
                 break
             continue
