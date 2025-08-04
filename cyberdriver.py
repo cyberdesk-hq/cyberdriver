@@ -896,12 +896,19 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
     stdout_thread.start()
     stderr_thread.start()
     
-    # Wait for threads with timeout
+    # Wait for stdout thread first (it has the delimiter)
     stdout_thread.join(timeout=timeout)
-    stderr_thread.join(timeout=timeout)
     
-    # If threads are still alive, we hit timeout
-    if stdout_thread.is_alive() or stderr_thread.is_alive():
+    # If stdout finished (found delimiter), stop stderr thread
+    if not stdout_thread.is_alive():
+        timeout_event.set()  # Signal stderr to stop
+        stderr_thread.join(timeout=2.0)  # Give it 2 seconds to finish
+    else:
+        # Stdout timed out, wait for stderr briefly
+        stderr_thread.join(timeout=2.0)
+    
+    # If stdout thread is still alive, we hit timeout
+    if stdout_thread.is_alive():
         print(f"Command timed out after {timeout} seconds")
         timeout_event.set()  # Signal threads to stop
         
