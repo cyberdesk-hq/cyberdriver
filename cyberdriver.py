@@ -681,74 +681,102 @@ def read_stream(stream, lines_list, delimiter, timeout_event=None):
     """Read lines from a stream until a delimiter is found or timeout."""
     import select
     
-    # Debug logging removed - function is working properly now
+    # Helper function to process a line
+    def process_line(line):
+        if not line or not line.strip():
+            return
+            
+        # Debug: print ALL lines we read
+        print(f"READ: {line.strip()[:100]}")
+        
+        # Check for delimiter
+        if delimiter and f"###DELIMITER:{delimiter}###" in line:
+            return True  # Signal to stop
+            
+        # Skip PowerShell prompts and initialization commands
+        stripped = line.strip()
+        is_prompt = stripped.startswith("PS ") and stripped.endswith(">")
+        is_init_cmd = any(pref in stripped for pref in ["$ProgressPreference", "$ConfirmPreference", "$VerbosePreference", "$DebugPreference", "Set-Location"])
+        # Don't filter out echo commands with our delimiter marker
+        is_echo_of_cmd = (stripped.startswith("echo ") or stripped.startswith("Write-Output ")) and "###DELIMITER:" not in stripped
+        
+        if not (is_prompt or is_init_cmd or is_echo_of_cmd):
+            lines_list.append(stripped)
+        else:
+            # Temporary debug: see what we're filtering out
+            if not is_prompt and not is_init_cmd:
+                print(f"FILTERED OUT: {stripped[:100]}")
+        
+        return False
     
+    if platform.system() == "Windows":
+        # Windows-specific implementation using threads
+        import threading
+        import queue
+        
+        line_queue = queue.Queue()
+        delimiter_found = threading.Event()
+        
+        def read_worker():
+            """Continuously read lines from stream until delimiter found or timeout."""
+            try:
+                while not timeout_event or not timeout_event.is_set():
+                    line = stream.readline()
+                    if not line:  # EOF
+                        break
+                    line_queue.put(line)
+                    if delimiter and f"###DELIMITER:{delimiter}###" in line:
+                        delimiter_found.set()
+                        break
+            except:
+                pass
+        
+        # Start reader thread
+        reader = threading.Thread(target=read_worker)
+        reader.daemon = True
+        reader.start()
+        
+        # Process lines from queue
+        while True:
+            if timeout_event and timeout_event.is_set():
+                break
+                
+            if delimiter_found.is_set():
+                # Process remaining lines in queue before exiting
+                while not line_queue.empty():
+                    try:
+                        line = line_queue.get_nowait()
+                        process_line(line)
+                    except queue.Empty:
+                        break
+                break
+                
+            try:
+                # Wait for a line with timeout
+                line = line_queue.get(timeout=0.1)
+                if process_line(line):  # Returns True if delimiter found
+                    break
+            except queue.Empty:
+                # No line available, check if reader is still alive
+                if not reader.is_alive():
+                    break
+        
+        return
+    
+    # Non-Windows implementation
     while True:
         # Check if we should stop due to timeout
         if timeout_event and timeout_event.is_set():
             break
             
         # Use select with timeout to check if data is available
-        if platform.system() != "Windows":
-            # Unix-like systems
-            try:
-                ready, _, _ = select.select([stream], [], [], 0.1)
-                if not ready:
-                    continue
-            except (ValueError, OSError):
-                # Stream might be closed
-                break
-        else:
-            # Windows doesn't support select on pipes, use a different approach
-            # Read all available lines quickly
-            import threading
-            lines_batch = []
-            
-            def read_available_lines():
-                nonlocal lines_batch
-                try:
-                    # Read multiple lines if available
-                    while True:
-                        line = stream.readline()
-                        if line:
-                            lines_batch.append(line)
-                        else:
-                            break
-                except:
-                    pass
-            
-            read_thread = threading.Thread(target=read_available_lines)
-            read_thread.daemon = True
-            read_thread.start()
-            read_thread.join(0.1)  # Wait max 0.1 seconds
-            
-            # Process all lines we got in this batch
-            for line in lines_batch:
-                # Debug: print ALL lines we read
-                if line.strip():
-                    print(f"READ: {line.strip()[:100]}")
-                
-                if delimiter and f"###DELIMITER:{delimiter}###" in line:
-                    return  # Exit the function when delimiter found
-                if line.strip():  # Only add non-empty lines
-                    # Skip PowerShell prompts and initialization commands
-                    stripped = line.strip()
-                    is_prompt = stripped.startswith("PS ") and stripped.endswith(">")
-                    is_init_cmd = any(pref in stripped for pref in ["$ProgressPreference", "$ConfirmPreference", "$VerbosePreference", "$DebugPreference", "Set-Location"])
-                    # Don't filter out echo commands with our delimiter marker
-                    is_echo_of_cmd = (stripped.startswith("echo ") or stripped.startswith("Write-Output ")) and "###DELIMITER:" not in stripped
-                    
-                    if not (is_prompt or is_init_cmd or is_echo_of_cmd):
-                        lines_list.append(stripped)
-                    else:
-                        # Temporary debug: see what we're filtering out
-                        if not is_prompt and not is_init_cmd:
-                            print(f"FILTERED OUT: {stripped[:100]}")
-            
-            # If no lines were read and timeout is set, check if we should stop
-            if not lines_batch and timeout_event and timeout_event.is_set():
-                break
-            continue
+        try:
+            ready, _, _ = select.select([stream], [], [], 0.1)
+            if not ready:
+                continue
+        except (ValueError, OSError):
+            # Stream might be closed
+            break
         
         # Read the line
         try:
@@ -758,22 +786,9 @@ def read_stream(stream, lines_list, delimiter, timeout_event=None):
             
         if not line:  # EOF
             break
-        if delimiter and f"###DELIMITER:{delimiter}###" in line:
-            break
-        if line.strip():  # Only add non-empty lines
-            # Skip PowerShell prompts and initialization commands
-            stripped = line.strip()
-            is_prompt = stripped.startswith("PS ") and stripped.endswith(">")
-            is_init_cmd = any(pref in stripped for pref in ["$ProgressPreference", "$ConfirmPreference", "$VerbosePreference", "$DebugPreference", "Set-Location"])
-            # Don't filter out echo commands with our delimiter marker
-            is_echo_of_cmd = (stripped.startswith("echo ") or stripped.startswith("Write-Output ")) and "###DELIMITER:" not in stripped
             
-            if not (is_prompt or is_init_cmd or is_echo_of_cmd):
-                lines_list.append(stripped)
-            else:
-                # Temporary debug: see what we're filtering out
-                if not is_prompt and not is_init_cmd:
-                    print(f"FILTERED OUT: {stripped[:100]}")
+        if process_line(line):  # Returns True if delimiter found
+            break
 
 
 def kill_powershell_session(session_id: str):
