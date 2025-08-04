@@ -700,29 +700,36 @@ def read_stream(stream, lines_list, delimiter, timeout_event=None):
                 break
         else:
             # Windows doesn't support select on pipes, use a different approach
-            # Try to read with a very short timeout
+            # Read all available lines quickly
             import threading
-            line = None
+            lines_batch = []
             
-            def read_line():
-                nonlocal line
+            def read_available_lines():
+                nonlocal lines_batch
                 try:
-                    line = stream.readline()
+                    # Read multiple lines if available
+                    while True:
+                        line = stream.readline()
+                        if line:
+                            lines_batch.append(line)
+                        else:
+                            break
                 except:
-                    line = None
+                    pass
             
-            read_thread = threading.Thread(target=read_line)
+            read_thread = threading.Thread(target=read_available_lines)
             read_thread.daemon = True
             read_thread.start()
             read_thread.join(0.1)  # Wait max 0.1 seconds
             
-            if not read_thread.is_alive() and line:
+            # Process all lines we got in this batch
+            for line in lines_batch:
                 # Debug: print ALL lines we read
                 if line.strip():
                     print(f"READ: {line.strip()[:100]}")
                 
                 if delimiter and f"###DELIMITER:{delimiter}###" in line:
-                    break
+                    return  # Exit the function when delimiter found
                 if line.strip():  # Only add non-empty lines
                     # Skip PowerShell prompts and initialization commands
                     stripped = line.strip()
@@ -737,7 +744,9 @@ def read_stream(stream, lines_list, delimiter, timeout_event=None):
                         # Temporary debug: see what we're filtering out
                         if not is_prompt and not is_init_cmd:
                             print(f"FILTERED OUT: {stripped[:100]}")
-            elif timeout_event and timeout_event.is_set():
+            
+            # If no lines were read and timeout is set, check if we should stop
+            if not lines_batch and timeout_event and timeout_event.is_set():
                 break
             continue
         
