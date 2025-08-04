@@ -78,5 +78,5 @@ exe = EXE(
     entitlements_file=None,
     icon=None,  # Add icon path here if you have one
     version_file=None,  # Add version info file if needed
-    uac_admin=True  # Request administrator privileges on Windows
+    uac_admin=False  # Don't request administrator privileges on Windows
 )

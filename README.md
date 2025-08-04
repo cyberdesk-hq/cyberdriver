@@ -48,7 +48,7 @@ $toolDir = "$env:USERPROFILE\.cyberdriver"
 New-Item -ItemType Directory -Force -Path $toolDir
 
 # Download cyberdriver
-Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.13/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe"
+Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.14/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe"
 
 # Add to PATH if not already there
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -59,7 +59,15 @@ if ($userPath -notlike "*$toolDir*") {
 Write-Host "Cyberdriver installed! You may need to restart your terminal for PATH changes to take effect."
 ```
 
-**Note:** Cyberdriver automatically disables PowerShell's QuickEdit Mode on startup. PowerShell has this dumb quirk where focusing your mouse on a running executable can stall the outputs until you unfocus it (it's called "QuickEdit Mode"). Additionally, cyberdriver requires administrator privileges to automate legacy desktop apps that have to be run as admin.
+**Note:** Cyberdriver automatically disables PowerShell's QuickEdit Mode on startup. PowerShell has this dumb quirk where focusing your mouse on a running executable can stall the outputs until you unfocus it (it's called "QuickEdit Mode"). 
+
+**Important - Admin Privileges:** If the desktop application you want to automate requires administrator privileges to start (such as many legacy enterprise applications), you must also run cyberdriver from an Administrator PowerShell terminal:
+
+1. Right-click on PowerShell and select "Run as Administrator"
+2. Navigate to your desired directory
+3. Run `cyberdriver start` or `cyberdriver join --secret YOUR_KEY`
+
+This ensures cyberdriver has the necessary permissions to interact with elevated applications. If you're only automating regular user-level applications, you can run cyberdriver normally without admin privileges.
 
 Cyberdriver can then be started with:
 
@@ -151,7 +159,7 @@ Configuration is stored in:
 The config file contains:
 ```json
 {
-  "version": "0.0.13",
+  "version": "0.0.14",
   "fingerprint": "uuid-v4-string"
 }
 ```

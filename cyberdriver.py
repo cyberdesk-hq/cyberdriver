@@ -11,7 +11,6 @@ It includes all features from the original Zig implementation:
 - Instant mouse movement with pyautogui
 - Mouse button press/release control
 - Configuration persistence (fingerprint, version)
-- Cursor overlay (cross-platform)
 - Exponential backoff reconnection
 - File transfer support (read/write/list any file type through tunnel)
 
@@ -19,7 +18,6 @@ File Transfer Features:
   - Write any file type to the remote machine (binary safe)
   - Read files from the remote machine (with size limits)
   - List directory contents
-  - Automatic path validation for security
   - Base64 encoding for binary data transport
   - Support for Drake tax files, medical images, or any binary format
 
@@ -36,8 +34,8 @@ Install dependencies:
     pip install fastapi uvicorn[standard] websockets httpx mss pyautogui pillow numpy
 
 Usage:
-    python cyberdriver.py start [--port 3000] [--cursor-overlay]
-    python cyberdriver.py join --secret API_KEY [--host example.com] [--port 443] [--cursor-overlay]
+    cyberdriver start [--port 3000]
+    cyberdriver join --secret YOUR_API_KEY [--host example.com] [--port 443]
 """
 
 import argparse
@@ -47,22 +45,24 @@ import json
 import os
 import platform
 import pathlib
-import re
+import socket
 import subprocess
 import sys
 import time
 import uuid
 import signal
+import threading
 from typing import Dict, List, Optional, Tuple, Union, Any
 from enum import Enum
 from dataclasses import dataclass
 from io import BytesIO
+from contextlib import asynccontextmanager
 
 import httpx
 import mss
 import numpy as np
 import pyautogui
-from PIL import Image, ImageDraw
+from PIL import Image
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response, JSONResponse
 import uvicorn
@@ -146,7 +146,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.13"
+VERSION = "0.0.14"
 
 @dataclass
 class Config:
@@ -174,21 +174,63 @@ def get_config() -> Config:
     """Load or create configuration."""
     config_dir = get_config_dir()
     config_path = config_dir / CONFIG_FILE
+    should_create = False
+    existing_fingerprint = None
     
-    if config_path.exists():
-        with open(config_path, 'r') as f:
-            data = json.load(f)
-        return Config.from_dict(data)
+    # Create new config if it doesn't exist or version is outdated
+    if not config_path.exists():
+        should_create = True
+    else:
+        try:
+            with open(config_path, 'r') as f:
+                data = json.load(f)
+            # Check if version is outdated
+            if data.get("version") != VERSION:
+                print("Configuration is outdated, creating a new one.")
+                should_create = True
+                # Preserve fingerprint if it exists
+                if "fingerprint" in data:
+                    existing_fingerprint = data["fingerprint"]
+            else:
+                return Config.from_dict(data)
+        except (json.JSONDecodeError, KeyError):
+            print("Configuration is corrupt, creating a new one.")
+            should_create = True
+
+    if should_create:
+        config_dir.mkdir(parents=True, exist_ok=True)
+        fingerprint = existing_fingerprint or str(uuid.uuid4())
+        config = Config(version=VERSION, fingerprint=fingerprint)
+        
+        with open(config_path, 'w') as f:
+            json.dump(config.to_dict(), f, indent=2)
+        
+        return config
     
-    # Create new config
+    # Fallback in case logic fails
     config_dir.mkdir(parents=True, exist_ok=True)
     config = Config(version=VERSION, fingerprint=str(uuid.uuid4()))
-    
     with open(config_path, 'w') as f:
         json.dump(config.to_dict(), f, indent=2)
-    
     return config
 
+
+# -----------------------------------------------------------------------------
+# Network Utilities
+# -----------------------------------------------------------------------------
+
+def find_available_port(host: str, start_port: int, max_attempts: int = 50) -> Optional[int]:
+    """Find an available TCP port by trying to bind to it."""
+    for port in range(start_port, start_port + max_attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind((host, port))
+                return port
+            except OSError:
+                if port == start_port:
+                    print(f"Port {port} is in use, searching for an available one...")
+                continue
+    return None
 
 # -----------------------------------------------------------------------------
 # Screenshot Scaling
@@ -295,93 +337,17 @@ def execute_xdo_sequence(sequence: str):
     
     for group in command_groups:
         for event in group:
+            # Map 'cmd' to 'win' for Windows compatibility
+            key = event.key
+            if key == 'cmd':
+                key = 'win'
+            
             if event.down:
-                pyautogui.keyDown(event.key)
+                pyautogui.keyDown(key)
             else:
-                pyautogui.keyUp(event.key)
+                pyautogui.keyUp(key)
         # Small delay between command groups
         time.sleep(0.01)
-
-
-# -----------------------------------------------------------------------------
-# Mouse Movement
-# -----------------------------------------------------------------------------
-
-# -----------------------------------------------------------------------------
-# Cursor Overlay
-# -----------------------------------------------------------------------------
-
-class CursorOverlay:
-    """Cross-platform cursor overlay implementation."""
-    
-    def __init__(self):
-        self.running = False
-        self.overlay_thread = None
-        self.color = (0xFF, 0x00, 0xE5)  # Pig Peach color
-        
-    def start(self):
-        """Start the cursor overlay in a separate thread."""
-        if self.running:
-            return
-        
-        self.running = True
-        import threading
-        self.overlay_thread = threading.Thread(target=self._overlay_loop, daemon=True)
-        self.overlay_thread.start()
-    
-    def stop(self):
-        """Stop the cursor overlay."""
-        self.running = False
-        if self.overlay_thread:
-            self.overlay_thread.join()
-    
-    def _overlay_loop(self):
-        """Main overlay loop - platform specific implementation."""
-        if platform.system() == "Windows":
-            self._windows_overlay()
-        else:
-            # For non-Windows, we'll use a different approach
-            print("Cursor overlay is currently only supported on Windows")
-    
-    def _windows_overlay(self):
-        """Windows-specific overlay using tkinter."""
-        try:
-            import tkinter as tk
-            from tkinter import ttk
-            
-            root = tk.Tk()
-            root.overrideredirect(True)
-            root.attributes('-topmost', True)
-            root.attributes('-transparentcolor', 'white')
-            root.configure(bg='white')
-            
-            # Create cursor image
-            cursor_size = 30
-            canvas = tk.Canvas(root, width=cursor_size, height=cursor_size, 
-                             bg='white', highlightthickness=0)
-            canvas.pack()
-            
-            # Draw cursor shape
-            canvas.create_oval(2, 2, cursor_size-2, cursor_size-2, 
-                             fill=f'#{self.color[0]:02x}{self.color[1]:02x}{self.color[2]:02x}',
-                             outline='')
-            
-            def update_position():
-                if not self.running:
-                    root.quit()
-                    return
-                try:
-                    x, y = pyautogui.position()
-                    root.geometry(f'+{x-cursor_size//2}+{y-cursor_size//2}')
-                except:
-                    pass
-                root.after(16, update_position)  # ~60 FPS
-            
-            update_position()
-            root.mainloop()
-            
-        except ImportError:
-            print("tkinter not available for cursor overlay")
 
 
 # -----------------------------------------------------------------------------
@@ -397,10 +363,19 @@ pyautogui.FAILSAFE = True
 # Local API implementation
 # -----------------------------------------------------------------------------
 
-app = FastAPI(title="Cyberdriver", version=VERSION)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifespan events."""
+    # Startup
+    yield
+    # Shutdown
+    print("Shutting down...")
+    
+    # Shutdown the thread pool executor
+    executor.shutdown(wait=False)
+    print("Cleanup complete")
 
-# Global state
-cursor_overlay = CursorOverlay()
+app = FastAPI(title="Cyberdriver", version=VERSION, lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -432,12 +407,11 @@ async def get_screenshot(
         pil_image = Image.frombytes('RGB', img.size, img.bgra, 'raw', 'BGRX')
         
         # Default to 1024x768 if no dimensions specified
-        # This fixed resolution is strongly recommended for Claude
         if width is None and height is None:
             width = 1024
             height = 768
         
-        # Apply scaling - always scale to maintain consistency with Piglet
+        # Apply scaling
         if width is not None or height is not None:
             pil_image = scale_image(pil_image, width, height, scale_mode)
         
@@ -523,23 +497,13 @@ async def post_mouse_click(payload: Dict[str, Any]):
     return {}
 
 
-# File system endpoints
+# File system endpoints - Full access (localhost only)
 @app.get("/computer/fs/list")
 async def get_fs_list(path: str = Query(".")):
-    """List directory contents."""
+    """List directory contents with full file system access."""
     try:
-        # Resolve and validate path
+        # Resolve path - no restrictions
         safe_path = pathlib.Path(path).expanduser().resolve()
-        
-        # Security: only allow listing within user's home or temp directories
-        allowed_roots = [
-            pathlib.Path.home(),
-            pathlib.Path("/tmp"),
-            pathlib.Path(os.environ.get("TEMP", "/tmp"))  # Windows temp
-        ]
-        
-        if not any(str(safe_path).startswith(str(root)) for root in allowed_roots):
-            raise HTTPException(status_code=403, detail="Access denied to this directory")
         
         if not safe_path.exists():
             raise HTTPException(status_code=404, detail="Directory not found")
@@ -549,40 +513,47 @@ async def get_fs_list(path: str = Query(".")):
         
         # List directory contents
         items = []
-        for item in safe_path.iterdir():
-            items.append({
-                "name": item.name,
-                "path": str(item),
-                "is_dir": item.is_dir(),
-                "size": item.stat().st_size if item.is_file() else None,
-                "modified": item.stat().st_mtime
-            })
+        try:
+            for item in safe_path.iterdir():
+                try:
+                    stat = item.stat()
+                    items.append({
+                        "name": item.name,
+                        "path": str(item),
+                        "is_dir": item.is_dir(),
+                        "size": stat.st_size if item.is_file() else None,
+                        "modified": stat.st_mtime
+                    })
+                except (PermissionError, OSError):
+                    # Skip items we can't access
+                    items.append({
+                        "name": item.name,
+                        "path": str(item),
+                        "is_dir": None,
+                        "size": None,
+                        "modified": None,
+                        "error": "Permission denied"
+                    })
+        except PermissionError:
+            raise HTTPException(status_code=403, detail="Permission denied to list directory")
         
         return {
             "path": str(safe_path),
-            "items": sorted(items, key=lambda x: (not x["is_dir"], x["name"]))
+            "entries": sorted(items, key=lambda x: (x.get("is_dir") is not True, x["name"]))
         }
         
     except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/computer/fs/read")
 async def get_fs_read(path: str = Query(...)):
-    """Read file contents."""
+    """Read file contents with full file system access."""
     try:
-        # Resolve and validate path
+        # Resolve path - no restrictions
         safe_path = pathlib.Path(path).expanduser().resolve()
-        
-        # Security: only allow reading within user's home or temp directories
-        allowed_roots = [
-            pathlib.Path.home(),
-            pathlib.Path("/tmp"),
-            pathlib.Path(os.environ.get("TEMP", "/tmp"))
-        ]
-        
-        if not any(str(safe_path).startswith(str(root)) for root in allowed_roots):
-            raise HTTPException(status_code=403, detail="Access denied to this file")
         
         if not safe_path.exists():
             raise HTTPException(status_code=404, detail="File not found")
@@ -595,8 +566,11 @@ async def get_fs_read(path: str = Query(...)):
             raise HTTPException(status_code=413, detail="File too large (>100MB)")
         
         # Read file and encode as base64
-        with open(safe_path, "rb") as f:
-            content = f.read()
+        try:
+            with open(safe_path, "rb") as f:
+                content = f.read()
+        except PermissionError:
+            raise HTTPException(status_code=403, detail="Permission denied to read file")
         
         return {
             "path": str(safe_path),
@@ -612,7 +586,7 @@ async def get_fs_read(path: str = Query(...)):
 
 @app.post("/computer/fs/write")
 async def post_fs_write(payload: Dict[str, Any]):
-    """Write file contents to specified path.
+    """Write file contents with full file system access.
     
     Expects:
     - path: Target file path
@@ -635,54 +609,279 @@ async def post_fs_write(payload: Dict[str, Any]):
         raise HTTPException(status_code=400, detail=f"Invalid base64 content: {e}")
     
     try:
-        # Resolve and validate path
+        # Resolve path - no restrictions
         safe_path = pathlib.Path(file_path).expanduser().resolve()
         
-        # Security: only allow writing within user's home or temp directories
-        allowed_roots = [
-            pathlib.Path.home(),
-            pathlib.Path("/tmp"),
-            pathlib.Path(os.environ.get("TEMP", "/tmp"))
-        ]
-        
-        # Check if target path is within allowed directories
-        if not any(str(safe_path).startswith(str(root)) for root in allowed_roots):
-            # If not, default to user's home directory with a cyberdesk subdirectory
-            safe_path = pathlib.Path.home() / "CyberDeskTransfers" / safe_path.name
+        # If path doesn't specify a directory, default to CyberdeskTransfers
+        if not safe_path.parent.exists() and str(safe_path.parent) == ".":
+            safe_path = pathlib.Path.home() / "CyberdeskTransfers" / safe_path.name
         
         # Create parent directories if they don't exist
         safe_path.parent.mkdir(parents=True, exist_ok=True)
         
         # Write file
         write_mode = "ab" if mode == "append" else "wb"
-        with open(safe_path, write_mode) as f:
-            f.write(file_data)
+        try:
+            with open(safe_path, write_mode) as f:
+                f.write(file_data)
+        except PermissionError:
+            raise HTTPException(status_code=403, detail="Permission denied to write file")
         
         # Get file info for response
         stat = safe_path.stat()
         
         return {
-            "success": True,
             "path": str(safe_path),
             "size": stat.st_size,
             "modified": stat.st_mtime
         }
         
     except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
         raise HTTPException(status_code=500, detail=f"Failed to write file: {e}")
 
 
-# Shell endpoints (marked as not implemented in original)
-@app.post("/computer/shell/cmd/exec")
-async def post_shell_cmd_exec(payload: Dict[str, str]):
-    """Execute shell command."""
-    raise HTTPException(status_code=501, detail="Not implemented")
+# PowerShell endpoints
+from concurrent.futures import ThreadPoolExecutor
 
+executor = ThreadPoolExecutor(max_workers=5)
+
+
+
+def execute_powershell_command(command: str, session_id: str, working_directory: Optional[str] = None, same_session: bool = True, timeout: float = 30.0):
+    """Execute PowerShell command in a session with timeout."""
+    import subprocess
+    import threading
+    
+    # For clean output, we'll use a different approach - execute each command as a separate process
+    # This avoids the echo/prompt issues with interactive PowerShell
+    
+    powershell_cmd = "pwsh" if platform.system() != "Windows" else "powershell"
+    try:
+        # Test if pwsh is available on Windows
+        if platform.system() == "Windows":
+            subprocess.run(["pwsh", "-Version"], capture_output=True, check=True, timeout=5)
+            powershell_cmd = "pwsh"
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    
+    # Create command script that handles working directory
+    script_lines = []
+    if working_directory:
+        script_lines.append(f"Set-Location -Path '{working_directory}'")
+    script_lines.append(command)
+    
+    # Join with semicolons for single-line execution
+    full_script = "; ".join(script_lines)
+    
+    # Build PowerShell arguments for clean output
+    ps_args = [
+        powershell_cmd,
+        "-NoLogo",           # No startup banner
+        "-NoProfile",        # Don't load profile
+        "-NonInteractive",   # No prompts
+        "-ExecutionPolicy", "Bypass",
+        "-OutputFormat", "Text",  # Plain text output
+        "-Command", full_script   # Execute directly
+    ]
+    
+    # Setup process
+    startupinfo = None
+    if platform.system() == "Windows":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    
+    try:
+        # Run the command
+        process = subprocess.Popen(
+            ps_args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            startupinfo=startupinfo,
+            encoding='utf-8',
+            errors='replace'
+        )
+        
+        # Wait for completion with timeout
+        stdout, stderr = process.communicate(timeout=timeout)
+        
+        # Clean output - remove empty lines at start/end
+        stdout_lines = [line.rstrip() for line in stdout.splitlines() if line.strip()]
+        stderr_lines = [line.rstrip() for line in stderr.splitlines() if line.strip()]
+        
+        return {
+            "stdout": "\n".join(stdout_lines),
+            "stderr": "\n".join(stderr_lines),
+            "exit_code": process.returncode,
+            "session_id": session_id
+        }
+        
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        return {
+            "stdout": "",
+            "stderr": "Command timed out",
+            "exit_code": -1,
+            "session_id": session_id,
+            "error": f"Command timed out after {timeout} seconds"
+        }
+    except Exception as e:
+        return {
+            "stdout": "",
+            "stderr": str(e),
+            "exit_code": -1,
+            "session_id": session_id,
+            "error": str(e)
+        }
+
+@app.post("/computer/shell/powershell/simple")
+async def simple_powershell_test():
+    """Ultra-simple PowerShell test."""
+    import subprocess
+    
+    print("\n=== SIMPLE POWERSHELL TEST ===")
+    
+    try:
+        # Run a simple command directly
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", "Write-Output 'Hello World'"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        print(f"Return code: {result.returncode}")
+        print(f"Stdout: {result.stdout}")
+        print(f"Stderr: {result.stderr}")
+        
+        return {
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr
+        }
+    except subprocess.TimeoutExpired:
+        return {"error": "Command timed out"}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/computer/shell/powershell/test")
+async def test_powershell():
+    """Test PowerShell functionality with a simple command."""
+    import subprocess
+    import threading
+    
+    print("\n=== POWERSHELL TEST ===")
+    
+    # Start a simple PowerShell process
+    ps_args = ["powershell", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass"]
+    print(f"Starting PowerShell with: {ps_args}")
+    
+    try:
+        process = subprocess.Popen(
+            ps_args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1
+        )
+        
+        print(f"Process started, PID: {process.pid}")
+        
+        # Test 1: Simple echo
+        test_cmd = 'Write-Output "Hello from PowerShell"\n'
+        print(f"Sending: {test_cmd.strip()}")
+        process.stdin.write(test_cmd)
+        process.stdin.flush()
+        
+        # Try to read output with timeout
+        output = []
+        def read_output():
+            try:
+                line = process.stdout.readline()
+                if line:
+                    output.append(line.strip())
+                    print(f"Got output: {line.strip()}")
+            except Exception as e:
+                print(f"Read error: {e}")
+        
+        for i in range(10):  # Try for 1 second
+            t = threading.Thread(target=read_output)
+            t.daemon = True
+            t.start()
+            t.join(0.1)
+            if output:
+                break
+        
+        if not output:
+            print("No output received!")
+            
+            # Check if process is still alive
+            if process.poll() is not None:
+                print(f"Process died with code: {process.poll()}")
+                stderr = process.stderr.read()
+                if stderr:
+                    print(f"Stderr: {stderr}")
+        
+        # Kill the process
+        process.terminate()
+        
+        return {"test": "complete", "output": output}
+        
+    except Exception as e:
+        print(f"Test error: {e}")
+        return {"error": str(e)}
 
 @app.post("/computer/shell/powershell/exec")
-async def post_shell_powershell_exec(payload: Dict[str, str]):
-    """Execute PowerShell command."""
-    raise HTTPException(status_code=501, detail="Not implemented")
+async def post_powershell_exec(payload: Dict[str, Any]):
+    """Execute PowerShell command with optional session management."""
+    command = payload.get("command")
+    same_session = payload.get("same_session", True)
+    working_directory = payload.get("working_directory")
+    session_id = payload.get("session_id", str(uuid.uuid4()))
+    timeout = payload.get("timeout", 30.0)  # Default 30 second timeout
+    
+    if not command:
+        raise HTTPException(status_code=400, detail="Missing 'command' field")
+    
+    try:
+        # Run in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            executor,
+            execute_powershell_command,
+            command,
+            session_id,
+            working_directory,
+            same_session,
+            timeout
+        )
+        
+        return result
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to execute command: {e}")
+
+@app.post("/computer/shell/powershell/session")
+async def post_powershell_session(payload: Dict[str, Any]):
+    """Manage PowerShell sessions (compatibility endpoint)."""
+    action = payload.get("action")
+    session_id = payload.get("session_id")
+    
+    if action not in ["create", "destroy"]:
+        raise HTTPException(status_code=400, detail="Invalid action. Must be 'create' or 'destroy'")
+    
+    if action == "create":
+        # Sessions are no longer maintained - each command runs independently
+        new_session_id = str(uuid.uuid4())
+        return {"session_id": new_session_id, "message": "Session ID generated (sessions are now stateless)"}
+    
+    elif action == "destroy":
+        # No-op since we don't maintain sessions anymore
+        return {"message": "Session destroyed (no-op in stateless mode)"}
 
 
 # -----------------------------------------------------------------------------
@@ -737,7 +936,11 @@ class TunnelClient:
         # Use compatibility wrapper for connection
         websocket = await connect_with_headers(uri, headers)
         async with websocket:
-            print("Connected to control server")
+            # Print success message with green checkmark
+            green = '\033[92m'
+            white = '\033[97m'
+            reset = '\033[0m'
+            print(f"{green}✓{reset} {white}Connected!{reset} Forwarding to http://127.0.0.1:{self.target_port}")
             
             # Message handling state
             request_meta = None
@@ -778,7 +981,7 @@ class TunnelClient:
         query = meta.get("query", "")
         headers = meta.get("headers", {})
         
-        url = f"http://localhost:{self.target_port}{path}"
+        url = f"http://127.0.0.1:{self.target_port}{path}"
         if query:
             url += f"?{query}"
         
@@ -837,7 +1040,7 @@ def run_server(port: int):
 
 async def run_server_async(port: int):
     """Run the FastAPI server asynchronously."""
-    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="info")
     server = uvicorn.Server(config)
     await server.serve()
 
@@ -846,14 +1049,23 @@ async def run_join(host: str, port: int, secret: str, target_port: int):
     """Run both API server and tunnel client."""
     config = get_config()
     
+    # Find an available port for the local server, starting with the one provided
+    actual_target_port = find_available_port("127.0.0.1", target_port)
+    if actual_target_port is None:
+        print(f"Error: Could not find an available port starting from {target_port}.")
+        sys.exit(1)
+    
+    if actual_target_port != target_port:
+        print(f"Using available port {actual_target_port} for local server.")
+
     # Start API server asynchronously in the same event loop
-    server_task = asyncio.create_task(run_server_async(target_port))
+    server_task = asyncio.create_task(run_server_async(actual_target_port))
     
     # Give server time to start
     await asyncio.sleep(1)
     
     # Start tunnel client
-    tunnel = TunnelClient(host, port, secret, target_port, config)
+    tunnel = TunnelClient(host, port, secret, actual_target_port, config)
     
     # Run both concurrently
     try:
@@ -869,50 +1081,137 @@ def signal_handler(signum, frame):
     sys.exit(0)
 
 
+def print_banner(mode="default"):
+    """Print a cool gradient banner for Cyberdriver.
+    
+    Args:
+        mode: "default" for normal banner, "connecting" for join command
+    """
+    # Colors
+    white = '\033[97m'
+    blue = '\033[38;2;0;123;255m'
+    purple = '\033[38;2;147;51;234m'
+    green = '\033[92m'
+    reset = '\033[0m'
+    
+    banner = [
+        " ██████╗██╗   ██╗██████╗ ███████╗██████╗ ██████╗ ██████╗ ██╗██╗   ██╗███████╗██████╗ ",
+        "██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗██╔══██╗██╔══██╗██║██║   ██║██╔════╝██╔══██╗",
+        "██║      ╚████╔╝ ██████╔╝█████╗  ██████╔╝██║  ██║██████╔╝██║██║   ██║█████╗  ██████╔╝",
+        "██║       ╚██╔╝  ██╔══██╗██╔══╝  ██╔══██╗██║  ██║██╔══██╗██║╚██╗ ██╔╝██╔══╝  ██╔══██╗",
+        "╚██████╗   ██║   ██████╔╝███████╗██║  ██║██████╔╝██║  ██║██║ ╚████╔╝ ███████╗██║  ██║",
+        " ╚═════╝   ╚═╝   ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝  ╚══════╝╚═╝  ╚═╝"
+    ]
+    
+    # Print banner with left-to-right gradient
+    for line in banner:
+        output = ""
+        line_length = len(line)
+        for i, char in enumerate(line):
+            # Calculate gradient position (0 to 1)
+            position = i / max(line_length - 1, 1)
+            
+            # Interpolate between blue and purple
+            r = int(0 + (147 - 0) * position)
+            g = int(123 + (51 - 123) * position)
+            b = int(255 + (234 - 255) * position)
+            
+            color = f'\033[38;2;{r};{g};{b}m'
+            output += f"{color}{char}"
+        print(f"{output}{reset}")
+    
+    print()
+    
+    # Different messages based on mode
+    if mode == "connecting":
+        print(f"{white}Connecting to Cyberdesk Cloud...{reset}")
+    else:
+        print(f"{white}Get started:{reset}")
+        print(f"{white}→ {blue}cyberdriver join --secret{reset} {white}YOUR_API_KEY{reset}")
+    
+    # Always show help and docs
+    print(f"{white}→ Run {blue}-h{reset} {white}for help{reset}")
+    print(f"{white}→ Visit {blue}https://docs.cyberdesk.io{reset} for documentation")
+    print()
+
+
 def main():
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
+    # Print banner if no arguments or help requested
+    if len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] in ['-h', '--help']):
+        print_banner()
+    
     parser = argparse.ArgumentParser(
-        description="Cyberdriver: Remote computer control"
+        description="Remote computer control via Cyberdesk",
+        epilog="",
+        formatter_class=argparse.RawTextHelpFormatter,
+        add_help=False  # We'll add custom help
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument(
+        "-v", "--version",
+        action="version",
+        version=f"%(prog)s {VERSION}"
+    )
+    parser.add_argument(
+        "-h", "--help",
+        action="store_true",
+        help="Show help"
+    )
+    
+    subparsers = parser.add_subparsers(dest="command", metavar="")
     
     # start command
-    start_parser = subparsers.add_parser("start", help="Start local server")
-    start_parser.add_argument("--port", type=int, default=3000, 
-                            help="Port for local API server")
-    start_parser.add_argument("--cursor-overlay", action="store_true",
-                            help="Enable cursor overlay")
+    start_parser = subparsers.add_parser(
+        "start", 
+        help="Start local server",
+        description="Start Cyberdriver API server locally for testing"
+    )
+    start_parser.add_argument("--port", type=int, default=3000, help="Port (default: 3000)")
     
     # join command
-    join_parser = subparsers.add_parser("join", 
-                                      help="Join control plane")
-    join_parser.add_argument("--host", default="api.cyberdesk.io", 
-                           help="Control server host")
-    join_parser.add_argument("--port", type=int, default=443, 
-                           help="Control server port")
-    join_parser.add_argument("--secret", required=True, 
-                           help="API key for authentication")
-    join_parser.add_argument("--target-port", type=int, default=3000,
-                           help="Local API port")
-    join_parser.add_argument("--cursor-overlay", action="store_true",
-                           help="Enable cursor overlay")
+    join_parser = subparsers.add_parser(
+        "join", 
+        help="Connect to Cyberdesk Cloud",
+        description="Connect your machine to Cyberdesk Cloud for remote control"
+    )
+    join_parser.add_argument("--secret", required=True, help="Your API key from Cyberdesk")
+    join_parser.add_argument("--host", default="api.cyberdesk.io", help="Control server (default: api.cyberdesk.io)")
+    join_parser.add_argument("--port", type=int, default=443, help="Control server port (default: 443)")
+    join_parser.add_argument("--target-port", type=int, default=3000, help="Local port (default: 3000)")
     
     args = parser.parse_args()
+
+    # Handle help or no command
+    if not args.command or args.help:
+        if not (len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] in ['-h', '--help'])):
+            print_banner()
+        print("Commands:")
+        print("  join --secret KEY  Connect to Cyberdesk Cloud")
+        print("  start              Start local server")
+        print()
+        print("For more info: cyberdriver <command> -h")
+        sys.exit(0)
+    
+    # Show banner for join command
+    if args.command == "join":
+        print_banner(mode="connecting")
     
     # Disable Windows console QuickEdit mode to prevent output blocking
     disable_windows_console_quickedit()
     
-    # Start cursor overlay if requested
-    if getattr(args, 'cursor_overlay', False):
-        cursor_overlay.start()
-    
     try:
         if args.command == "start":
-            print(f"Local server running at http://localhost:{args.port}")
-            run_server(args.port)
+            actual_port = find_available_port("0.0.0.0", args.port)
+            if actual_port is None:
+                print(f"Error: Could not find an available port starting from {args.port}.")
+                sys.exit(1)
+            
+            print(f"✓ Cyberdriver server starting on http://0.0.0.0:{actual_port}")
+            run_server(actual_port)
+
         elif args.command == "join":
             asyncio.run(run_join(
                 args.host, args.port, args.secret, args.target_port
@@ -920,11 +1219,9 @@ def main():
     except KeyboardInterrupt:
         print("\n\nKeyboard interrupt received. Shutting down...")
     except Exception as e:
-        print(f"\nError: {e}")
+        print(f"\nAn unexpected error occurred: {e}")
         sys.exit(1)
     finally:
-        # Cleanup
-        cursor_overlay.stop()
         print("Cleanup complete.")
 
 
