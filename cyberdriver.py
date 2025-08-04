@@ -336,10 +336,15 @@ def execute_xdo_sequence(sequence: str):
     
     for group in command_groups:
         for event in group:
+            # Map 'cmd' to 'win' for Windows compatibility
+            key = event.key
+            if key == 'cmd':
+                key = 'win'
+            
             if event.down:
-                pyautogui.keyDown(event.key)
+                pyautogui.keyDown(key)
             else:
-                pyautogui.keyUp(event.key)
+                pyautogui.keyUp(key)
         # Small delay between command groups
         time.sleep(0.01)
 
