@@ -364,6 +364,22 @@ pyautogui.FAILSAFE = True
 
 app = FastAPI(title="Cyberdriver", version=VERSION)
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up all PowerShell sessions on shutdown."""
+    print("Cleaning up PowerShell sessions...")
+    
+    # Kill all active sessions
+    for session_id in list(powershell_sessions.keys()):
+        kill_powershell_session(session_id)
+    
+    # Clear active executions
+    active_executions.clear()
+    
+    # Shutdown the thread pool executor
+    executor.shutdown(wait=False)
+    print("Cleanup complete")
+
 
 @app.middleware("http")
 async def disable_buffering(request, call_next):
@@ -637,6 +653,9 @@ powershell_sessions = {}
 session_lock = asyncio.Lock()
 executor = ThreadPoolExecutor(max_workers=5)
 
+# Add a dictionary to track active command executions
+active_executions = {}
+
 def cleanup_old_sessions():
     """Clean up sessions older than 1 hour."""
     current_time = time.time()
@@ -654,22 +673,84 @@ def cleanup_old_sessions():
                 pass # Process already ended
             del powershell_sessions[session_id]
 
-def read_stream(stream, lines_list, delimiter):
-    """Read lines from a stream until a delimiter is found."""
-    for line in iter(stream.readline, ''):
+def read_stream(stream, lines_list, delimiter, timeout_event=None):
+    """Read lines from a stream until a delimiter is found or timeout."""
+    import select
+    
+    while True:
+        # Check if we should stop due to timeout
+        if timeout_event and timeout_event.is_set():
+            break
+            
+        # Use select with timeout to check if data is available
+        if platform.system() != "Windows":
+            # Unix-like systems
+            ready, _, _ = select.select([stream], [], [], 0.1)
+            if not ready:
+                continue
+        else:
+            # Windows doesn't support select on pipes, use a different approach
+            # Try to read with a very short timeout
+            import threading
+            line = None
+            
+            def read_line():
+                nonlocal line
+                line = stream.readline()
+            
+            read_thread = threading.Thread(target=read_line)
+            read_thread.daemon = True
+            read_thread.start()
+            read_thread.join(0.1)  # Wait max 0.1 seconds
+            
+            if not read_thread.is_alive() and line:
+                if delimiter in line:
+                    break
+                lines_list.append(line.strip())
+            elif timeout_event and timeout_event.is_set():
+                break
+            continue
+        
+        # Read the line
+        line = stream.readline()
+        if not line:  # EOF
+            break
         if delimiter in line:
             break
         lines_list.append(line.strip())
-    # The stream is now at the delimiter, so further reads will be after it.
 
 
-def execute_powershell_command(command: str, session_id: str, working_directory: Optional[str] = None, same_session: bool = True):
-    """Execute PowerShell command in a session."""
+def kill_powershell_session(session_id: str):
+    """Force kill a PowerShell session."""
+    if session_id in powershell_sessions:
+        try:
+            process = powershell_sessions[session_id]['process']
+            if platform.system() == "Windows":
+                # On Windows, use taskkill for a more forceful termination
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True)
+            else:
+                process.kill()
+            process.wait(timeout=1)
+        except:
+            pass
+        finally:
+            del powershell_sessions[session_id]
+
+def execute_powershell_command(command: str, session_id: str, working_directory: Optional[str] = None, same_session: bool = True, timeout: float = 30.0):
+    """Execute PowerShell command in a session with timeout."""
     import subprocess
     import threading
     
     # Clean up old sessions
     cleanup_old_sessions()
+    
+    # Check if there's an active execution for this session that's hanging
+    if session_id in active_executions:
+        # Kill the hanging session
+        print(f"Killing hanging session {session_id}")
+        kill_powershell_session(session_id)
+        if session_id in active_executions:
+            del active_executions[session_id]
     
     if not same_session or session_id not in powershell_sessions:
         # Create new PowerShell session
@@ -729,22 +810,63 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
     process.stdin.write(full_command)
     process.stdin.flush()
     
+    # Create timeout event for threads
+    timeout_event = threading.Event()
+    
+    # Mark this execution as active
+    active_executions[session_id] = {
+        'start_time': time.time(),
+        'timeout_event': timeout_event
+    }
+    
     # Read streams in separate threads to prevent blocking
     stdout_lines = []
     stderr_lines = []
     
-    stdout_thread = threading.Thread(target=read_stream, args=(process.stdout, stdout_lines, stdout_delimiter))
-    stderr_thread = threading.Thread(target=read_stream, args=(process.stderr, stderr_lines, stderr_delimiter))
+    stdout_thread = threading.Thread(target=read_stream, args=(process.stdout, stdout_lines, stdout_delimiter, timeout_event))
+    stderr_thread = threading.Thread(target=read_stream, args=(process.stderr, stderr_lines, stderr_delimiter, timeout_event))
+    
+    stdout_thread.daemon = True
+    stderr_thread.daemon = True
     
     stdout_thread.start()
     stderr_thread.start()
     
-    stdout_thread.join(timeout=3600)
-    stderr_thread.join(timeout=3600)
+    # Wait for threads with timeout
+    stdout_thread.join(timeout=timeout)
+    stderr_thread.join(timeout=timeout)
+    
+    # If threads are still alive, we hit timeout
+    if stdout_thread.is_alive() or stderr_thread.is_alive():
+        print(f"Command timed out after {timeout} seconds")
+        timeout_event.set()  # Signal threads to stop
+        
+        # Kill the session
+        kill_powershell_session(session_id)
+        
+        # Clean up active execution
+        if session_id in active_executions:
+            del active_executions[session_id]
+        
+        return {
+            "stdout": "\n".join(stdout_lines) + "\n[Command timed out]",
+            "stderr": "\n".join(stderr_lines) + "\n[Command timed out]",
+            "exit_code": -1,
+            "session_id": session_id,
+            "error": f"Command timed out after {timeout} seconds"
+        }
 
+    # Clean up active execution
+    if session_id in active_executions:
+        del active_executions[session_id]
+    
     # After delimiters are hit, the exit code is the only thing left in stdout
     exit_code_output = []
-    read_stream(process.stdout, exit_code_output, '') # Read remaining output
+    # Use a short timeout for reading the exit code
+    exit_thread = threading.Thread(target=read_stream, args=(process.stdout, exit_code_output, '', None))
+    exit_thread.daemon = True
+    exit_thread.start()
+    exit_thread.join(timeout=2.0)  # Short timeout for exit code
 
     exit_code = 0
     # Find the line after the delimiter and parse the exit code
@@ -777,26 +899,39 @@ async def post_powershell_exec(payload: Dict[str, Any]):
     same_session = payload.get("same_session", True)
     working_directory = payload.get("working_directory")
     session_id = payload.get("session_id", str(uuid.uuid4()))
+    timeout = payload.get("timeout", 30.0)  # Default 30 second timeout
     
     if not command:
         raise HTTPException(status_code=400, detail="Missing 'command' field")
     
     try:
-        async with session_lock:
-            # Run in thread pool to avoid blocking
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                executor,
-                execute_powershell_command,
-                command,
-                session_id,
-                working_directory,
-                same_session
-            )
+        # Don't hold the lock for the entire execution
+        # Just use it for critical sections
+        loop = asyncio.get_event_loop()
+        
+        # Check if there's already an execution in progress for this session
+        if session_id in active_executions:
+            # Kill the old one first
+            print(f"Killing existing execution for session {session_id}")
+            kill_powershell_session(session_id)
+        
+        # Run in thread pool to avoid blocking
+        result = await loop.run_in_executor(
+            executor,
+            execute_powershell_command,
+            command,
+            session_id,
+            working_directory,
+            same_session,
+            timeout
+        )
         
         return result
         
     except Exception as e:
+        # Clean up on error
+        if session_id in active_executions:
+            del active_executions[session_id]
         raise HTTPException(status_code=500, detail=f"Failed to execute command: {e}")
 
 @app.post("/computer/shell/powershell/session")
