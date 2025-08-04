@@ -369,14 +369,7 @@ async def lifespan(app: FastAPI):
     # Startup
     yield
     # Shutdown
-    print("Cleaning up PowerShell sessions...")
-    
-    # Kill all active sessions
-    for session_id in list(powershell_sessions.keys()):
-        kill_powershell_session(session_id)
-    
-    # Clear active executions
-    active_executions.clear()
+    print("Shutting down...")
     
     # Shutdown the thread pool executor
     executor.shutdown(wait=False)
@@ -649,334 +642,100 @@ async def post_fs_write(payload: Dict[str, Any]):
         raise HTTPException(status_code=500, detail=f"Failed to write file: {e}")
 
 
-# PowerShell endpoints with session management
+# PowerShell endpoints
 from concurrent.futures import ThreadPoolExecutor
 
-# Global dictionary to store PowerShell sessions
-powershell_sessions = {}
-session_lock = asyncio.Lock()
 executor = ThreadPoolExecutor(max_workers=5)
 
-# Add a dictionary to track active command executions
-active_executions = {}
 
-def cleanup_old_sessions():
-    """Clean up sessions older than 1 hour."""
-    current_time = time.time()
-    expired = []
-    # Use list() to avoid RuntimeError for changing dict size during iteration
-    for session_id, session in list(powershell_sessions.items()):
-        if current_time - session['last_used'] > 3600:  # 1 hour
-            expired.append(session_id)
-    
-    for session_id in expired:
-        if session_id in powershell_sessions:
-            try:
-                powershell_sessions[session_id]['process'].terminate()
-            except (ProcessLookupError, OSError):
-                pass # Process already ended
-            del powershell_sessions[session_id]
-
-def read_stream(stream, lines_list, delimiter, timeout_event=None):
-    """Read lines from a stream until a delimiter is found or timeout."""
-    import select
-    
-    # Helper function to process a line
-    def process_line(line):
-        if not line or not line.strip():
-            return
-            
-
-        
-        # Check for delimiter
-        if delimiter and f"###DELIMITER:{delimiter}###" in line:
-            return True  # Signal to stop
-            
-        # Skip PowerShell prompts and initialization commands
-        stripped = line.strip()
-        is_prompt = stripped.startswith("PS ") and stripped.endswith(">")
-        is_init_cmd = any(pref in stripped for pref in ["$ProgressPreference", "$ConfirmPreference", "$VerbosePreference", "$DebugPreference", "Set-Location"])
-        # Don't filter out echo commands with our delimiter marker
-        is_echo_of_cmd = (stripped.startswith("echo ") or stripped.startswith("Write-Output ")) and "###DELIMITER:" not in stripped
-        
-        if not (is_prompt or is_init_cmd or is_echo_of_cmd):
-            lines_list.append(stripped)
-
-        
-        return False
-    
-    if platform.system() == "Windows":
-        # Windows-specific implementation using threads
-        import threading
-        import queue
-        
-        line_queue = queue.Queue()
-        delimiter_found = threading.Event()
-        
-        def read_worker():
-            """Continuously read lines from stream until delimiter found or timeout."""
-            try:
-                while not timeout_event or not timeout_event.is_set():
-                    line = stream.readline()
-                    if not line:  # EOF
-                        break
-                    line_queue.put(line)
-                    if delimiter and f"###DELIMITER:{delimiter}###" in line:
-                        delimiter_found.set()
-                        break
-            except:
-                pass
-        
-        # Start reader thread
-        reader = threading.Thread(target=read_worker)
-        reader.daemon = True
-        reader.start()
-        
-        # Process lines from queue
-        while True:
-            if timeout_event and timeout_event.is_set():
-                break
-                
-            if delimiter_found.is_set():
-                # Process remaining lines in queue before exiting
-                while not line_queue.empty():
-                    try:
-                        line = line_queue.get_nowait()
-                        process_line(line)
-                    except queue.Empty:
-                        break
-                break
-                
-            try:
-                # Wait for a line with timeout
-                line = line_queue.get(timeout=0.1)
-                if process_line(line):  # Returns True if delimiter found
-                    break
-            except queue.Empty:
-                # No line available, check if reader is still alive
-                if not reader.is_alive():
-                    break
-        
-        return
-    
-    # Non-Windows implementation
-    while True:
-        # Check if we should stop due to timeout
-        if timeout_event and timeout_event.is_set():
-            break
-            
-        # Use select with timeout to check if data is available
-        try:
-            ready, _, _ = select.select([stream], [], [], 0.1)
-            if not ready:
-                continue
-        except (ValueError, OSError):
-            # Stream might be closed
-            break
-        
-        # Read the line
-        try:
-            line = stream.readline()
-        except:
-            break
-            
-        if not line:  # EOF
-            break
-            
-        if process_line(line):  # Returns True if delimiter found
-            break
-
-
-def kill_powershell_session(session_id: str):
-    """Force kill a PowerShell session."""
-    if session_id in powershell_sessions:
-        try:
-            process = powershell_sessions[session_id]['process']
-            if platform.system() == "Windows":
-                # On Windows, use taskkill for a more forceful termination
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True)
-            else:
-                process.kill()
-            process.wait(timeout=1)
-        except:
-            pass
-        finally:
-            del powershell_sessions[session_id]
 
 def execute_powershell_command(command: str, session_id: str, working_directory: Optional[str] = None, same_session: bool = True, timeout: float = 30.0):
     """Execute PowerShell command in a session with timeout."""
     import subprocess
     import threading
     
-    # Clean up old sessions
-    cleanup_old_sessions()
+    # For clean output, we'll use a different approach - execute each command as a separate process
+    # This avoids the echo/prompt issues with interactive PowerShell
     
-    # Check if there's an active execution for this session that's hanging
-    if session_id in active_executions:
-        # Kill the hanging session
-        print(f"WARNING: Killing hanging session {session_id} (started {time.time() - active_executions[session_id]['start_time']:.1f}s ago)")
-        kill_powershell_session(session_id)
-        if session_id in active_executions:
-            del active_executions[session_id]
-    
-    if not same_session or session_id not in powershell_sessions:
-        # Create new PowerShell session
-        powershell_cmd = "pwsh" if platform.system() != "Windows" else "powershell"
-        try:
-            # Test if pwsh is available on Windows
-            if platform.system() == "Windows":
-                subprocess.run(["pwsh", "-Version"], capture_output=True, check=True, timeout=5)
-                powershell_cmd = "pwsh"
-        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-        
-        # Start PowerShell process
-        startupinfo = None
+    powershell_cmd = "pwsh" if platform.system() != "Windows" else "powershell"
+    try:
+        # Test if pwsh is available on Windows
         if platform.system() == "Windows":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        
-        # Use proper PowerShell flags to prevent hanging
-        # DO NOT use "-Command -" as it waits for EOF before executing!
-        ps_args = [
-            powershell_cmd,
-            "-NoLogo",           # No startup banner
-            "-NoProfile",        # Don't load profile (prevents hanging on profile scripts)
-            "-ExecutionPolicy", "Bypass"  # Allow script execution
-            # NO "-Command -" - we want interactive mode!
-        ]
-        
-        # Start PowerShell with proper args
-        
+            subprocess.run(["pwsh", "-Version"], capture_output=True, check=True, timeout=5)
+            powershell_cmd = "pwsh"
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    
+    # Create command script that handles working directory
+    script_lines = []
+    if working_directory:
+        script_lines.append(f"Set-Location -Path '{working_directory}'")
+    script_lines.append(command)
+    
+    # Join with semicolons for single-line execution
+    full_script = "; ".join(script_lines)
+    
+    # Build PowerShell arguments for clean output
+    ps_args = [
+        powershell_cmd,
+        "-NoLogo",           # No startup banner
+        "-NoProfile",        # Don't load profile
+        "-NonInteractive",   # No prompts
+        "-ExecutionPolicy", "Bypass",
+        "-OutputFormat", "Text",  # Plain text output
+        "-Command", full_script   # Execute directly
+    ]
+    
+    # Setup process
+    startupinfo = None
+    if platform.system() == "Windows":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    
+    try:
+        # Run the command
         process = subprocess.Popen(
             ps_args,
-            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            cwd=working_directory,
             startupinfo=startupinfo,
             encoding='utf-8',
-            errors='replace',
-            bufsize=1  # Line buffered
+            errors='replace'
         )
         
-        # Use the provided session_id, don't generate a new one
-        powershell_sessions[session_id] = {
-            'process': process,
-            'last_used': time.time()
-        }
+        # Wait for completion with timeout
+        stdout, stderr = process.communicate(timeout=timeout)
         
-        # Give PowerShell a moment to initialize
-        time.sleep(0.5)
-        
-        # Set working directory if specified
-        if working_directory:
-            process.stdin.write(f"Set-Location -Path '{working_directory}'\n")
-            process.stdin.flush()
-        
-        # Set PowerShell preferences to prevent hanging on prompts
-        init_commands = [
-            "$ProgressPreference = 'SilentlyContinue'",  # Disable progress bars
-            "$ConfirmPreference = 'None'",               # Never prompt for confirmation
-            "$VerbosePreference = 'SilentlyContinue'",   # Disable verbose output
-            "$DebugPreference = 'SilentlyContinue'",     # Disable debug output
-        ]
-        for cmd in init_commands:
-            process.stdin.write(f"{cmd}\n")
-        process.stdin.flush()
-    
-    session = powershell_sessions[session_id]
-    session['last_used'] = time.time()
-    process = session['process']
-    
-    # Execute command with unique delimiter for stdout
-    stdout_delimiter = f"__CYBERDRIVER_STDOUT_END_{uuid.uuid4().hex}__"
-
-    # Run command and output delimiter
-    # Using echo with specific marker to ensure it gets through
-    full_command = (
-        f"{command}\n"
-        f"echo '###DELIMITER:{stdout_delimiter}###'\n"
-    )
-    
-    # Write and flush
-    try:
-        process.stdin.write(full_command)
-        process.stdin.flush()
-    except Exception as e:
-        print(f"Error writing command: {e}")
-        raise
-    
-    # Create timeout event for threads
-    timeout_event = threading.Event()
-    
-    # Mark this execution as active
-    active_executions[session_id] = {
-        'start_time': time.time(),
-        'timeout_event': timeout_event
-    }
-    
-    # Read streams in separate threads to prevent blocking
-    stdout_lines = []
-    stderr_lines = []
-    
-    stdout_thread = threading.Thread(target=read_stream, args=(process.stdout, stdout_lines, stdout_delimiter, timeout_event))
-    # For stderr, we'll just read until timeout since we don't have a delimiter
-    stderr_thread = threading.Thread(target=read_stream, args=(process.stderr, stderr_lines, None, timeout_event))
-    
-    stdout_thread.daemon = True
-    stderr_thread.daemon = True
-    
-    stdout_thread.start()
-    stderr_thread.start()
-    
-    # Wait for stdout thread first (it has the delimiter)
-    stdout_thread.join(timeout=timeout)
-    
-    # If stdout finished (found delimiter), stop stderr thread
-    if not stdout_thread.is_alive():
-        timeout_event.set()  # Signal stderr to stop
-        stderr_thread.join(timeout=2.0)  # Give it 2 seconds to finish
-    else:
-        # Stdout timed out, wait for stderr briefly
-        stderr_thread.join(timeout=2.0)
-    
-    # If stdout thread is still alive, we hit timeout
-    if stdout_thread.is_alive():
-        print(f"Command timed out after {timeout} seconds")
-        timeout_event.set()  # Signal threads to stop
-        
-        # Kill the session
-        kill_powershell_session(session_id)
-        
-        # Clean up active execution
-        if session_id in active_executions:
-            del active_executions[session_id]
+        # Clean output - remove empty lines at start/end
+        stdout_lines = [line.rstrip() for line in stdout.splitlines() if line.strip()]
+        stderr_lines = [line.rstrip() for line in stderr.splitlines() if line.strip()]
         
         return {
-            "stdout": "\n".join(stdout_lines) + "\n[Command timed out]",
-            "stderr": "\n".join(stderr_lines) + "\n[Command timed out]",
+            "stdout": "\n".join(stdout_lines),
+            "stderr": "\n".join(stderr_lines),
+            "exit_code": process.returncode,
+            "session_id": session_id
+        }
+        
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        return {
+            "stdout": "",
+            "stderr": "Command timed out",
             "exit_code": -1,
             "session_id": session_id,
             "error": f"Command timed out after {timeout} seconds"
         }
-
-    # Clean up active execution
-    if session_id in active_executions:
-        del active_executions[session_id]
-    
-    # For now, we'll just return what we got
-    # TODO: Add proper exit code handling back once basic execution works
-
-
-    
-    return {
-        "stdout": "\n".join(stdout_lines),
-        "stderr": "\n".join(stderr_lines),
-        "exit_code": 0,  # TODO: Get proper exit code
-        "session_id": session_id
-    }
+    except Exception as e:
+        return {
+            "stdout": "",
+            "stderr": str(e),
+            "exit_code": -1,
+            "session_id": session_id,
+            "error": str(e)
+        }
 
 @app.post("/computer/shell/powershell/simple")
 async def simple_powershell_test():
@@ -1089,17 +848,8 @@ async def post_powershell_exec(payload: Dict[str, Any]):
         raise HTTPException(status_code=400, detail="Missing 'command' field")
     
     try:
-        # Don't hold the lock for the entire execution
-        # Just use it for critical sections
-        loop = asyncio.get_event_loop()
-        
-        # Check if there's already an execution in progress for this session
-        if session_id in active_executions:
-            # Kill the old one first
-            print(f"Killing existing execution for session {session_id}")
-            kill_powershell_session(session_id)
-        
         # Run in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             executor,
             execute_powershell_command,
@@ -1113,39 +863,25 @@ async def post_powershell_exec(payload: Dict[str, Any]):
         return result
         
     except Exception as e:
-        # Clean up on error
-        if session_id in active_executions:
-            del active_executions[session_id]
         raise HTTPException(status_code=500, detail=f"Failed to execute command: {e}")
 
 @app.post("/computer/shell/powershell/session")
 async def post_powershell_session(payload: Dict[str, Any]):
-    """Manage PowerShell sessions."""
+    """Manage PowerShell sessions (compatibility endpoint)."""
     action = payload.get("action")
     session_id = payload.get("session_id")
     
     if action not in ["create", "destroy"]:
         raise HTTPException(status_code=400, detail="Invalid action. Must be 'create' or 'destroy'")
     
-    async with session_lock:
-        if action == "create":
-            # Session is created on the first `exec` command automatically
-            new_session_id = str(uuid.uuid4())
-            return {"session_id": new_session_id, "message": "Session will be created on first use."}
-        
-        elif action == "destroy":
-            if not session_id:
-                raise HTTPException(status_code=400, detail="Missing 'session_id' field")
-            
-            if session_id in powershell_sessions:
-                try:
-                    powershell_sessions[session_id]['process'].terminate()
-                except:
-                    pass
-                del powershell_sessions[session_id]
-                return {"message": "Session destroyed"}
-            else:
-                raise HTTPException(status_code=404, detail="Session not found")
+    if action == "create":
+        # Sessions are no longer maintained - each command runs independently
+        new_session_id = str(uuid.uuid4())
+        return {"session_id": new_session_id, "message": "Session ID generated (sessions are now stateless)"}
+    
+    elif action == "destroy":
+        # No-op since we don't maintain sessions anymore
+        return {"message": "Session destroyed (no-op in stateless mode)"}
 
 
 # -----------------------------------------------------------------------------
