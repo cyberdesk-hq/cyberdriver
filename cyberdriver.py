@@ -686,8 +686,7 @@ def read_stream(stream, lines_list, delimiter, timeout_event=None):
         if not line or not line.strip():
             return
             
-        # Debug: print ALL lines we read
-        #print(f"READ: {line.strip()[:100]}")
+
         
         # Check for delimiter
         if delimiter and f"###DELIMITER:{delimiter}###" in line:
@@ -702,10 +701,7 @@ def read_stream(stream, lines_list, delimiter, timeout_event=None):
         
         if not (is_prompt or is_init_cmd or is_echo_of_cmd):
             lines_list.append(stripped)
-        else:
-            # Temporary debug: see what we're filtering out
-            if not is_prompt and not is_init_cmd:
-                print(f"FILTERED OUT: {stripped[:100]}")
+
         
         return False
     
@@ -973,15 +969,7 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
     # For now, we'll just return what we got
     # TODO: Add proper exit code handling back once basic execution works
 
-    # Debug: print what we collected
-    print(f"DEBUG: Collected {len(stdout_lines)} stdout lines")
-    for i, line in enumerate(stdout_lines[:10]):  # Show first 10 lines
-        print(f"  Line {i}: {repr(line[:50])}...")
-    
-    # Check the joined output
-    joined_output = "\n".join(stdout_lines)
-    print(f"DEBUG: Joined output length: {len(joined_output)} chars")
-    print(f"DEBUG: Joined output preview: {repr(joined_output[:200])}")
+
     
     return {
         "stdout": "\n".join(stdout_lines),
