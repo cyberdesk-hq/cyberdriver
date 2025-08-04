@@ -56,6 +56,7 @@ from typing import Dict, List, Optional, Tuple, Union, Any
 from enum import Enum
 from dataclasses import dataclass
 from io import BytesIO
+from contextlib import asynccontextmanager
 
 import httpx
 import mss
@@ -362,11 +363,12 @@ pyautogui.FAILSAFE = True
 # Local API implementation
 # -----------------------------------------------------------------------------
 
-app = FastAPI(title="Cyberdriver", version=VERSION)
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Clean up all PowerShell sessions on shutdown."""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifespan events."""
+    # Startup
+    yield
+    # Shutdown
     print("Cleaning up PowerShell sessions...")
     
     # Kill all active sessions
@@ -379,6 +381,8 @@ async def shutdown_event():
     # Shutdown the thread pool executor
     executor.shutdown(wait=False)
     print("Cleanup complete")
+
+app = FastAPI(title="Cyberdriver", version=VERSION, lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -677,6 +681,8 @@ def read_stream(stream, lines_list, delimiter, timeout_event=None):
     """Read lines from a stream until a delimiter is found or timeout."""
     import select
     
+    print(f"Starting read_stream, looking for delimiter: {delimiter[:20]}...")
+    
     while True:
         # Check if we should stop due to timeout
         if timeout_event and timeout_event.is_set():
@@ -711,7 +717,9 @@ def read_stream(stream, lines_list, delimiter, timeout_event=None):
             read_thread.join(0.1)  # Wait max 0.1 seconds
             
             if not read_thread.is_alive() and line:
+                print(f"Read line: {line.strip()[:100]}")
                 if delimiter and delimiter in line:
+                    print(f"Found delimiter!")
                     break
                 if line.strip():  # Only add non-empty lines
                     lines_list.append(line.strip())
@@ -783,13 +791,13 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         
         # Use proper PowerShell flags to prevent hanging
+        # DO NOT use "-Command -" as it waits for EOF before executing!
         ps_args = [
             powershell_cmd,
             "-NoLogo",           # No startup banner
             "-NoProfile",        # Don't load profile (prevents hanging on profile scripts)
-            "-NonInteractive",   # Don't prompt for input
-            "-ExecutionPolicy", "Bypass",  # Allow script execution
-            "-Command", "-"      # Read commands from stdin
+            "-ExecutionPolicy", "Bypass"  # Allow script execution
+            # NO "-Command -" - we want interactive mode!
         ]
         
         print(f"Starting PowerShell with args: {ps_args}")
@@ -813,6 +821,10 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
             'last_used': time.time()
         }
         
+        # Give PowerShell a moment to initialize
+        time.sleep(0.5)
+        print("PowerShell process initialized")
+        
         # Set working directory if specified
         if working_directory:
             process.stdin.write(f"Set-Location -Path '{working_directory}'\n")
@@ -833,31 +845,28 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
     session['last_used'] = time.time()
     process = session['process']
     
-    # Execute command with unique delimiters for stdout and stderr
+    # Execute command with unique delimiter for stdout
     stdout_delimiter = f"__CYBERDRIVER_STDOUT_END_{uuid.uuid4().hex}__"
-    stderr_delimiter = f"__CYBERDRIVER_STDERR_END_{uuid.uuid4().hex}__"
-    exit_code_delimiter = f"__CYBERDRIVER_EXIT_CODE_{uuid.uuid4().hex}__"
 
-    # Wrap command to ensure it completes and we get output
+    # Simplified command - just run it and output delimiter
+    # This will help us debug if PowerShell is even executing commands
     full_command = (
-        f"$ErrorActionPreference = 'Continue'\n"  # Continue on errors
-        f"try {{\n"
-        f"  {command}\n"
-        f"  $exit_code = $LASTEXITCODE\n"
-        f"  if ($null -eq $exit_code) {{ $exit_code = 0 }}\n"
-        f"}} catch {{\n"
-        f"  Write-Error $_.Exception.Message\n"
-        f"  $exit_code = 1\n"
-        f"}}\n"
+        f"{command}\n"
         f"Write-Output '{stdout_delimiter}'\n"
-        f"[Console]::Error.WriteLine('{stderr_delimiter}')\n"
-        f"Write-Output '{exit_code_delimiter}'\n"
-        f"Write-Output $exit_code\n"
     )
     
     print(f"Executing command: {command}")
-    process.stdin.write(full_command)
-    process.stdin.flush()
+    print(f"Full command with delimiters:\n{full_command}")
+    print(f"Process alive: {process.poll() is None}")
+    
+    # Write and flush
+    try:
+        process.stdin.write(full_command)
+        process.stdin.flush()
+        print("Command written and flushed successfully")
+    except Exception as e:
+        print(f"Error writing command: {e}")
+        raise
     
     # Create timeout event for threads
     timeout_event = threading.Event()
@@ -873,7 +882,8 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
     stderr_lines = []
     
     stdout_thread = threading.Thread(target=read_stream, args=(process.stdout, stdout_lines, stdout_delimiter, timeout_event))
-    stderr_thread = threading.Thread(target=read_stream, args=(process.stderr, stderr_lines, stderr_delimiter, timeout_event))
+    # For stderr, we'll just read until timeout since we don't have a delimiter
+    stderr_thread = threading.Thread(target=read_stream, args=(process.stderr, stderr_lines, None, timeout_event))
     
     stdout_thread.daemon = True
     stderr_thread.daemon = True
@@ -909,37 +919,113 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
     if session_id in active_executions:
         del active_executions[session_id]
     
-    # After delimiters are hit, the exit code is the only thing left in stdout
-    exit_code_output = []
-    # Use a short timeout for reading the exit code
-    exit_thread = threading.Thread(target=read_stream, args=(process.stdout, exit_code_output, '', None))
-    exit_thread.daemon = True
-    exit_thread.start()
-    exit_thread.join(timeout=2.0)  # Short timeout for exit code
-
-    exit_code = 0
-    # Find the line after the delimiter and parse the exit code
-    try:
-        # Find the index of the delimiter in the combined output
-        delimiter_index = -1
-        for i, line in enumerate(exit_code_output):
-            if exit_code_delimiter in line:
-                delimiter_index = i
-                break
-        
-        if delimiter_index != -1 and delimiter_index + 1 < len(exit_code_output):
-            exit_code_line = exit_code_output[delimiter_index + 1]
-            exit_code = int(exit_code_line.strip())
-
-    except (ValueError, IndexError):
-        pass # Could not parse exit code, default to 0
+    # For now, we'll just return what we got
+    # TODO: Add proper exit code handling back once basic execution works
 
     return {
         "stdout": "\n".join(stdout_lines),
         "stderr": "\n".join(stderr_lines),
-        "exit_code": exit_code,
+        "exit_code": 0,  # TODO: Get proper exit code
         "session_id": session_id
     }
+
+@app.post("/computer/shell/powershell/simple")
+async def simple_powershell_test():
+    """Ultra-simple PowerShell test."""
+    import subprocess
+    
+    print("\n=== SIMPLE POWERSHELL TEST ===")
+    
+    try:
+        # Run a simple command directly
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", "Write-Output 'Hello World'"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        print(f"Return code: {result.returncode}")
+        print(f"Stdout: {result.stdout}")
+        print(f"Stderr: {result.stderr}")
+        
+        return {
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr
+        }
+    except subprocess.TimeoutExpired:
+        return {"error": "Command timed out"}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/computer/shell/powershell/test")
+async def test_powershell():
+    """Test PowerShell functionality with a simple command."""
+    import subprocess
+    import threading
+    
+    print("\n=== POWERSHELL TEST ===")
+    
+    # Start a simple PowerShell process
+    ps_args = ["powershell", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass"]
+    print(f"Starting PowerShell with: {ps_args}")
+    
+    try:
+        process = subprocess.Popen(
+            ps_args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1
+        )
+        
+        print(f"Process started, PID: {process.pid}")
+        
+        # Test 1: Simple echo
+        test_cmd = 'Write-Output "Hello from PowerShell"\n'
+        print(f"Sending: {test_cmd.strip()}")
+        process.stdin.write(test_cmd)
+        process.stdin.flush()
+        
+        # Try to read output with timeout
+        output = []
+        def read_output():
+            try:
+                line = process.stdout.readline()
+                if line:
+                    output.append(line.strip())
+                    print(f"Got output: {line.strip()}")
+            except Exception as e:
+                print(f"Read error: {e}")
+        
+        for i in range(10):  # Try for 1 second
+            t = threading.Thread(target=read_output)
+            t.daemon = True
+            t.start()
+            t.join(0.1)
+            if output:
+                break
+        
+        if not output:
+            print("No output received!")
+            
+            # Check if process is still alive
+            if process.poll() is not None:
+                print(f"Process died with code: {process.poll()}")
+                stderr = process.stderr.read()
+                if stderr:
+                    print(f"Stderr: {stderr}")
+        
+        # Kill the process
+        process.terminate()
+        
+        return {"test": "complete", "output": output}
+        
+    except Exception as e:
+        print(f"Test error: {e}")
+        return {"error": str(e)}
 
 @app.post("/computer/shell/powershell/exec")
 async def post_powershell_exec(payload: Dict[str, Any]):
