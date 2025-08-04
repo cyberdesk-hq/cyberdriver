@@ -30,7 +30,7 @@ jobs:
       id: version
       shell: bash
       run: |
-        VERSION=$(python -c "import re; content = open('cyberdriver.py').read(); print(re.search(r'VERSION = \"(.+?)\"', content).group(1))")
+        VERSION=$(python -c "import re; content = open('cyberdriver.py', encoding='utf-8').read(); print(re.search(r'VERSION = \"(.+?)\"', content).group(1))")
         echo "version=$VERSION" >> $GITHUB_OUTPUT
     
     - name: Create Release
