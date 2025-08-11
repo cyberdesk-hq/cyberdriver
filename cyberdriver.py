@@ -123,29 +123,41 @@ def disable_windows_console_quickedit():
 
 # Define websocket compatibility helper inline
 async def connect_with_headers(uri, headers_dict):
-    """Compatibility wrapper for websocket connections with headers."""
+    """Compatibility wrapper for websocket connections with headers and keepalive settings."""
+    # Common kwargs for robustness across proxies
+    ws_kwargs = {
+        # Send pings to keep NATs and proxies alive
+        "ping_interval": 20,
+        "ping_timeout": 20,
+        # Allow larger messages (screenshots, file reads)
+        "max_size": None,
+        # Avoid unbounded back-pressure
+        "max_queue": 32,
+        # Faster close handshakes
+        "close_timeout": 3,
+    }
     # Try websockets v15+ API (uses additional_headers)
     try:
-        return await websockets.connect(uri, additional_headers=headers_dict)
+        return await websockets.connect(uri, additional_headers=headers_dict, **ws_kwargs)
     except TypeError:
         pass
     
     # Try websockets v10-14 API (uses extra_headers)
     try:
-        return await websockets.connect(uri, extra_headers=headers_dict)
+        return await websockets.connect(uri, extra_headers=headers_dict, **ws_kwargs)
     except TypeError:
         pass
     
     # Try list of tuples format (websockets 8.x - 9.x)
     try:
-        return await websockets.connect(uri, extra_headers=list(headers_dict.items()))
+        return await websockets.connect(uri, extra_headers=list(headers_dict.items()), **ws_kwargs)
     except TypeError:
         pass
     
     # Last resort - connect without headers
     print("WARNING: Could not send custom headers with WebSocket connection")
     print("This may cause authentication to fail ")
-    return await websockets.connect(uri)
+    return await websockets.connect(uri, **ws_kwargs)
 
 # -----------------------------------------------------------------------------
 # Configuration Management
@@ -993,6 +1005,10 @@ class TunnelClient:
                     else:
                         # Binary body chunk
                         body_buffer.extend(message)
+
+                # If we exit the async for without an exception, the server closed gracefully
+                # Ensure we signal this to the reconnection loop by raising to trigger backoff
+                raise RuntimeError("WebSocket closed by server")
     
     async def _forward_request(self, meta: dict, body: bytes, client: httpx.AsyncClient) -> dict:
         """Forward request to local API."""
