@@ -459,6 +459,52 @@ async def post_keyboard_type(payload: Dict[str, str]):
     return {}
 
 
+@app.post("/computer/input/mouse/scroll")
+async def post_mouse_scroll(payload: Dict[str, Any]):
+    """Scroll the mouse wheel vertically or horizontally.
+    
+    Payload:
+    - direction: 'up' | 'down' | 'left' | 'right'
+    - amount: int number of scroll steps (clicks); positive integer
+    - x, y: optional cursor position to move to before scrolling
+    """
+    direction = str(payload.get("direction", "")).lower()
+    amount = payload.get("amount")
+    if direction not in ("up", "down", "left", "right"):
+        raise HTTPException(status_code=400, detail="Invalid direction: expected 'up', 'down', 'left', or 'right'")
+    try:
+        amount_int = int(amount)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Missing or invalid 'amount' (must be integer)")
+    if amount_int < 0:
+        raise HTTPException(status_code=400, detail="'amount' must be non-negative")
+    if amount_int == 0:
+        return {}
+    x = payload.get("x")
+    y = payload.get("y")
+    if x is not None and y is not None:
+        try:
+            pyautogui.moveTo(int(x), int(y), duration=0)
+        except Exception:
+            pass
+    # Map to pyautogui scroll functions
+    if direction in ("up", "down"):
+        clicks = amount_int if direction == "up" else -amount_int
+        pyautogui.scroll(clicks)
+    else:
+        clicks = amount_int if direction == "right" else -amount_int
+        # Use hscroll if available; fallback to shift+scroll
+        try:
+            pyautogui.hscroll(clicks)
+        except AttributeError:
+            # Fallback: hold shift and use vertical scroll as horizontal surrogate
+            pyautogui.keyDown("shift")
+            try:
+                pyautogui.scroll(clicks)
+            finally:
+                pyautogui.keyUp("shift")
+    return {}
+
 @app.post("/computer/input/keyboard/key")
 async def post_keyboard_key(payload: Dict[str, str]):
     """Execute XDO-style key sequence (e.g., 'ctrl+c', 'alt+tab')."""
