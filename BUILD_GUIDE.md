@@ -4,7 +4,7 @@ This guide walks you through creating a standalone executable from Cyberdriver.
 
 ## Prerequisites
 
-- Python 3.9 or later
+- Python 3.9 or later (on macOS, prefer using the system Python via `pyenv` or a venv)
 - All dependencies installed (`pip install -r requirements.txt`)
 - PyInstaller (`pip install pyinstaller`)
 
@@ -97,13 +97,35 @@ dist\cyberdriver.exe start --port 3000
        cyberdriver.py
    ```
 
-3. **Universal Binary**: For Apple Silicon + Intel:
+3. **Apple Silicon vs Intel**: Build on the target architecture for best compatibility.
+   - On Apple Silicon (arm64): run builds natively.
+   - To produce x86_64 from Apple Silicon, use Rosetta Python:
+     ```bash
+     arch -x86_64 /usr/bin/python3 -m venv venv-x86
+     source venv-x86/bin/activate
+     pip install -r requirements.txt
+     pyinstaller cyberdriver.spec
+     ```
+   - Or set `TARGET_ARCH` for the spec to hint target selection:
+     ```bash
+     export TARGET_ARCH=universal2  # or x86_64 / arm64 where supported
+     pyinstaller cyberdriver.spec
+     ```
+
+4. **Code Signing & Notarization** (optional but recommended for distribution):
    ```bash
-   pyinstaller \
-       --onefile \
-       --name cyberdriver \
-       --icon=cyberdriver.icns \
-       cyberdriver.py
+   # Sign the binary (requires Developer ID Application cert on this machine)
+   codesign --deep --force --options runtime --sign "Developer ID Application: Your Name (TEAMID)" dist/cyberdriver
+
+   # Notarize (requires apple credentials / API key setup)
+   xcrun notarytool submit dist/cyberdriver --keychain-profile "AC_PASSWORD_PROFILE" --wait
+   xcrun stapler staple dist/cyberdriver
+   ```
+
+5. **UPX Compression** (optional):
+   ```bash
+   brew install upx
+   upx --best dist/cyberdriver
    ```
 
 ### Windows

@@ -123,29 +123,41 @@ def disable_windows_console_quickedit():
 
 # Define websocket compatibility helper inline
 async def connect_with_headers(uri, headers_dict):
-    """Compatibility wrapper for websocket connections with headers."""
+    """Compatibility wrapper for websocket connections with headers and keepalive settings."""
+    # Common kwargs for robustness across proxies
+    ws_kwargs = {
+        # Send pings to keep NATs and proxies alive
+        "ping_interval": 20,
+        "ping_timeout": 20,
+        # Allow larger messages (screenshots, file reads)
+        "max_size": None,
+        # Avoid unbounded back-pressure
+        "max_queue": 32,
+        # Faster close handshakes
+        "close_timeout": 3,
+    }
     # Try websockets v15+ API (uses additional_headers)
     try:
-        return await websockets.connect(uri, additional_headers=headers_dict)
+        return await websockets.connect(uri, additional_headers=headers_dict, **ws_kwargs)
     except TypeError:
         pass
     
     # Try websockets v10-14 API (uses extra_headers)
     try:
-        return await websockets.connect(uri, extra_headers=headers_dict)
+        return await websockets.connect(uri, extra_headers=headers_dict, **ws_kwargs)
     except TypeError:
         pass
     
     # Try list of tuples format (websockets 8.x - 9.x)
     try:
-        return await websockets.connect(uri, extra_headers=list(headers_dict.items()))
+        return await websockets.connect(uri, extra_headers=list(headers_dict.items()), **ws_kwargs)
     except TypeError:
         pass
     
     # Last resort - connect without headers
     print("WARNING: Could not send custom headers with WebSocket connection")
     print("This may cause authentication to fail ")
-    return await websockets.connect(uri)
+    return await websockets.connect(uri, **ws_kwargs)
 
 # -----------------------------------------------------------------------------
 # Configuration Management
@@ -153,7 +165,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.15"
+VERSION = "0.0.16"
 
 @dataclass
 class Config:
@@ -446,6 +458,52 @@ async def post_keyboard_type(payload: Dict[str, str]):
     pyautogui.typewrite(text)
     return {}
 
+
+@app.post("/computer/input/mouse/scroll")
+async def post_mouse_scroll(payload: Dict[str, Any]):
+    """Scroll the mouse wheel vertically or horizontally.
+    
+    Payload:
+    - direction: 'up' | 'down' | 'left' | 'right'
+    - amount: int number of scroll steps (clicks); positive integer
+    - x, y: optional cursor position to move to before scrolling
+    """
+    direction = str(payload.get("direction", "")).lower()
+    amount = payload.get("amount")
+    if direction not in ("up", "down", "left", "right"):
+        raise HTTPException(status_code=400, detail="Invalid direction: expected 'up', 'down', 'left', or 'right'")
+    try:
+        amount_int = int(amount)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Missing or invalid 'amount' (must be integer)")
+    if amount_int < 0:
+        raise HTTPException(status_code=400, detail="'amount' must be non-negative")
+    if amount_int == 0:
+        return {}
+    x = payload.get("x")
+    y = payload.get("y")
+    if x is not None and y is not None:
+        try:
+            pyautogui.moveTo(int(x), int(y), duration=0)
+        except Exception:
+            pass
+    # Map to pyautogui scroll functions
+    if direction in ("up", "down"):
+        clicks = amount_int if direction == "up" else -amount_int
+        pyautogui.scroll(clicks)
+    else:
+        clicks = amount_int if direction == "right" else -amount_int
+        # Use hscroll if available; fallback to shift+scroll
+        try:
+            pyautogui.hscroll(clicks)
+        except AttributeError:
+            # Fallback: hold shift and use vertical scroll as horizontal surrogate
+            pyautogui.keyDown("shift")
+            try:
+                pyautogui.scroll(clicks)
+            finally:
+                pyautogui.keyUp("shift")
+    return {}
 
 @app.post("/computer/input/keyboard/key")
 async def post_keyboard_key(payload: Dict[str, str]):
@@ -993,6 +1051,10 @@ class TunnelClient:
                     else:
                         # Binary body chunk
                         body_buffer.extend(message)
+
+                # If we exit the async for without an exception, the server closed gracefully
+                # Ensure we signal this to the reconnection loop by raising to trigger backoff
+                raise RuntimeError("WebSocket closed by server")
     
     async def _forward_request(self, meta: dict, body: bytes, client: httpx.AsyncClient) -> dict:
         """Forward request to local API."""

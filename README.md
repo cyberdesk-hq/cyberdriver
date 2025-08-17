@@ -48,7 +48,7 @@ $toolDir = "$env:USERPROFILE\.cyberdriver"
 New-Item -ItemType Directory -Force -Path $toolDir
 
 # Download cyberdriver
-Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.15/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe"
+Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.16/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe"
 
 # Add to PATH if not already there
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -59,7 +59,41 @@ if ($userPath -notlike "*$toolDir*") {
 Write-Host "Cyberdriver installed! You may need to restart your terminal for PATH changes to take effect."
 ```
 
-**Note:** Cyberdriver automatically disables PowerShell's QuickEdit Mode on startup. PowerShell has this dumb quirk where focusing your mouse on a running executable can stall the outputs until you unfocus it (it's called "QuickEdit Mode"). 
+### macOS Installation (Bash/Zsh)
+
+```bash
+# Choose version and target directory
+VERSION=0.0.16
+TOOL_DIR="$HOME/.cyberdriver"
+mkdir -p "$TOOL_DIR"
+
+# Detect architecture (arm64 or x86_64)
+ARCH=$(uname -m)
+
+# Download and install
+curl -L "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v${VERSION}/cyberdriver-macos-${ARCH}.zip" -o "$TOOL_DIR/cyberdriver.zip"
+unzip -o "$TOOL_DIR/cyberdriver.zip" -d "$TOOL_DIR"
+chmod +x "$TOOL_DIR/cyberdriver"
+
+# Add to PATH (Zsh)
+if ! echo ":$PATH:" | grep -q ":$TOOL_DIR:"; then
+  echo "export PATH=\"$TOOL_DIR:$PATH\"" >> "$HOME/.zshrc"
+  echo "Added to PATH. Restart your terminal or run: source $HOME/.zshrc"
+fi
+
+# Permissions: grant Terminal/iTerm access in System Settings → Privacy & Security
+echo "Please enable:"
+echo "- Accessibility"
+echo "- Screen Recording"
+
+# Optional: remove quarantine attribute if blocked
+# xattr -d com.apple.quarantine "$TOOL_DIR/cyberdriver" || true
+
+# Run it
+"$TOOL_DIR/cyberdriver" join --secret YOUR_API_KEY
+```
+
+**Note (Windows):** Cyberdriver automatically disables PowerShell's QuickEdit Mode on startup. PowerShell has this dumb quirk where focusing your mouse on a running executable can stall the outputs until you unfocus it (it's called "QuickEdit Mode"). 
 
 **Important - Admin Privileges:** If the desktop application you want to automate requires administrator privileges to start (such as many legacy enterprise applications), you must also run cyberdriver from an Administrator PowerShell terminal:
 
@@ -78,7 +112,7 @@ cyberdriver start
 Or subscribed for remote use via Cyberdesk cloud:
 
 ```bash
-cyberdriver join --secret SK-YOUR-SECRET-KEY --host https://cyberdesk-new.fly.dev
+cyberdriver join --secret SK-YOUR-SECRET-KEY
 ```
 
 ## Common Issues
@@ -125,7 +159,7 @@ foreach ($cert in $certs) {
 }
 ```
 
-Then retry cyberdriver join!
+Then retry `cyberdriver join`!
 
 > If you have any other issues, reach out to the team! We'll get on it asap.
 
@@ -159,7 +193,7 @@ Configuration is stored in:
 The config file contains:
 ```json
 {
-  "version": "0.0.15",
+  "version": "0.0.16",
   "fingerprint": "uuid-v4-string"
 }
 ```
