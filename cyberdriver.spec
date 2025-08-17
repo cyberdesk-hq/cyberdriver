@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 import sys
+import os
 from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
@@ -73,9 +74,9 @@ exe = EXE(
     runtime_tmpdir=None,
     console=True,
     disable_windowed_traceback=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
+    target_arch=(os.environ.get('TARGET_ARCH') if sys.platform == 'darwin' else None),
+    codesign_identity=(os.environ.get('CODESIGN_IDENTITY') if sys.platform == 'darwin' else None),
+    entitlements_file=(os.environ.get('ENTITLEMENTS_FILE') if sys.platform == 'darwin' else None),
     icon=None,  # Add icon path here if you have one
     version_file=None,  # Add version info file if needed
     uac_admin=False  # Don't request administrator privileges on Windows
