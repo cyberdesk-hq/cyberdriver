@@ -1552,7 +1552,9 @@ def print_banner_no_color(mode="default"):
         print("Connecting to Cyberdesk Cloud...")
     else:
         print("Get started:")
-        print("→ cyberdriver join --secret YOUR_API_KEY")
+        print("→ Join: cyberdriver join --secret YOUR_API_KEY")
+        print("→ Keepalive: cyberdriver join --secret YOUR_API_KEY --keepalive --keepalive-threshold-minutes 3")
+        print("→ Remote keepalive (host): cyberdriver join --secret YOUR_API_KEY --keepalive --register-as-keepalive-for MAIN_MACHINE_ID")
     
     print("→ Run -h for help")
     print("→ Visit https://docs.cyberdesk.io for documentation")
@@ -1617,7 +1619,9 @@ def print_banner(mode="default"):
         print(f"{white}Connecting to Cyberdesk Cloud...{reset}")
     else:
         print(f"{white}Get started:{reset}")
-        print(f"{white}→ {blue}cyberdriver join --secret{reset} {white}YOUR_API_KEY{reset}")
+        print(f"{white}→ {blue}Join:{reset} cyberdriver join --secret YOUR_API_KEY")
+        print(f"{white}→ {blue}Keepalive:{reset} cyberdriver join --secret YOUR_API_KEY --keepalive --keepalive-threshold-minutes 3")
+        print(f"{white}→ {blue}Remote keepalive (host):{reset} cyberdriver join --secret YOUR_API_KEY --keepalive --register-as-keepalive-for MAIN_MACHINE_ID")
     
     # Always show help and docs
     print(f"{white}→ Run {blue}-h{reset} {white}for help{reset}")
