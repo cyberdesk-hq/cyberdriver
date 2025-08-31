@@ -52,6 +52,7 @@ import time
 import uuid
 import signal
 import threading
+import random
 from typing import Dict, List, Optional, Tuple, Union, Any
 from enum import Enum
 from dataclasses import dataclass
@@ -165,7 +166,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.16"
+VERSION = "0.0.17"
 
 @dataclass
 class Config:
@@ -405,6 +406,21 @@ async def disable_buffering(request, call_next):
     response.headers["X-Accel-Buffering"] = "no"
     response.headers["Cache-Control"] = "no-cache"
     return response
+@app.post("/internal/keepalive/remote/activity")
+async def post_remote_keepalive_activity():
+    """Record remote activity to delay/suppress keepalive runs.
+    
+    Mirrors local activity semantics. Returns 204 immediately.
+    """
+    try:
+        manager = getattr(app.state, "keepalive_manager", None)
+        if manager is not None:
+            # This mirrors local request activity
+            manager.record_activity()
+            print("RemoteKeepalive: activity signal received; idle timer reset")
+        return Response(status_code=204)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 @app.get("/computer/display/screenshot", response_class=Response)
@@ -956,7 +972,7 @@ async def post_powershell_session(payload: Dict[str, Any]):
 class TunnelClient:
     """WebSocket tunnel client with proper message framing."""
     
-    def __init__(self, host: str, port: int, secret: str, target_port: int, config: Config):
+    def __init__(self, host: str, port: int, secret: str, target_port: int, config: Config, keepalive_manager: Optional["KeepAliveManager"] = None, remote_keepalive_for_main_id: Optional[str] = None):
         self.host = host
         self.port = port
         self.secret = secret
@@ -964,6 +980,8 @@ class TunnelClient:
         self.config = config
         self.min_sleep = 1
         self.max_sleep = 16
+        self.keepalive_manager = keepalive_manager
+        self.remote_keepalive_for_main_id = remote_keepalive_for_main_id
         
     async def run(self):
         """Run the tunnel with exponential backoff reconnection."""
@@ -974,6 +992,9 @@ class TunnelClient:
                 await self._connect_and_run()
                 # Reset sleep time on successful connection
                 sleep_time = self.min_sleep
+            except asyncio.CancelledError:
+                # Allow task cancellation to stop the tunnel immediately
+                raise
             except Exception as e:
                 print(f"Tunnel error: {e}")
                 print(f"Retrying in {sleep_time} seconds...")
@@ -997,6 +1018,8 @@ class TunnelClient:
             "X-PIGLET-FINGERPRINT": self.config.fingerprint,
             "X-PIGLET-VERSION": self.config.version,
         }
+        if self.remote_keepalive_for_main_id:
+            headers["X-Remote-Keepalive-For"] = self.remote_keepalive_for_main_id
         
         # Use compatibility wrapper for connection
         websocket = await connect_with_headers(uri, headers)
@@ -1034,6 +1057,9 @@ class TunnelClient:
                         if message == "end":
                             if request_meta:
                                 # Process complete request
+                                # Note activity (work received)
+                                if self.keepalive_manager is not None:
+                                    self.keepalive_manager.record_activity()
                                 response = await self._forward_request(
                                     request_meta, bytes(body_buffer), http_client
                                 )
@@ -1047,6 +1073,9 @@ class TunnelClient:
                         else:
                             # New request metadata
                             request_meta = json.loads(message)
+                            # Note activity as soon as we receive metadata
+                            if self.keepalive_manager is not None:
+                                self.keepalive_manager.record_activity()
                             body_buffer.clear()
                     else:
                         # Binary body chunk
@@ -1068,6 +1097,13 @@ class TunnelClient:
             url += f"?{query}"
         
         try:
+            # If a keepalive action is currently running, wait for it to finish
+            if self.keepalive_manager is not None:
+                if self.keepalive_manager.is_busy():
+                    print("Keepalive: waiting for current action to finish before handling request…")
+                await self.keepalive_manager.wait_until_idle()
+                # Record that we are actively processing a request
+                self.keepalive_manager.record_activity()
             # IMPORTANT: Use stream=True to avoid buffering the entire response
             async with client.stream(method, url, headers=headers, content=body) as response:
                 print(f"{method} {path} -> {response.status_code}")
@@ -1127,7 +1163,243 @@ async def run_server_async(port: int):
     await server.serve()
 
 
-async def run_join(host: str, port: int, secret: str, target_port: int):
+class KeepAliveManager:
+    """Background manager that triggers realistic user activity when idle.
+    
+    - Tracks last activity timestamp (requests from cloud)
+    - If enabled and idle beyond threshold, triggers a short keepalive action
+    - While keepalive action runs, requests will wait until it completes
+    """
+    def __init__(self, enabled: bool, threshold_minutes: float = 3.0, check_interval_seconds: float = 30.0):
+        self.enabled = enabled
+        self.threshold_seconds = max(10.0, float(threshold_minutes) * 60.0)
+        self.check_interval_seconds = max(5.0, float(check_interval_seconds))
+        self.last_activity_ts = time.time()
+        self._idle_event: Optional[asyncio.Event] = None  # created in run()
+        self._task: Optional[asyncio.Task] = None
+        self._stop = False
+        # After a keepalive completes, wait a random 3-5 min before allowing another
+        self._next_allowed_ts = self.last_activity_ts + self.threshold_seconds
+        # Live countdown printer state
+        self._countdown_task: Optional[asyncio.Task] = None
+        self._countdown_active: bool = False
+        self._last_countdown_len: int = 0
+
+    def record_activity(self):
+        self.last_activity_ts = time.time()
+        # Also push out next allowed time based on fresh activity
+        self._next_allowed_ts = self.last_activity_ts + self.threshold_seconds
+        # Update countdown immediately
+        self._print_countdown()
+
+    async def wait_until_idle(self):
+        if not self.enabled:
+            return
+        if self._idle_event is None:
+            return
+        await self._idle_event.wait()
+
+    async def run(self):
+        if not self.enabled:
+            return
+        self._idle_event = asyncio.Event()
+        self._idle_event.set()  # initially idle
+        # Start live countdown printer
+        self._ensure_countdown_printer_started()
+        try:
+            while not self._stop:
+                await asyncio.sleep(self.check_interval_seconds)
+                if self._stop or not self.enabled:
+                    break
+                now = time.time()
+                idle_for = now - self.last_activity_ts
+                # Only run if idle beyond threshold and after cooldown window
+                if idle_for >= self.threshold_seconds and now >= self._next_allowed_ts:
+                    # Mark busy so requests will wait
+                    self._idle_event.clear()
+                    # Clear countdown line before printing status
+                    self._clear_countdown_line()
+                    start_ts = time.time()
+                    print("Keepalive: starting simulated activity…")
+                    try:
+                        await asyncio.to_thread(self._perform_keepalive_action)
+                    except Exception as e:
+                        print(f"Keepalive action error: {e}")
+                    finally:
+                        # Finished, mark idle and set next random cooldown window
+                        self._idle_event.set()
+                        duration = time.time() - start_ts
+                        cooldown = random.uniform(180.0, 300.0)
+                        self._next_allowed_ts = time.time() + cooldown
+                        print(f"Keepalive: completed in {duration:.1f}s. Next eligible window in {int(cooldown // 60)}m {int(cooldown % 60)}s.")
+                        # Resume countdown line
+                        self._print_countdown()
+                else:
+                    # Countdown printer runs independently; nothing to log here
+                    pass
+        finally:
+            if self._idle_event is not None:
+                self._idle_event.set()
+
+    def stop(self):
+        self._stop = True
+        # Stop countdown printer and clear line
+        try:
+            if self._countdown_task and not self._countdown_task.done():
+                self._countdown_task.cancel()
+        except Exception:
+            pass
+        self._clear_countdown_line()
+
+    # --- Internal: perform cross-platform minimal user activity ---
+    def _perform_keepalive_action(self):
+        system_name = platform.system()
+        # Small randomized pauses helper
+        def short_pause(a: float = 0.15, b: float = 0.4):
+            time.sleep(random.uniform(a, b))
+        
+        # Expanded, human-like phrases inspired by workspace jiggle script
+        phrases = [
+            "cookies",
+            "checking notes",
+            "be right back",
+            "just a sec",
+            "one moment",
+            "thinking",
+            "hmm",
+            "on it",
+            "almost there",
+            "nearly done",
+            "okay",
+            "ok",
+            "sure",
+            "yep",
+            "cool",
+            "thanks",
+            "working",
+            # utility/search-like terms to feel natural in Start/Spotlight
+            "system settings",
+            "logs",
+            "utilities",
+            "reports",
+            "status",
+            "calendar",
+            "updates",
+            "notepad",
+            "calculator",
+            "network",
+        ]
+        # Number of phrases to type in this run
+        num_phrases = random.randint(2, 5)
+        chosen = random.sample(phrases, k=num_phrases)
+        
+        try:
+            if system_name == "Windows":
+                # Open Start Menu
+                try:
+                    pyautogui.press("winleft")
+                except Exception:
+                    # Fallback to keyDown/Up
+                    try:
+                        pyautogui.keyDown("win"); pyautogui.keyUp("win")
+                    except Exception:
+                        pass
+                short_pause()
+                for p in chosen:
+                    pyautogui.typewrite(p, interval=random.uniform(0.05, 0.15))
+                    short_pause()
+                pyautogui.press("esc")
+            elif system_name == "Darwin":
+                # Spotlight
+                try:
+                    pyautogui.hotkey("command", "space")
+                except Exception:
+                    pass
+                short_pause()
+                for p in chosen:
+                    pyautogui.typewrite(p, interval=random.uniform(0.05, 0.12))
+                    short_pause()
+                pyautogui.press("esc")
+            else:
+                # Linux or others: small mouse jiggle + minimal typing into no target
+                x, y = pyautogui.position()
+                pyautogui.moveTo(x + random.randint(1, 3), y + random.randint(1, 3), duration=0)
+                short_pause(0.05, 0.15)
+                pyautogui.moveTo(x, y, duration=0)
+        except Exception as e:
+            # Never crash due to keepalive
+            print(f"Keepalive action failed: {e}")
+
+    # --- Helpers for logging and coordination ---
+    def compute_seconds_until_possible_action(self, now: Optional[float] = None) -> float:
+        now_ts = time.time() if now is None else now
+        earliest = max(self.last_activity_ts + self.threshold_seconds, self._next_allowed_ts)
+        return max(0.0, earliest - now_ts)
+
+    def is_busy(self) -> bool:
+        return bool(self._idle_event is not None and not self._idle_event.is_set())
+
+    def _ensure_countdown_printer_started(self):
+        if self._countdown_task is None or self._countdown_task.done():
+            self._countdown_task = asyncio.create_task(self._countdown_printer())
+
+    async def _countdown_printer(self):
+        try:
+            while not self._stop:
+                if not self.enabled:
+                    await asyncio.sleep(1.0)
+                    continue
+                # Only show countdown when idle (not currently running an action)
+                if self.is_busy():
+                    # Ensure countdown line is cleared while busy
+                    self._clear_countdown_line()
+                    await asyncio.sleep(0.5)
+                    continue
+                remaining = self.compute_seconds_until_possible_action()
+                if remaining > 0.0:
+                    mins = int(remaining // 60)
+                    secs = int(remaining % 60)
+                    print(self._format_countdown_line(mins, secs), end="", flush=True)
+                    self._countdown_active = True
+                else:
+                    # Clear once we reach 0
+                    self._clear_countdown_line()
+                await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            # Don't crash keepalive due to printer
+            try:
+                print(f"Keepalive countdown error: {e}")
+            except Exception:
+                pass
+
+    def _format_countdown_line(self, mins: int, secs: int) -> str:
+        text = f"\rKeepalive: next action in {mins}m {secs:02d}s"
+        # Pad with spaces to erase previous longer content if any
+        pad_len = max(0, self._last_countdown_len - len(text))
+        self._last_countdown_len = len(text)
+        return text + (" " * pad_len)
+
+    def _clear_countdown_line(self):
+        if self._countdown_active:
+            # Overwrite the line with spaces and return cursor
+            clear = "\r" + (" " * max(self._last_countdown_len, 0)) + "\r"
+            print(clear, end="", flush=True)
+            self._countdown_active = False
+            self._last_countdown_len = 0
+
+    def _print_countdown(self):
+        if not self.enabled or self.is_busy():
+            return
+        remaining = self.compute_seconds_until_possible_action()
+        mins = int(remaining // 60)
+        secs = int(remaining % 60)
+        print(self._format_countdown_line(mins, secs), end="", flush=True)
+        self._countdown_active = True
+
+
+async def run_join(host: str, port: int, secret: str, target_port: int, keepalive_enabled: bool = False, keepalive_threshold_minutes: float = 3.0, interactive: bool = False, register_as_keepalive_for: Optional[str] = None):
     """Run both API server and tunnel client."""
     config = get_config()
     
@@ -1146,14 +1418,111 @@ async def run_join(host: str, port: int, secret: str, target_port: int):
     # Give server time to start
     await asyncio.sleep(1)
     
-    # Start tunnel client
-    tunnel = TunnelClient(host, port, secret, actual_target_port, config)
-    
-    # Run both concurrently
+    # Prepare keepalive manager (optional)
+    keepalive_manager = KeepAliveManager(
+        enabled=keepalive_enabled,
+        threshold_minutes=keepalive_threshold_minutes,
+        check_interval_seconds=30.0,
+    )
+    # Expose manager to API routes
     try:
-        await asyncio.gather(server_task, tunnel.run())
-    except KeyboardInterrupt:
-        print("\nShutting down...")
+        app.state.keepalive_manager = keepalive_manager
+    except Exception:
+        pass
+    keepalive_task: Optional[asyncio.Task] = None
+    tunnel_task: Optional[asyncio.Task] = None
+
+    async def start_keepalive_if_enabled():
+        nonlocal keepalive_task
+        if keepalive_enabled and keepalive_task is None:
+            keepalive_manager.enabled = True
+            keepalive_task = asyncio.create_task(keepalive_manager.run())
+
+    async def stop_keepalive():
+        nonlocal keepalive_task
+        if keepalive_task is not None:
+            # Disable and allow the task to finish its loop
+            keepalive_manager.enabled = False
+            try:
+                await asyncio.wait_for(keepalive_task, timeout=2.0)
+            except Exception:
+                pass
+            keepalive_task = None
+
+    def make_tunnel():
+        return TunnelClient(
+            host, port, secret, actual_target_port, config,
+            keepalive_manager=keepalive_manager if keepalive_enabled else None,
+            remote_keepalive_for_main_id=register_as_keepalive_for
+        )
+
+    async def start_tunnel():
+        nonlocal tunnel_task
+        if tunnel_task is None:
+            tunnel = make_tunnel()
+            tunnel_task = asyncio.create_task(tunnel.run())
+
+    async def stop_tunnel():
+        nonlocal tunnel_task
+        if tunnel_task is not None:
+            tunnel_task.cancel()
+            try:
+                await asyncio.wait_for(tunnel_task, timeout=2.0)
+            except Exception:
+                pass
+            tunnel_task = None
+
+    # Start initially enabled
+    await start_tunnel()
+    await start_keepalive_if_enabled()
+
+    if not interactive:
+        # Run server and tunnel until interrupted
+        try:
+            await asyncio.gather(server_task, tunnel_task)
+        except KeyboardInterrupt:
+            print("\nShutting down...")
+        finally:
+            await stop_keepalive()
+    else:
+        # Interactive CLI loop to Disable/Re-enable without killing process
+        print("\nInteractive controls: [d] Disable, [e] Re-enable, [q] Quit, [h] Help")
+        async def interactive_cli():
+            while True:
+                try:
+                    sys.stdout.write("cyberdriver> ")
+                    sys.stdout.flush()
+                    line = await asyncio.to_thread(sys.stdin.readline)
+                    if not line:
+                        await asyncio.sleep(0.1)
+                        continue
+                    cmd = line.strip().lower()
+                    if cmd in ("h", "help", "?"):
+                        print("Commands: d=Disable, e=Enable, q=Quit")
+                    elif cmd in ("d", "disable"):
+                        print("Disabling Cyberdriver tunnel…")
+                        await stop_tunnel()
+                        await stop_keepalive()
+                        print("Disabled. The local server is still running.")
+                    elif cmd in ("e", "enable", "reenable", "re-enable"):
+                        print("Enabling Cyberdriver tunnel…")
+                        await start_tunnel()
+                        await start_keepalive_if_enabled()
+                        print("Enabled and connected (reconnection may take a moment).")
+                    elif cmd in ("q", "quit", "exit"):
+                        print("Exiting…")
+                        break
+                    else:
+                        print("Unknown command. Type 'h' for help.")
+                except KeyboardInterrupt:
+                    print("\nExiting…")
+                    break
+
+        try:
+            await asyncio.gather(server_task, interactive_cli())
+        finally:
+            await stop_tunnel()
+            await stop_keepalive()
 
 
 def signal_handler(signum, frame):
@@ -1302,6 +1671,10 @@ def main():
     join_parser.add_argument("--host", default="api.cyberdesk.io", help="Control server (default: api.cyberdesk.io)")
     join_parser.add_argument("--port", type=int, default=443, help="Control server port (default: 443)")
     join_parser.add_argument("--target-port", type=int, default=3000, help="Local port (default: 3000)")
+    join_parser.add_argument("--keepalive", action="store_true", help="Enable keepalive actions when idle")
+    join_parser.add_argument("--keepalive-threshold-minutes", type=float, default=3.0, help="Idle minutes before keepalive (default: 3)")
+    join_parser.add_argument("--interactive", action="store_true", help="Interactive CLI to Disable/Re-enable without exiting")
+    join_parser.add_argument("--register-as-keepalive-for", type=str, default=None, help="Register this instance as the remote keepalive for the specified main machine ID")
     
     args = parser.parse_args()
 
@@ -1345,7 +1718,14 @@ def main():
 
         elif args.command == "join":
             asyncio.run(run_join(
-                args.host, args.port, args.secret, args.target_port
+                args.host,
+                args.port,
+                args.secret,
+                args.target_port,
+                keepalive_enabled=bool(getattr(args, "keepalive", False)),
+                keepalive_threshold_minutes=float(getattr(args, "keepalive_threshold_minutes", 3.0)),
+                interactive=bool(getattr(args, "interactive", False)),
+                register_as_keepalive_for=getattr(args, "register_as_keepalive_for", None),
             ))
     except KeyboardInterrupt:
         print("\n\nKeyboard interrupt received. Shutting down...")
