@@ -48,7 +48,7 @@ $toolDir = "$env:USERPROFILE\.cyberdriver"
 New-Item -ItemType Directory -Force -Path $toolDir
 
 # Download cyberdriver
-Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.16/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe"
+Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.17/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe"
 
 # Add to PATH if not already there
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -63,7 +63,7 @@ Write-Host "Cyberdriver installed! You may need to restart your terminal for PAT
 
 ```bash
 # Choose version and target directory
-VERSION=0.0.16
+VERSION=0.0.17
 TOOL_DIR="$HOME/.cyberdriver"
 mkdir -p "$TOOL_DIR"
 
@@ -184,6 +184,57 @@ python cyberdriver.py start --port 3000
 python cyberdriver.py join --secret YOUR_API_KEY --host https://cyberdesk-new.fly.dev
 ```
 
+### Keepalive Mode
+
+Some environments suspend or lock when idle, which can interrupt automation. Enable Cyberdriver's keepalive to gently simulate user activity when no work is incoming.
+
+```bash
+cyberdriver join --secret YOUR_API_KEY --keepalive --keepalive-threshold-minutes 3
+```
+
+- `--keepalive` turns on the keepalive background worker.
+- `--keepalive-threshold-minutes` sets the idle threshold (default: 3 minutes).
+
+Behavior:
+- Tracks last time a cloud request was received.
+- When idle beyond the threshold, performs a short, realistic action:
+  - Clicks near the bottom-left corner of the screen, types 2–5 short phrases with natural intervals, then presses Esc. If your Windows Start icon isn't in the bottom-left, you might not see anything onscreen, but the keepalive still prevents idle timeouts.
+- If work arrives during keepalive, requests wait until keepalive finishes (cleanly closes Start/Spotlight), then execute immediately.
+ - If a keepalive action is mid-run when work arrives, Cyberdriver finishes it first, then starts the workflow. This prevents leaving Start/Spotlight or other UI elements open on the wrong screen.
+ - Remote activity signals (from a host-linked driver) reset the idle timer with a small random jitter (±7s) around your keepalive threshold so cadence feels natural.
+- After any request, keepalive stays off until idle threshold is reached again.
+
+### Interactive Disable/Re-enable
+
+Run `join` with interactive mode to toggle the tunnel without killing the process. This is useful when someone needs to use the machine locally for a moment.
+
+```bash
+cyberdriver join --secret YOUR_API_KEY --keepalive --interactive
+```
+
+Commands inside the prompt:
+- `d` or `disable`: Disconnects the cloud tunnel and pauses keepalive. Local server stays up.
+- `e` or `enable`: Reconnects the tunnel and resumes keepalive.
+- `q` or `quit`: Exits cyberdriver.
+- `h` or `help`: Show commands.
+
+### Remote Keepalive
+
+When automating a VM through remote desktop (RDP, Avatara, AnyDesk, etc.), the VM often locks or shuts off after inactivity. Because this is enforced by the remote desktop software, running keepalive inside the VM may not help. Remote Keepalive runs a second Cyberdriver on the host (where the remote desktop software runs) to keep the VM session alive while your main Cyberdriver inside the VM is idle. This helps you avoid redoing 2FA every time you kick off a workflow.
+
+Remote (host-level) keepalive registers itself to a main machine ID at join time:
+
+```bash
+cyberdriver join --secret YOUR_API_KEY --keepalive --register-as-keepalive-for <MAIN_MACHINE_ID>
+```
+
+Behavior:
+- On connect, the host announces the link (same organization required; self-links rejected).
+- The host Cyberdriver won’t interfere while a workflow runs on the VM; it only runs keepalive when the VM has been idle beyond your configured threshold.
+ - If a keepalive action is mid-run when work arrives on the VM, Cyberdriver completes that action first to avoid disruptive UI state, then proceeds with the workflow.
+ - The host’s remote activity signals reset the VM’s idle timer with a small random jitter (±7s) around the threshold.
+- If the host disconnects, the link is cleared automatically; when it reconnects, the link is re-established.
+
 ## Configuration
 
 Configuration is stored in:
@@ -193,7 +244,7 @@ Configuration is stored in:
 The config file contains:
 ```json
 {
-  "version": "0.0.16",
+  "version": "0.0.17",
   "fingerprint": "uuid-v4-string"
 }
 ```
