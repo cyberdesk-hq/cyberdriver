@@ -1284,9 +1284,15 @@ class KeepAliveManager:
                         # Finished, mark idle and set next random cooldown window
                         self._idle_event.set()
                         duration = time.time() - start_ts
-                        cooldown = random.uniform(180.0, 300.0)
+                        # Respect configured threshold for subsequent scheduling with light jitter
+                        base = float(self.threshold_seconds)
+                        jitter = random.uniform(-min(7.0, base * 0.2), min(7.0, base * 0.2))
+                        cooldown = max(0.0, base + jitter)
                         self._next_allowed_ts = time.time() + cooldown
-                        print(f"Keepalive: completed in {duration:.1f}s. Next eligible window in {int(cooldown // 60)}m {int(cooldown % 60)}s.")
+                        print(
+                            f"Keepalive: completed in {duration:.1f}s. Next eligible window in "
+                            f"{int(cooldown // 60)}m {int(cooldown % 60)}s."
+                        )
                         # Resume countdown line
                         self._print_countdown()
                         # Wake scheduler to recompute based on new next_allowed_ts
