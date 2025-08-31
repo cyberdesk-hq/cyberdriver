@@ -1399,39 +1399,22 @@ class KeepAliveManager:
         chosen = random.sample(phrases, k=num_phrases)
         
         try:
-            if system_name == "Windows":
-                # Open Start Menu
-                try:
-                    pyautogui.press("winleft")
-                except Exception:
-                    # Fallback to keyDown/Up
-                    try:
-                        pyautogui.keyDown("win"); pyautogui.keyUp("win")
-                    except Exception:
-                        pass
-                short_pause(0.08, 0.18)
-                for p in chosen:
-                    # Slightly faster, still human-like
-                    pyautogui.typewrite(p, interval=random.uniform(0.02, 0.06))
-                    short_pause(0.06, 0.15)
-                pyautogui.press("esc")
-            elif system_name == "Darwin":
-                # Spotlight
-                try:
-                    pyautogui.hotkey("command", "space")
-                except Exception:
-                    pass
-                short_pause(0.08, 0.18)
-                for p in chosen:
-                    pyautogui.typewrite(p, interval=random.uniform(0.02, 0.05))
-                    short_pause(0.06, 0.15)
-                pyautogui.press("esc")
-            else:
-                # Linux or others: small mouse jiggle + minimal typing into no target
-                x, y = pyautogui.position()
-                pyautogui.moveTo(x + random.randint(1, 3), y + random.randint(1, 3), duration=0)
-                short_pause(0.05, 0.15)
-                pyautogui.moveTo(x, y, duration=0)
+            # Cross-platform approach: click near bottom-left to focus the shell/taskbar, type, then escape
+            screen_width, screen_height = pyautogui.size()
+            click_x = random.randint(1, 3)
+            click_y = screen_height - random.randint(1, 3)
+            try:
+                pyautogui.moveTo(click_x, click_y, duration=0)
+                short_pause(0.05, 0.12)
+                pyautogui.click(button="left")
+            except Exception:
+                pass
+
+            short_pause(0.08, 0.18)
+            for p in chosen:
+                pyautogui.typewrite(p, interval=random.uniform(0.02, 0.06))
+                short_pause(0.06, 0.15)
+            pyautogui.press("esc")
         except Exception as e:
             # Never crash due to keepalive
             print(f"Keepalive action failed: {e}")
