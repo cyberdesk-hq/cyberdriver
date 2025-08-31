@@ -198,9 +198,7 @@ cyberdriver join --secret YOUR_API_KEY --keepalive --keepalive-threshold-minutes
 Behavior:
 - Tracks last time a cloud request was received.
 - When idle beyond the threshold, performs a short, realistic action:
-  - Windows: press Win to open Start, type 2–5 random short phrases, then Esc.
-  - macOS: open Spotlight (cmd+space), type, then Esc.
-  - Linux: minimal mouse jiggle.
+  - Clicks near the bottom-left corner of the screen, types 2–5 short phrases with natural intervals, then presses Esc. If your Windows Start icon isn't in the bottom-left, you might not see anything onscreen, but the keepalive still prevents idle timeouts.
 - If work arrives during keepalive, requests wait until keepalive finishes (cleanly closes Start/Spotlight), then execute immediately.
  - If a keepalive action is mid-run when work arrives, Cyberdriver finishes it first, then starts the workflow. This prevents leaving Start/Spotlight or other UI elements open on the wrong screen.
  - Remote activity signals (from a host-linked driver) reset the idle timer with a small random jitter (±7s) around your keepalive threshold so cadence feels natural.
