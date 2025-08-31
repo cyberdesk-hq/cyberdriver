@@ -203,6 +203,7 @@ Behavior:
   - Linux: minimal mouse jiggle.
 - If work arrives during keepalive, requests wait until keepalive finishes (cleanly closes Start/Spotlight), then execute immediately.
  - If a keepalive action is mid-run when work arrives, Cyberdriver finishes it first, then starts the workflow. This prevents leaving Start/Spotlight or other UI elements open on the wrong screen.
+ - Remote activity signals (from a host-linked driver) reset the idle timer with a small random jitter (±7s) around your keepalive threshold so cadence feels natural.
 - After any request, keepalive stays off until idle threshold is reached again.
 
 ### Interactive Disable/Re-enable
@@ -233,6 +234,7 @@ Behavior:
 - On connect, the host announces the link (same organization required; self-links rejected).
 - The host Cyberdriver won’t interfere while a workflow runs on the VM; it only runs keepalive when the VM has been idle beyond your configured threshold.
  - If a keepalive action is mid-run when work arrives on the VM, Cyberdriver completes that action first to avoid disruptive UI state, then proceeds with the workflow.
+ - The host’s remote activity signals reset the VM’s idle timer with a small random jitter (±7s) around the threshold.
 - If the host disconnects, the link is cleared automatically; when it reconnects, the link is re-established.
 
 ## Configuration

@@ -415,9 +415,23 @@ async def post_remote_keepalive_activity():
     try:
         manager = getattr(app.state, "keepalive_manager", None)
         if manager is not None:
-            # This mirrors local request activity
-            manager.record_activity()
+            # Clear countdown line to avoid mixed output, then reprint after
+            try:
+                if hasattr(manager, "_clear_countdown_line"):
+                    manager._clear_countdown_line()
+            except Exception:
+                pass
+            # Apply small jitter around the threshold to avoid rigid cadence
+            now = time.time()
+            jitter_seconds = random.uniform(-7.0, 7.0)
+            manager.last_activity_ts = now - jitter_seconds
+            manager._next_allowed_ts = manager.last_activity_ts + manager.threshold_seconds
             print("RemoteKeepalive: activity signal received; idle timer reset")
+            try:
+                if hasattr(manager, "_print_countdown"):
+                    manager._print_countdown()
+            except Exception:
+                pass
         return Response(status_code=204)
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -1025,6 +1039,12 @@ class TunnelClient:
         websocket = await connect_with_headers(uri, headers)
         async with websocket:
             # Print success message with green checkmark
+            # Ensure countdown line (if any) is cleared before printing
+            try:
+                if self.keepalive_manager is not None and hasattr(self.keepalive_manager, "_clear_countdown_line"):
+                    self.keepalive_manager._clear_countdown_line()
+            except Exception:
+                pass
             if platform.system() == "Windows":
                 # Check if colors are supported
                 try:
@@ -1042,6 +1062,12 @@ class TunnelClient:
                 white = '\033[97m'
                 reset = '\033[0m'
                 print(f"{green}✓{reset} {white}Connected!{reset} Forwarding to http://127.0.0.1:{self.target_port}")
+            # Optionally re-print countdown immediately after connect
+            try:
+                if self.keepalive_manager is not None and hasattr(self.keepalive_manager, "_print_countdown"):
+                    self.keepalive_manager._print_countdown()
+            except Exception:
+                pass
             
             # Message handling state
             request_meta = None
@@ -1184,6 +1210,8 @@ class KeepAliveManager:
         self._countdown_task: Optional[asyncio.Task] = None
         self._countdown_active: bool = False
         self._last_countdown_len: int = 0
+        # Precise scheduler event - wakes the scheduler when activity occurs
+        self._schedule_event: Optional[asyncio.Event] = None
 
     def record_activity(self):
         self.last_activity_ts = time.time()
@@ -1191,6 +1219,12 @@ class KeepAliveManager:
         self._next_allowed_ts = self.last_activity_ts + self.threshold_seconds
         # Update countdown immediately
         self._print_countdown()
+        # Wake scheduler to recompute deadline
+        try:
+            if self._schedule_event is not None:
+                self._schedule_event.set()
+        except Exception:
+            pass
 
     async def wait_until_idle(self):
         if not self.enabled:
@@ -1206,21 +1240,42 @@ class KeepAliveManager:
         self._idle_event.set()  # initially idle
         # Start live countdown printer
         self._ensure_countdown_printer_started()
+        # Initialize scheduler event
+        self._schedule_event = asyncio.Event()
+        self._schedule_event.clear()
         try:
             while not self._stop:
-                await asyncio.sleep(self.check_interval_seconds)
-                if self._stop or not self.enabled:
-                    break
+                # Compute next due time precisely
                 now = time.time()
-                idle_for = now - self.last_activity_ts
-                # Only run if idle beyond threshold and after cooldown window
-                if idle_for >= self.threshold_seconds and now >= self._next_allowed_ts:
+                deadline = max(self.last_activity_ts + self.threshold_seconds, self._next_allowed_ts)
+                remaining = max(0.0, deadline - now)
+
+                if remaining > 0.0:
+                    # Wait for either deadline or a schedule event (activity or config change)
+                    sleep_task = asyncio.create_task(asyncio.sleep(remaining))
+                    wait_task = asyncio.create_task(self._schedule_event.wait())
+                    done, pending = await asyncio.wait({sleep_task, wait_task}, return_when=asyncio.FIRST_COMPLETED)
+                    # Cancel whichever didn't fire
+                    for p in pending:
+                        p.cancel()
+                    # If schedule event fired, clear it and loop to recompute deadline
+                    if wait_task in done:
+                        try:
+                            self._schedule_event.clear()
+                        except Exception:
+                            pass
+                        continue
+                    # Else, deadline sleep finished, proceed to action
+
+                # Time reached; only proceed if still eligible
+                now = time.time()
+                if now >= max(self.last_activity_ts + self.threshold_seconds, self._next_allowed_ts):
                     # Mark busy so requests will wait
                     self._idle_event.clear()
                     # Clear countdown line before printing status
                     self._clear_countdown_line()
                     start_ts = time.time()
-                    print("Keepalive: starting simulated activity…")
+                    print("\nKeepalive: starting simulated activity…")
                     try:
                         await asyncio.to_thread(self._perform_keepalive_action)
                     except Exception as e:
@@ -1234,9 +1289,11 @@ class KeepAliveManager:
                         print(f"Keepalive: completed in {duration:.1f}s. Next eligible window in {int(cooldown // 60)}m {int(cooldown % 60)}s.")
                         # Resume countdown line
                         self._print_countdown()
-                else:
-                    # Countdown printer runs independently; nothing to log here
-                    pass
+                        # Wake scheduler to recompute based on new next_allowed_ts
+                        try:
+                            self._schedule_event.set()
+                        except Exception:
+                            pass
         finally:
             if self._idle_event is not None:
                 self._idle_event.set()
@@ -1304,10 +1361,11 @@ class KeepAliveManager:
                         pyautogui.keyDown("win"); pyautogui.keyUp("win")
                     except Exception:
                         pass
-                short_pause()
+                short_pause(0.08, 0.18)
                 for p in chosen:
-                    pyautogui.typewrite(p, interval=random.uniform(0.05, 0.15))
-                    short_pause()
+                    # Slightly faster, still human-like
+                    pyautogui.typewrite(p, interval=random.uniform(0.02, 0.06))
+                    short_pause(0.06, 0.15)
                 pyautogui.press("esc")
             elif system_name == "Darwin":
                 # Spotlight
@@ -1315,10 +1373,10 @@ class KeepAliveManager:
                     pyautogui.hotkey("command", "space")
                 except Exception:
                     pass
-                short_pause()
+                short_pause(0.08, 0.18)
                 for p in chosen:
-                    pyautogui.typewrite(p, interval=random.uniform(0.05, 0.12))
-                    short_pause()
+                    pyautogui.typewrite(p, interval=random.uniform(0.02, 0.05))
+                    short_pause(0.06, 0.15)
                 pyautogui.press("esc")
             else:
                 # Linux or others: small mouse jiggle + minimal typing into no target
