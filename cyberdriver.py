@@ -437,6 +437,48 @@ async def post_remote_keepalive_activity():
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+@app.post("/internal/keepalive/remote/enable")
+async def post_remote_keepalive_enable():
+    """Enable keepalive on this instance (used by Cloud for remote keepalive coordination)."""
+    try:
+        manager = getattr(app.state, "keepalive_manager", None)
+        if manager is not None:
+            manager.enabled = True
+            # Wake scheduler and redraw countdown
+            try:
+                if manager._schedule_event is not None:
+                    manager._schedule_event.set()
+                if hasattr(manager, "_print_countdown"):
+                    manager._print_countdown()
+            except Exception:
+                pass
+            print("RemoteKeepalive: enabled")
+        return Response(status_code=204)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.post("/internal/keepalive/remote/disable")
+async def post_remote_keepalive_disable():
+    """Disable keepalive on this instance (used by Cloud for remote keepalive coordination)."""
+    try:
+        manager = getattr(app.state, "keepalive_manager", None)
+        if manager is not None:
+            manager.enabled = False
+            # Clear countdown and wake scheduler to idle
+            try:
+                if hasattr(manager, "_clear_countdown_line"):
+                    manager._clear_countdown_line()
+                if manager._schedule_event is not None:
+                    manager._schedule_event.set()
+            except Exception:
+                pass
+            print("RemoteKeepalive: disabled")
+        return Response(status_code=204)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @app.get("/computer/display/screenshot", response_class=Response)
 async def get_screenshot(
     width: Optional[int] = Query(None),
