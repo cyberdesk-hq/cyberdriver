@@ -1678,7 +1678,7 @@ def main():
     join_parser.add_argument("--keepalive", action="store_true", help="Enable keepalive actions when idle")
     join_parser.add_argument("--keepalive-threshold-minutes", type=float, default=3.0, help="Idle minutes before keepalive (default: 3)")
     join_parser.add_argument("--interactive", action="store_true", help="Interactive CLI to Disable/Re-enable without exiting")
-    join_parser.add_argument("--register-as-keepalive-for", type=str, default=None, help="Register this instance as the remote keepalive for the specified main machine ID")
+    join_parser.add_argument("--register-as-keepalive-for", type=str, default=None, help="Register this instance as the remote keepalive (host) for MAIN_MACHINE_ID")
     
     args = parser.parse_args()
 
@@ -1687,10 +1687,11 @@ def main():
         if not (len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] in ['-h', '--help'])):
             print_banner()
         print("Commands:")
-        print("  join --secret KEY  Connect to Cyberdesk Cloud")
-        print("  start              Start local server")
+        print("  join --secret KEY                                      Connect to Cyberdesk Cloud")
+        print("  join --secret KEY --keepalive                          Enable keepalive (see 'join -h' for options)")
+        print("  join --secret KEY --keepalive --register-as-keepalive-for MAIN_MACHINE_ID  Remote keepalive (host)")
         print()
-        print("For more info: cyberdriver <command> -h")
+        print("For more info: cyberdriver <command> -h  or  cyberdriver join -h")
         sys.exit(0)
     
     # Show banner for join command
