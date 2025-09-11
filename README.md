@@ -48,7 +48,7 @@ $toolDir = "$env:USERPROFILE\.cyberdriver"
 New-Item -ItemType Directory -Force -Path $toolDir
 
 # Download cyberdriver
-Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.17/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe"
+Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.18/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe"
 
 # Add to PATH if not already there
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -63,7 +63,7 @@ Write-Host "Cyberdriver installed! You may need to restart your terminal for PAT
 
 ```bash
 # Choose version and target directory
-VERSION=0.0.17
+VERSION=0.0.18
 TOOL_DIR="$HOME/.cyberdriver"
 mkdir -p "$TOOL_DIR"
 
@@ -244,7 +244,7 @@ Configuration is stored in:
 The config file contains:
 ```json
 {
-  "version": "0.0.17",
+  "version": "0.0.18",
   "fingerprint": "uuid-v4-string"
 }
 ```
