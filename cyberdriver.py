@@ -166,7 +166,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.17"
+VERSION = "0.0.18"
 
 @dataclass
 class Config:
@@ -612,8 +612,8 @@ async def post_mouse_move(payload: Dict[str, int]):
 async def post_mouse_click(payload: Dict[str, Any]):
     """Click the mouse with full press/release control."""
     button = payload.get("button", "left").lower()
-    if button not in ("left", "right"):
-        raise HTTPException(status_code=400, detail="Invalid button: expected 'left' or 'right'")
+    if button not in ("left", "right", "middle"):
+        raise HTTPException(status_code=400, detail="Invalid button: expected 'left', 'right', or 'middle'")
     
     down = payload.get("down")
     x = payload.get("x")
@@ -632,6 +632,129 @@ async def post_mouse_click(payload: Dict[str, Any]):
         pyautogui.mouseUp(button=button)
     
     return {}
+
+
+@app.post("/computer/input/mouse/drag")
+async def post_mouse_drag(payload: Dict[str, Any]):
+    """Drag the mouse from a start position to an end position.
+
+    Payload variants:
+    - Required destination:
+      • to_x/to_y (preferred) OR x/y (legacy key names)
+    - Optional start:
+      • from_x/from_y OR start_x/start_y
+      • If omitted, current cursor position is used
+    - Optional:
+      • duration: float seconds for the move (0 for instant)
+      • button: 'left' | 'right' | 'middle' (default 'left')
+    """
+    # Validate button
+    button = str(payload.get("button", "left")).lower()
+    if button not in ("left", "right", "middle"):
+        raise HTTPException(status_code=400, detail="Invalid button: expected 'left', 'right', or 'middle'")
+
+    # Destination coordinates (absolute) or relative offsets
+    # Absolute: to_x/to_y or x/y
+    # Relative: dx/dy or rel_x/rel_y or offset_x/offset_y or delta_x/delta_y
+    rel_keys = (
+        ("dx", "dy"),
+        ("rel_x", "rel_y"),
+        ("offset_x", "offset_y"),
+        ("delta_x", "delta_y"),
+    )
+    is_relative = False
+    rel_x = rel_y = None
+    for kx, ky in rel_keys:
+        if kx in payload or ky in payload:
+            try:
+                rel_x = int(payload.get(kx))
+                rel_y = int(payload.get(ky))
+                is_relative = True
+                break
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="Invalid relative offsets")
+
+    end_x = end_y = None
+    if not is_relative:
+        to_x = payload.get("to_x")
+        to_y = payload.get("to_y")
+        if to_x is None or to_y is None:
+            to_x = payload.get("x")
+            to_y = payload.get("y")
+        try:
+            end_x = int(to_x)
+            end_y = int(to_y)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Missing or invalid destination coordinates")
+
+    # Optional start coordinates (from_x/from_y or start_x/start_y)
+    start_x_val = payload.get("from_x")
+    start_y_val = payload.get("from_y")
+    if start_x_val is None or start_y_val is None:
+        start_x_val = payload.get("start_x")
+        start_y_val = payload.get("start_y")
+    start_x: Optional[int]
+    start_y: Optional[int]
+    if start_x_val is not None and start_y_val is not None:
+        try:
+            start_x = int(start_x_val)
+            start_y = int(start_y_val)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid start coordinates")
+    else:
+        # Use current cursor position when start not provided
+        try:
+            cx, cy = pyautogui.position()
+            start_x, start_y = int(cx), int(cy)
+        except Exception:
+            # Fallback to destination as start to avoid failure
+            start_x, start_y = end_x, end_y
+
+    # Optional duration
+    duration_val = payload.get("duration")
+    move_duration: float = 0.0
+    if duration_val is not None:
+        try:
+            move_duration = max(0.0, float(duration_val))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid 'duration' (must be number)")
+
+    # Perform drag using native pyautogui.dragTo/dragRel with safe fallback
+    try:
+        # If explicit start provided, move there first
+        if start_x is not None and start_y is not None:
+            try:
+                pyautogui.moveTo(int(start_x), int(start_y), duration=0)
+            except Exception:
+                pass
+        # Native drag
+        if is_relative and rel_x is not None and rel_y is not None:
+            pyautogui.dragRel(rel_x, rel_y, duration=move_duration, button=button)
+        else:
+            pyautogui.dragTo(int(end_x), int(end_y), duration=move_duration, button=button)
+        return {}
+    except Exception as e:
+        # Fallback: manual press/move/release
+        try:
+            if start_x is not None and start_y is not None:
+                try:
+                    pyautogui.moveTo(int(start_x), int(start_y), duration=0)
+                except Exception:
+                    pass
+            pyautogui.mouseDown(button=button)
+            time.sleep(0.02)
+            if is_relative and rel_x is not None and rel_y is not None:
+                # Compute end from current position
+                cx, cy = pyautogui.position()
+                pyautogui.moveTo(int(cx) + int(rel_x), int(cy) + int(rel_y), duration=move_duration)
+            else:
+                pyautogui.moveTo(int(end_x), int(end_y), duration=move_duration)
+        finally:
+            try:
+                pyautogui.mouseUp(button=button)
+            except Exception:
+                pass
+        return {}
 
 
 # File system endpoints - Full access (localhost only)
