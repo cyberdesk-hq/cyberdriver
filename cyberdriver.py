@@ -166,7 +166,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.19"
+VERSION = "0.0.20"
 
 @dataclass
 class Config:
@@ -548,7 +548,14 @@ async def post_keyboard_type(payload: Dict[str, str]):
     if not text:
         raise HTTPException(status_code=400, detail="Missing 'text' field")
     
-    pyautogui.typewrite(text, interval=TYPING_INTERVAL)
+    # Try clipboard paste method for Citrix compatibility
+    # pyautogui.write() uses clipboard internally on Windows
+    try:
+        pyautogui.write(text, interval=TYPING_INTERVAL)
+    except Exception as e:
+        # Fallback to typewrite if write() fails
+        print(f"Warning: clipboard method failed, falling back to typewrite: {e}")
+        pyautogui.typewrite(text, interval=TYPING_INTERVAL)
     return {}
 
 
