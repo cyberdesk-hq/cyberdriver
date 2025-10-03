@@ -166,7 +166,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.18"
+VERSION = "0.0.19"
 
 @dataclass
 class Config:
@@ -351,8 +351,13 @@ class XDOParser:
         return result
 
 
-def execute_xdo_sequence(sequence: str):
-    """Execute an XDO-style keyboard sequence."""
+def execute_xdo_sequence(sequence: str, key_delay: float = 0.0):
+    """Execute an XDO-style keyboard sequence.
+    
+    Args:
+        sequence: XDO-style key sequence (e.g., 'ctrl+c')
+        key_delay: delay between key down/up events in seconds
+    """
     command_groups = XDOParser.parse(sequence)
     
     for group in command_groups:
@@ -364,10 +369,17 @@ def execute_xdo_sequence(sequence: str):
             
             if event.down:
                 pyautogui.keyDown(key)
+                # Delay after key down to prevent input buffering issues in VDI/Citrix
+                if key_delay > 0:
+                    time.sleep(key_delay)
             else:
                 pyautogui.keyUp(key)
-        # Small delay between command groups
-        time.sleep(0.01)
+                # Delay after key up
+                if key_delay > 0:
+                    time.sleep(key_delay)
+        # Small delay between command groups (only if delays are enabled)
+        if key_delay > 0:
+            time.sleep(max(0.01, key_delay))
 
 
 # -----------------------------------------------------------------------------
@@ -378,6 +390,14 @@ def execute_xdo_sequence(sequence: str):
 pyautogui.PAUSE = 0
 # Keep fail-safe enabled for safety (move mouse to top-left corner to abort)
 pyautogui.FAILSAFE = True
+
+# -----------------------------------------------------------------------------
+# Global Input Delay Configuration (for Citrix/VDI compatibility)
+# -----------------------------------------------------------------------------
+
+# Global delay settings for keyboard input (helps with Citrix/VDI double-typing issues)
+TYPING_INTERVAL = 0.0  # Default: no delay (will be set by command-line args)
+KEY_EVENT_DELAY = 0.0  # Default: no delay (will be set by command-line args)
 
 # -----------------------------------------------------------------------------
 # Local API implementation
@@ -527,7 +547,8 @@ async def post_keyboard_type(payload: Dict[str, str]):
     text = payload.get("text")
     if not text:
         raise HTTPException(status_code=400, detail="Missing 'text' field")
-    pyautogui.typewrite(text)
+    
+    pyautogui.typewrite(text, interval=TYPING_INTERVAL)
     return {}
 
 
@@ -584,7 +605,7 @@ async def post_keyboard_key(payload: Dict[str, str]):
     if not sequence:
         raise HTTPException(status_code=400, detail="Missing 'text' field")
     
-    execute_xdo_sequence(sequence)
+    execute_xdo_sequence(sequence, key_delay=KEY_EVENT_DELAY)
     return {}
 
 
@@ -636,15 +657,12 @@ async def post_mouse_click(payload: Dict[str, Any]):
 
 @app.post("/computer/input/mouse/drag")
 async def post_mouse_drag(payload: Dict[str, Any]):
-    """Drag the mouse from a start position to an end position.
+    """Drag the mouse from a required start position to a required end position.
 
-    Payload variants:
-    - Required destination:
+    Required:
       • to_x/to_y (preferred) OR x/y (legacy key names)
-    - Optional start:
-      • from_x/from_y OR start_x/start_y
-      • If omitted, current cursor position is used
-    - Optional:
+      • start_x/start_y OR from_x/from_y
+    Optional:
       • duration: float seconds for the move (0 for instant)
       • button: 'left' | 'right' | 'middle' (default 'left')
     """
@@ -653,62 +671,26 @@ async def post_mouse_drag(payload: Dict[str, Any]):
     if button not in ("left", "right", "middle"):
         raise HTTPException(status_code=400, detail="Invalid button: expected 'left', 'right', or 'middle'")
 
-    # Destination coordinates (absolute) or relative offsets
-    # Absolute: to_x/to_y or x/y
-    # Relative: dx/dy or rel_x/rel_y or offset_x/offset_y or delta_x/delta_y
-    rel_keys = (
-        ("dx", "dy"),
-        ("rel_x", "rel_y"),
-        ("offset_x", "offset_y"),
-        ("delta_x", "delta_y"),
-    )
-    is_relative = False
-    rel_x = rel_y = None
-    for kx, ky in rel_keys:
-        if kx in payload or ky in payload:
-            try:
-                rel_x = int(payload.get(kx))
-                rel_y = int(payload.get(ky))
-                is_relative = True
-                break
-            except (TypeError, ValueError):
-                raise HTTPException(status_code=400, detail="Invalid relative offsets")
+    # Destination coordinates (absolute only)
+    to_x = payload.get("to_x")
+    to_y = payload.get("to_y")
+    try:
+        end_x = int(to_x)
+        end_y = int(to_y)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Missing or invalid destination coordinates")
 
-    end_x = end_y = None
-    if not is_relative:
-        to_x = payload.get("to_x")
-        to_y = payload.get("to_y")
-        if to_x is None or to_y is None:
-            to_x = payload.get("x")
-            to_y = payload.get("y")
-        try:
-            end_x = int(to_x)
-            end_y = int(to_y)
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="Missing or invalid destination coordinates")
-
-    # Optional start coordinates (from_x/from_y or start_x/start_y)
-    start_x_val = payload.get("from_x")
-    start_y_val = payload.get("from_y")
+    # Required start coordinates (from_x/from_y or start_x/start_y)
+    start_x_val = payload.get("start_x")
+    start_y_val = payload.get("start_y")
     if start_x_val is None or start_y_val is None:
-        start_x_val = payload.get("start_x")
-        start_y_val = payload.get("start_y")
-    start_x: Optional[int]
-    start_y: Optional[int]
-    if start_x_val is not None and start_y_val is not None:
-        try:
-            start_x = int(start_x_val)
-            start_y = int(start_y_val)
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="Invalid start coordinates")
-    else:
-        # Use current cursor position when start not provided
-        try:
-            cx, cy = pyautogui.position()
-            start_x, start_y = int(cx), int(cy)
-        except Exception:
-            # Fallback to destination as start to avoid failure
-            start_x, start_y = end_x, end_y
+        start_x_val = payload.get("from_x")
+        start_y_val = payload.get("from_y")
+    try:
+        start_x = int(start_x_val)
+        start_y = int(start_y_val)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Missing or invalid start coordinates (start_x/start_y)")
 
     # Optional duration
     duration_val = payload.get("duration")
@@ -719,19 +701,15 @@ async def post_mouse_drag(payload: Dict[str, Any]):
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid 'duration' (must be number)")
 
-    # Perform drag using native pyautogui.dragTo/dragRel with safe fallback
+    # Perform drag using native pyautogui.dragTo with safe fallback
     try:
         # If explicit start provided, move there first
-        if start_x is not None and start_y is not None:
-            try:
-                pyautogui.moveTo(int(start_x), int(start_y), duration=0)
-            except Exception:
-                pass
-        # Native drag
-        if is_relative and rel_x is not None and rel_y is not None:
-            pyautogui.dragRel(rel_x, rel_y, duration=move_duration, button=button)
-        else:
-            pyautogui.dragTo(int(end_x), int(end_y), duration=move_duration, button=button)
+        try:
+            pyautogui.moveTo(int(start_x), int(start_y), duration=0)
+        except Exception:
+            pass
+        # Native drag (absolute)
+        pyautogui.dragTo(int(end_x), int(end_y), duration=move_duration, button=button)
         return {}
     except Exception as e:
         # Fallback: manual press/move/release
@@ -743,12 +721,7 @@ async def post_mouse_drag(payload: Dict[str, Any]):
                     pass
             pyautogui.mouseDown(button=button)
             time.sleep(0.02)
-            if is_relative and rel_x is not None and rel_y is not None:
-                # Compute end from current position
-                cx, cy = pyautogui.position()
-                pyautogui.moveTo(int(cx) + int(rel_x), int(cy) + int(rel_y), duration=move_duration)
-            else:
-                pyautogui.moveTo(int(end_x), int(end_y), duration=move_duration)
+            pyautogui.moveTo(int(end_x), int(end_y), duration=move_duration)
         finally:
             try:
                 pyautogui.mouseUp(button=button)
@@ -1175,8 +1148,38 @@ class TunnelClient:
                 # Allow task cancellation to stop the tunnel immediately
                 raise
             except Exception as e:
-                print(f"Tunnel error: {e}")
+                error_msg = str(e).lower()
+                print(f"\n{'='*60}")
+                print(f"WebSocket Connection Error: {e}")
+                print(f"{'='*60}")
+                
+                # Check for common error types and provide specific guidance
+                if "certificate" in error_msg or "ssl" in error_msg or "tls" in error_msg:
+                    print("\n⚠️  TLS/SSL Certificate Error Detected")
+                    print("\nThis is usually caused by missing or outdated root certificates.")
+                    print("\n📖 Fix: Install the required certificates")
+                    print("   → See: https://docs.cyberdesk.io/cyberdriver/quickstart#tls-certificate-errors")
+                    print("\nOn Windows, run the PowerShell certificate installation script from the docs.")
+                    print("On macOS/Linux, ensure your system's CA certificates are up to date.")
+                    
+                elif "unauthorized" in error_msg or "401" in error_msg or "403" in error_msg:
+                    print("\n⚠️  Authentication Error")
+                    print("\n❌ Invalid API Key")
+                    print("\nPlease check:")
+                    print("   1. Your API key is correct (from Cyberdesk dashboard)")
+                    print("   2. The API key hasn't been regenerated recently")
+                    
+                else:
+                    print("\n⚠️  Unknown Connection Error")
+                    print("\nCommon fixes:")
+                    print("   1. Check your API key: --secret YOUR_KEY")
+                    print("   2. Install TLS certificates: https://github.com/cyberdesk-hq/cyberdriver#tls-certificate-errors")
+                    print("   3. Check your internet connection")
+                
+                print(f"\n{'='*60}")
                 print(f"Retrying in {sleep_time} seconds...")
+                print(f"{'='*60}\n")
+                
                 await asyncio.sleep(sleep_time)
                 sleep_time = min(sleep_time * 2, self.max_sleep)
     
@@ -1201,7 +1204,12 @@ class TunnelClient:
             headers["X-Remote-Keepalive-For"] = self.remote_keepalive_for_main_id
         
         # Use compatibility wrapper for connection
-        websocket = await connect_with_headers(uri, headers)
+        try:
+            websocket = await connect_with_headers(uri, headers)
+        except Exception as e:
+            # Re-raise with more context about what failed
+            error_type = type(e).__name__
+            raise ConnectionError(f"{error_type}: {str(e)} (connecting to {uri})") from e
         async with websocket:
             # Print success message with green checkmark
             # Ensure countdown line (if any) is cleared before printing
@@ -1737,6 +1745,45 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
             await stop_keepalive()
 
 
+def validate_and_set_input_delays(typing_delay: float, key_delay: float) -> None:
+    """Validate and set global input delay configuration.
+    
+    Args:
+        typing_delay: Delay between typed characters in seconds
+        key_delay: Delay between key down/up events in seconds
+        
+    Raises:
+        SystemExit: If validation fails with invalid values
+    """
+    global TYPING_INTERVAL, KEY_EVENT_DELAY
+    
+    # Validate typing delay
+    if typing_delay < 0:
+        print("Error: --typing-delay must be >= 0")
+        sys.exit(1)
+    if typing_delay > 10.0:
+        print("Error: --typing-delay must be <= 10 seconds (value too high)")
+        sys.exit(1)
+    
+    # Validate key delay
+    if key_delay < 0:
+        print("Error: --key-delay must be >= 0")
+        sys.exit(1)
+    if key_delay > 5.0:
+        print("Error: --key-delay must be <= 5 seconds (value too high)")
+        sys.exit(1)
+    
+    # Set global values
+    TYPING_INTERVAL = typing_delay
+    KEY_EVENT_DELAY = key_delay
+    
+    # Warn if delays are unusually high
+    if typing_delay > 0.5:
+        print(f"Warning: --typing-delay of {typing_delay}s is quite high. Typing will be very slow.")
+    if key_delay > 0.1:
+        print(f"Warning: --key-delay of {key_delay}s is quite high. Key sequences may be sluggish.")
+
+
 def signal_handler(signum, frame):
     """Handle Ctrl+C gracefully."""
     print("\n\nReceived interrupt signal. Shutting down gracefully...")
@@ -1876,6 +1923,8 @@ def main():
         description="Start Cyberdriver API server locally for testing"
     )
     start_parser.add_argument("--port", type=int, default=3000, help="Port (default: 3000)")
+    start_parser.add_argument("--typing-delay", type=float, default=0.0, help="Delay between typed characters in seconds (for Citrix/VDI compatibility, try 0.05)")
+    start_parser.add_argument("--key-delay", type=float, default=0.0, help="Delay between key events in seconds (for Citrix/VDI compatibility, try 0.01)")
     
     # join command
     join_parser = subparsers.add_parser(
@@ -1891,8 +1940,17 @@ def main():
     join_parser.add_argument("--keepalive-threshold-minutes", type=float, default=3.0, help="Idle minutes before keepalive (default: 3)")
     join_parser.add_argument("--interactive", action="store_true", help="Interactive CLI to Disable/Re-enable without exiting")
     join_parser.add_argument("--register-as-keepalive-for", type=str, default=None, help="Register this instance as the remote keepalive (host) for MAIN_MACHINE_ID")
+    join_parser.add_argument("--typing-delay", type=float, default=0.0, help="Delay between typed characters in seconds (for Citrix/VDI compatibility, try 0.05)")
+    join_parser.add_argument("--key-delay", type=float, default=0.0, help="Delay between key events in seconds (for Citrix/VDI compatibility, try 0.01)")
     
-    args = parser.parse_args()
+    # Parse arguments with error handling
+    try:
+        args = parser.parse_args()
+    except SystemExit as e:
+        # argparse calls sys.exit() on error, catch it to provide better context
+        if e.code != 0:
+            print("\nError: Invalid arguments. Use -h for help.")
+        sys.exit(e.code)
 
     # Handle help or no command
     if not args.command or args.help:
@@ -1915,6 +1973,12 @@ def main():
     
     try:
         if args.command == "start":
+            # Validate and set global input delays
+            validate_and_set_input_delays(
+                getattr(args, "typing_delay", 0.0),
+                getattr(args, "key_delay", 0.0)
+            )
+            
             actual_port = find_available_port("0.0.0.0", args.port)
             if actual_port is None:
                 print(f"Error: Could not find an available port starting from {args.port}.")
@@ -1927,13 +1991,29 @@ def main():
                     kernel32 = ctypes.windll.kernel32
                     kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
                     print(f"✓ Cyberdriver server starting on http://0.0.0.0:{actual_port}")
+                    if TYPING_INTERVAL > 0 or KEY_EVENT_DELAY > 0:
+                        print(f"  → Typing delay: {TYPING_INTERVAL}s, Key delay: {KEY_EVENT_DELAY}s (Citrix/VDI mode)")
                 except:
                     print(f"√ Cyberdriver server starting on http://0.0.0.0:{actual_port}")
+                    if TYPING_INTERVAL > 0 or KEY_EVENT_DELAY > 0:
+                        print(f"  → Typing delay: {TYPING_INTERVAL}s, Key delay: {KEY_EVENT_DELAY}s (Citrix/VDI mode)")
             else:
                 print(f"✓ Cyberdriver server starting on http://0.0.0.0:{actual_port}")
+                if TYPING_INTERVAL > 0 or KEY_EVENT_DELAY > 0:
+                    print(f"  → Typing delay: {TYPING_INTERVAL}s, Key delay: {KEY_EVENT_DELAY}s (Citrix/VDI mode)")
             run_server(actual_port)
 
         elif args.command == "join":
+            # Validate and set global input delays
+            validate_and_set_input_delays(
+                getattr(args, "typing_delay", 0.0),
+                getattr(args, "key_delay", 0.0)
+            )
+            
+            if TYPING_INTERVAL > 0 or KEY_EVENT_DELAY > 0:
+                print(f"Citrix/VDI mode enabled: typing delay={TYPING_INTERVAL}s, key delay={KEY_EVENT_DELAY}s")
+                print()
+            
             asyncio.run(run_join(
                 args.host,
                 args.port,

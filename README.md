@@ -48,7 +48,7 @@ $toolDir = "$env:USERPROFILE\.cyberdriver"
 New-Item -ItemType Directory -Force -Path $toolDir
 
 # Download cyberdriver
-Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.18/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe"
+Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.19/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe"
 
 # Add to PATH if not already there
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -63,7 +63,7 @@ Write-Host "Cyberdriver installed! You may need to restart your terminal for PAT
 
 ```bash
 # Choose version and target directory
-VERSION=0.0.18
+VERSION=0.0.19
 TOOL_DIR="$HOME/.cyberdriver"
 mkdir -p "$TOOL_DIR"
 
@@ -114,6 +114,41 @@ Or subscribed for remote use via Cyberdesk cloud:
 ```bash
 cyberdriver join --secret SK-YOUR-SECRET-KEY
 ```
+
+## Citrix/VDI Compatibility
+
+If you're using Cyberdriver with **Citrix Workspace**, **VMware Horizon**, or other virtual desktop environments, you may experience keyboard input issues like **double-typing** (e.g., typing "Cat" results in "Ccaatt"). This happens because these environments can't handle rapid-fire keyboard events.
+
+### Solution: Enable Input Delays
+
+Add the `--typing-delay` and `--key-delay` flags when starting Cyberdriver:
+
+```bash
+# Recommended settings for Citrix/VDI
+cyberdriver join --secret YOUR_API_KEY \
+  --typing-delay 0.05 \
+  --key-delay 0.01
+```
+
+**Flag Reference:**
+- `--typing-delay`: Delay between typed characters in seconds (default: 0.0)
+  - **Recommended for Citrix/VDI: 0.05** (50ms between characters)
+  - Increase to 0.1 if still experiencing issues
+  
+- `--key-delay`: Delay between key down/up events in seconds (default: 0.0)
+  - **Recommended for Citrix/VDI: 0.01** (10ms between events)
+  - Affects keyboard shortcuts like Ctrl+C, Alt+Tab, etc.
+
+When enabled, you'll see:
+```
+Citrix/VDI mode enabled: typing delay=0.05s, key delay=0.01s
+```
+
+**Troubleshooting:**
+- If characters still double, increase `--typing-delay` to 0.1 or higher
+- If keyboard shortcuts don't work reliably, increase `--key-delay` to 0.02
+- These delays apply globally to all keyboard input
+- The delays slow down typing speed slightly but ensure reliable input in virtual environments
 
 ## Common Issues
 
@@ -244,7 +279,7 @@ Configuration is stored in:
 The config file contains:
 ```json
 {
-  "version": "0.0.18",
+  "version": "0.0.19",
   "fingerprint": "uuid-v4-string"
 }
 ```
