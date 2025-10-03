@@ -1745,6 +1745,45 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
             await stop_keepalive()
 
 
+def validate_and_set_input_delays(typing_delay: float, key_delay: float) -> None:
+    """Validate and set global input delay configuration.
+    
+    Args:
+        typing_delay: Delay between typed characters in seconds
+        key_delay: Delay between key down/up events in seconds
+        
+    Raises:
+        SystemExit: If validation fails with invalid values
+    """
+    global TYPING_INTERVAL, KEY_EVENT_DELAY
+    
+    # Validate typing delay
+    if typing_delay < 0:
+        print("Error: --typing-delay must be >= 0")
+        sys.exit(1)
+    if typing_delay > 10.0:
+        print("Error: --typing-delay must be <= 10 seconds (value too high)")
+        sys.exit(1)
+    
+    # Validate key delay
+    if key_delay < 0:
+        print("Error: --key-delay must be >= 0")
+        sys.exit(1)
+    if key_delay > 5.0:
+        print("Error: --key-delay must be <= 5 seconds (value too high)")
+        sys.exit(1)
+    
+    # Set global values
+    TYPING_INTERVAL = typing_delay
+    KEY_EVENT_DELAY = key_delay
+    
+    # Warn if delays are unusually high
+    if typing_delay > 0.5:
+        print(f"Warning: --typing-delay of {typing_delay}s is quite high. Typing will be very slow.")
+    if key_delay > 0.1:
+        print(f"Warning: --key-delay of {key_delay}s is quite high. Key sequences may be sluggish.")
+
+
 def signal_handler(signum, frame):
     """Handle Ctrl+C gracefully."""
     print("\n\nReceived interrupt signal. Shutting down gracefully...")
@@ -1934,36 +1973,11 @@ def main():
     
     try:
         if args.command == "start":
-            # Set global input delays with validation
-            global TYPING_INTERVAL, KEY_EVENT_DELAY
-            
-            typing_delay = getattr(args, "typing_delay", 0.0)
-            key_delay = getattr(args, "key_delay", 0.0)
-            
-            # Validate typing delay
-            if typing_delay < 0:
-                print("Error: --typing-delay must be >= 0")
-                sys.exit(1)
-            if typing_delay > 10.0:
-                print("Error: --typing-delay must be <= 10 seconds (value too high)")
-                sys.exit(1)
-            
-            # Validate key delay
-            if key_delay < 0:
-                print("Error: --key-delay must be >= 0")
-                sys.exit(1)
-            if key_delay > 5.0:
-                print("Error: --key-delay must be <= 5 seconds (value too high)")
-                sys.exit(1)
-            
-            TYPING_INTERVAL = typing_delay
-            KEY_EVENT_DELAY = key_delay
-            
-            # Warn if delays are unusually high
-            if typing_delay > 0.5:
-                print(f"Warning: --typing-delay of {typing_delay}s is quite high. Typing will be very slow.")
-            if key_delay > 0.1:
-                print(f"Warning: --key-delay of {key_delay}s is quite high. Key sequences may be sluggish.")
+            # Validate and set global input delays
+            validate_and_set_input_delays(
+                getattr(args, "typing_delay", 0.0),
+                getattr(args, "key_delay", 0.0)
+            )
             
             actual_port = find_available_port("0.0.0.0", args.port)
             if actual_port is None:
@@ -1990,36 +2004,11 @@ def main():
             run_server(actual_port)
 
         elif args.command == "join":
-            # Set global input delays with validation
-            global TYPING_INTERVAL, KEY_EVENT_DELAY
-            
-            typing_delay = getattr(args, "typing_delay", 0.0)
-            key_delay = getattr(args, "key_delay", 0.0)
-            
-            # Validate typing delay
-            if typing_delay < 0:
-                print("Error: --typing-delay must be >= 0")
-                sys.exit(1)
-            if typing_delay > 10.0:
-                print("Error: --typing-delay must be <= 10 seconds (value too high)")
-                sys.exit(1)
-            
-            # Validate key delay
-            if key_delay < 0:
-                print("Error: --key-delay must be >= 0")
-                sys.exit(1)
-            if key_delay > 5.0:
-                print("Error: --key-delay must be <= 5 seconds (value too high)")
-                sys.exit(1)
-            
-            TYPING_INTERVAL = typing_delay
-            KEY_EVENT_DELAY = key_delay
-            
-            # Warn if delays are unusually high
-            if typing_delay > 0.5:
-                print(f"Warning: --typing-delay of {typing_delay}s is quite high. Typing will be very slow.")
-            if key_delay > 0.1:
-                print(f"Warning: --key-delay of {key_delay}s is quite high. Key sequences may be sluggish.")
+            # Validate and set global input delays
+            validate_and_set_input_delays(
+                getattr(args, "typing_delay", 0.0),
+                getattr(args, "key_delay", 0.0)
+            )
             
             if TYPING_INTERVAL > 0 or KEY_EVENT_DELAY > 0:
                 print(f"Citrix/VDI mode enabled: typing delay={TYPING_INTERVAL}s, key delay={KEY_EVENT_DELAY}s")
