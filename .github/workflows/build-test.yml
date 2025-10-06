@@ -1,0 +1,92 @@
+name: Build Test Version
+
+on:
+  push:
+    branches: [ dev ]
+
+jobs:
+  prepare-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Delete existing test release
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete test --yes || true
+          git push origin :refs/tags/test || true
+          
+      - name: Create new test release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create test \
+            --title "Test Build (Latest Dev)" \
+            --notes "⚠️ **Test Build from dev branch**
+            
+            This is an automatically generated test build from the latest dev branch commit.
+            
+            **Commit:** ${{ github.sha }}
+            **Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+            **Commit Message:** ${{ github.event.head_commit.message }}
+            
+            This test release is always overwritten with the latest dev build.
+            
+            Builds are currently being generated..." \
+            --prerelease
+
+  build-test:
+    needs: prepare-release
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-windows.txt
+          pip install pyinstaller
+          
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+          
+      - name: Build executable
+        run: |
+          pyinstaller cyberdriver.spec
+          
+      - name: Prepare artifact
+        id: artifact
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            echo "asset_path=dist/cyberdriver.exe" >> $GITHUB_OUTPUT
+            echo "asset_name=cyberdriver.exe" >> $GITHUB_OUTPUT
+          else
+            ARCH=$(uname -m)
+            (cd dist && zip -9 "cyberdriver-test-macos-${ARCH}.zip" cyberdriver)
+            echo "asset_path=dist/cyberdriver-test-macos-${ARCH}.zip" >> $GITHUB_OUTPUT
+            echo "asset_name=cyberdriver-test-macos-${ARCH}.zip" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Upload to Test Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload test ${{ steps.artifact.outputs.asset_path }} --clobber
+

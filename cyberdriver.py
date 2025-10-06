@@ -399,6 +399,9 @@ pyautogui.FAILSAFE = True
 TYPING_INTERVAL = 0.0  # Default: no delay (will be set by command-line args)
 KEY_EVENT_DELAY = 0.0  # Default: no delay (will be set by command-line args)
 
+# Alternative input method for Citrix/VDI compatibility
+USE_SENDINPUT = False  # Default: use pyautogui (will be set by command-line args)
+
 # -----------------------------------------------------------------------------
 # Local API implementation
 # -----------------------------------------------------------------------------
@@ -541,6 +544,156 @@ async def get_dimensions() -> Dict[str, int]:
     return {"width": screen_width, "height": screen_height}
 
 
+def _type_with_win32_sendinput(text: str, interval: float = 0.0):
+    """Type text using Windows SendInput API with hardware scan codes (Citrix-compatible).
+    
+    Uses hardware scan codes with KEYEVENTF_SCANCODE instead of virtual keys.
+    Citrix/VDI environments handle hardware scan codes correctly but duplicate virtual key events.
+    Only works on Windows.
+    """
+    if platform.system() != "Windows":
+        raise NotImplementedError("SendInput method only available on Windows")
+    
+    import ctypes
+    from ctypes import wintypes
+    
+    # Windows constants
+    INPUT_KEYBOARD = 1
+    KEYEVENTF_SCANCODE = 0x0008  # Use hardware scan codes
+    KEYEVENTF_KEYUP = 0x0002
+    
+    # Hardware scan code mappings (PS/2 Set 1 scan codes)
+    LETTER_SCANCODES = {
+        'A': 0x1E, 'B': 0x30, 'C': 0x2E, 'D': 0x20, 'E': 0x12, 'F': 0x21,
+        'G': 0x22, 'H': 0x23, 'I': 0x17, 'J': 0x24, 'K': 0x25, 'L': 0x26,
+        'M': 0x32, 'N': 0x31, 'O': 0x18, 'P': 0x19, 'Q': 0x10, 'R': 0x13,
+        'S': 0x1F, 'T': 0x14, 'U': 0x16, 'V': 0x2F, 'W': 0x11, 'X': 0x2D,
+        'Y': 0x15, 'Z': 0x2C,
+    }
+    NUMBER_SCANCODES = {
+        '1': 0x02, '2': 0x03, '3': 0x04, '4': 0x05, '5': 0x06,
+        '6': 0x07, '7': 0x08, '8': 0x09, '9': 0x0A, '0': 0x0B,
+    }
+    SYMBOL_SCANCODES = {
+        '-': 0x0C, '=': 0x0D, '[': 0x1A, ']': 0x1B, ';': 0x27,
+        "'": 0x28, '`': 0x29, '\\': 0x2B, ',': 0x33, '.': 0x34,
+        '/': 0x35, ' ': 0x39, '\t': 0x0F, '\n': 0x1C,
+    }
+    # Shifted versions (send shift + base key)
+    SHIFT_MAP = {
+        '!': '1', '@': '2', '#': '3', '$': '4', '%': '5', '^': '6',
+        '&': '7', '*': '8', '(': '9', ')': '0', '_': '-', '+': '=',
+        '{': '[', '}': ']', ':': ';', '"': "'", '~': '`', '|': '\\',
+        '<': ',', '>': '.', '?': '/',
+    }
+    
+    LSHIFT_SCANCODE = 0x2A
+    
+    # Define structures matching Windows API exactly
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [
+            ("wVk", wintypes.WORD),
+            ("wScan", wintypes.WORD),
+            ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG))
+        ]
+    
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [
+            ("dx", wintypes.LONG),
+            ("dy", wintypes.LONG),
+            ("mouseData", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG))
+        ]
+    
+    class HARDWAREINPUT(ctypes.Structure):
+        _fields_ = [
+            ("uMsg", wintypes.DWORD),
+            ("wParamL", wintypes.WORD),
+            ("wParamH", wintypes.WORD)
+        ]
+    
+    # Windows INPUT structure has a union - we need to define it properly
+    class _InputUnion(ctypes.Union):
+        _fields_ = [
+            ("ki", KEYBDINPUT),
+            ("mi", MOUSEINPUT),
+            ("hi", HARDWAREINPUT)
+        ]
+    
+    class INPUT(ctypes.Structure):
+        _anonymous_ = ("u",)  # Makes union members accessible directly
+        _fields_ = [
+            ("type", wintypes.DWORD),
+            ("u", _InputUnion)
+        ]
+    
+    SendInput = ctypes.windll.user32.SendInput
+    
+    def send_key(scan_code: int, key_up: bool = False):
+        """Send a single key event using scan code."""
+        flags = KEYEVENTF_SCANCODE
+        if key_up:
+            flags |= KEYEVENTF_KEYUP
+        
+        input_event = INPUT()
+        input_event.type = INPUT_KEYBOARD
+        input_event.ki = KEYBDINPUT(
+            wVk=0,  # Not using virtual keys!
+            wScan=scan_code,
+            dwFlags=flags,
+            time=0,
+            dwExtraInfo=None
+        )
+        SendInput(1, ctypes.byref(input_event), ctypes.sizeof(INPUT))
+    
+    # Type each character
+    for char in text:
+        upper_char = char.upper()
+        scan_code = None
+        needs_shift = False
+        
+        # Check if it needs shift (capital or shifted symbol)
+        if char in SHIFT_MAP:
+            # Shifted symbol - get base key and use shift
+            base_char = SHIFT_MAP[char]
+            if base_char in NUMBER_SCANCODES:
+                scan_code = NUMBER_SCANCODES[base_char]
+            elif base_char in SYMBOL_SCANCODES:
+                scan_code = SYMBOL_SCANCODES[base_char]
+            needs_shift = True
+        elif char.isupper() and upper_char in LETTER_SCANCODES:
+            # Capital letter - use shift
+            scan_code = LETTER_SCANCODES[upper_char]
+            needs_shift = True
+        elif upper_char in LETTER_SCANCODES:
+            # Lowercase letter
+            scan_code = LETTER_SCANCODES[upper_char]
+        elif char in NUMBER_SCANCODES:
+            scan_code = NUMBER_SCANCODES[char]
+        elif char in SYMBOL_SCANCODES:
+            scan_code = SYMBOL_SCANCODES[char]
+        
+        if scan_code is None:
+            # Character not supported, skip it
+            print(f"Warning: Character '{char}' not supported by scan code method, skipping")
+            continue
+        
+        # Send the key event(s)
+        if needs_shift:
+            send_key(LSHIFT_SCANCODE, key_up=False)  # Shift down
+        send_key(scan_code, key_up=False)  # Key down
+        send_key(scan_code, key_up=True)   # Key up
+        if needs_shift:
+            send_key(LSHIFT_SCANCODE, key_up=True)  # Shift up
+        
+        if interval > 0:
+            time.sleep(interval)
+
+
 @app.post("/computer/input/keyboard/type")
 async def post_keyboard_type(payload: Dict[str, str]):
     """Type a string of text."""
@@ -548,14 +701,16 @@ async def post_keyboard_type(payload: Dict[str, str]):
     if not text:
         raise HTTPException(status_code=400, detail="Missing 'text' field")
     
-    # Try clipboard paste method for Citrix compatibility
-    # pyautogui.write() uses clipboard internally on Windows
-    try:
-        pyautogui.write(text, interval=TYPING_INTERVAL)
-    except Exception as e:
-        # Fallback to typewrite if write() fails
-        print(f"Warning: clipboard method failed, falling back to typewrite: {e}")
-        pyautogui.typewrite(text, interval=TYPING_INTERVAL)
+    # Use Windows SendInput API if explicitly enabled (for Citrix compatibility)
+    if USE_SENDINPUT and platform.system() == "Windows":
+        try:
+            _type_with_win32_sendinput(text, TYPING_INTERVAL)
+            return {}
+        except Exception as e:
+            print(f"Warning: SendInput method failed: {e}, falling back to pyautogui")
+    
+    # Default: use pyautogui (works on all platforms)
+    pyautogui.typewrite(text, interval=TYPING_INTERVAL)
     return {}
 
 
@@ -1752,17 +1907,18 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
             await stop_keepalive()
 
 
-def validate_and_set_input_delays(typing_delay: float, key_delay: float) -> None:
+def validate_and_set_input_delays(typing_delay: float, key_delay: float, use_sendinput: bool = False) -> None:
     """Validate and set global input delay configuration.
     
     Args:
         typing_delay: Delay between typed characters in seconds
         key_delay: Delay between key down/up events in seconds
+        use_sendinput: Use Windows SendInput API instead of pyautogui
         
     Raises:
         SystemExit: If validation fails with invalid values
     """
-    global TYPING_INTERVAL, KEY_EVENT_DELAY
+    global TYPING_INTERVAL, KEY_EVENT_DELAY, USE_SENDINPUT
     
     # Validate typing delay
     if typing_delay < 0:
@@ -1783,6 +1939,11 @@ def validate_and_set_input_delays(typing_delay: float, key_delay: float) -> None
     # Set global values
     TYPING_INTERVAL = typing_delay
     KEY_EVENT_DELAY = key_delay
+    USE_SENDINPUT = use_sendinput
+    
+    # Warn if SendInput is enabled on non-Windows
+    if use_sendinput and platform.system() != "Windows":
+        print("Warning: --use-sendinput flag has no effect on non-Windows platforms")
     
     # Warn if delays are unusually high
     if typing_delay > 0.5:
@@ -1932,6 +2093,7 @@ def main():
     start_parser.add_argument("--port", type=int, default=3000, help="Port (default: 3000)")
     start_parser.add_argument("--typing-delay", type=float, default=0.0, help="Delay between typed characters in seconds (for Citrix/VDI compatibility, try 0.05)")
     start_parser.add_argument("--key-delay", type=float, default=0.0, help="Delay between key events in seconds (for Citrix/VDI compatibility, try 0.01)")
+    start_parser.add_argument("--use-sendinput", action="store_true", help="Use Windows SendInput API instead of pyautogui (experimental Citrix fix, Windows only)")
     
     # join command
     join_parser = subparsers.add_parser(
@@ -1949,6 +2111,7 @@ def main():
     join_parser.add_argument("--register-as-keepalive-for", type=str, default=None, help="Register this instance as the remote keepalive (host) for MAIN_MACHINE_ID")
     join_parser.add_argument("--typing-delay", type=float, default=0.0, help="Delay between typed characters in seconds (for Citrix/VDI compatibility, try 0.05)")
     join_parser.add_argument("--key-delay", type=float, default=0.0, help="Delay between key events in seconds (for Citrix/VDI compatibility, try 0.01)")
+    join_parser.add_argument("--use-sendinput", action="store_true", help="Use Windows SendInput API instead of pyautogui (experimental Citrix fix, Windows only)")
     
     # Parse arguments with error handling
     try:
@@ -1983,7 +2146,8 @@ def main():
             # Validate and set global input delays
             validate_and_set_input_delays(
                 getattr(args, "typing_delay", 0.0),
-                getattr(args, "key_delay", 0.0)
+                getattr(args, "key_delay", 0.0),
+                getattr(args, "use_sendinput", False)
             )
             
             actual_port = find_available_port("0.0.0.0", args.port)
@@ -2014,7 +2178,8 @@ def main():
             # Validate and set global input delays
             validate_and_set_input_delays(
                 getattr(args, "typing_delay", 0.0),
-                getattr(args, "key_delay", 0.0)
+                getattr(args, "key_delay", 0.0),
+                getattr(args, "use_sendinput", False)
             )
             
             if TYPING_INTERVAL > 0 or KEY_EVENT_DELAY > 0:
