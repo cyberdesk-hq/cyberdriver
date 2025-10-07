@@ -1931,35 +1931,26 @@ def run_coords_capture():
         print("Install it with: pip install pynput")
         sys.exit(1)
     
-    print("Hold Alt and click anywhere to capture coordinates. Press Esc to exit.")
-    print("(Debug mode: will show all clicks to help troubleshoot)\n")
+    print("Right-click anywhere to capture coordinates. Press Esc to exit.\n")
     
-    # Track currently pressed keys and running state
-    current_keys = set()
+    # Track running state
     running = [True]  # Use list so nested functions can modify it
     
     def on_press(key):
-        current_keys.add(key)
-        print(f"[Debug] Key pressed: {key}")
         # Exit on Escape key
         if key == Key.esc:
             running[0] = False
             return False  # Stop listener
     
     def on_release(key):
-        current_keys.discard(key)
-        print(f"[Debug] Key released: {key}")
+        pass
     
     def on_click(x, y, button, pressed):
         if not running[0]:
             return False  # Stop listener
-        
-        # Debug: show all clicks
-        if pressed:
-            alt_held = Key.alt in current_keys or Key.alt_l in current_keys or Key.alt_r in current_keys
-            print(f"[Debug] Click at X={x}, Y={y}, Alt held: {alt_held}, Keys: {current_keys}")
             
-        if pressed and (Key.alt in current_keys or Key.alt_l in current_keys or Key.alt_r in current_keys):  # Only capture Alt+Click
+        # Only capture right-click (button.right)
+        if pressed and button == mouse.Button.right:
             # Print captured coordinates with colors
             if platform.system() == "Windows":
                 try:

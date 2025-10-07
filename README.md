@@ -256,10 +256,10 @@ Find screen coordinates for keepalive configuration:
 cyberdriver coords
 ```
 
-This starts an interactive tool that captures coordinates when you Alt+Click. Hold Alt and click anywhere on your screen:
+This starts an interactive tool that captures coordinates when you right-click. Right-click anywhere on your screen:
 
 ```
-Hold Alt and click anywhere to capture coordinates. Press Esc to exit.
+Right-click anywhere to capture coordinates. Press Esc to exit.
 
 ✓ Click captured: X=10, Y=1070
 
@@ -268,7 +268,7 @@ Use with keepalive:
     --keepalive-click-x 10 --keepalive-click-y 1070
 ```
 
-Press Esc when done. You can Alt+Click multiple times to try different locations. Regular clicks (without Alt) work normally and won't be captured.
+Press Esc when done. You can right-click multiple times to try different locations. Regular left-clicks work normally and won't be captured. On trackpad, use two-finger click/tap for right-click.
 
 ## Configuration
 
