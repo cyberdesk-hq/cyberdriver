@@ -48,7 +48,7 @@ $toolDir = "$env:USERPROFILE\.cyberdriver"
 New-Item -ItemType Directory -Force -Path $toolDir
 
 # Download cyberdriver
-Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.21/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe"
+Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.22/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe"
 
 # Add to PATH if not already there
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -63,7 +63,7 @@ Write-Host "Cyberdriver installed! You may need to restart your terminal for PAT
 
 ```bash
 # Choose version and target directory
-VERSION=0.0.21
+VERSION=0.0.22
 TOOL_DIR="$HOME/.cyberdriver"
 mkdir -p "$TOOL_DIR"
 
@@ -256,10 +256,10 @@ Find screen coordinates for keepalive configuration:
 cyberdriver coords
 ```
 
-This starts an interactive tool that captures coordinates when you Alt+Click. Hold Alt and click anywhere on your screen:
+This starts an interactive tool that captures coordinates when you right-click. Right-click anywhere on your screen:
 
 ```
-Hold Alt and click anywhere to capture coordinates. Press Ctrl+C to exit.
+Right-click anywhere to capture coordinates. Press Esc to exit.
 
 ✓ Click captured: X=10, Y=1070
 
@@ -268,7 +268,7 @@ Use with keepalive:
     --keepalive-click-x 10 --keepalive-click-y 1070
 ```
 
-Press Ctrl+C when done. You can Alt+Click multiple times to try different locations. Regular clicks (without Alt) work normally and won't be captured.
+Press Esc when done. You can right-click multiple times to try different locations. Regular left-clicks work normally and won't be captured. On trackpad, use two-finger click/tap for right-click.
 
 ## Configuration
 
@@ -279,7 +279,7 @@ Configuration is stored in:
 The config file contains:
 ```json
 {
-  "version": "0.0.21",
+  "version": "0.0.22",
   "fingerprint": "uuid-v4-string"
 }
 ```

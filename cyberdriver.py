@@ -166,7 +166,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.21"
+VERSION = "0.0.22"
 
 @dataclass
 class Config:
@@ -1931,19 +1931,26 @@ def run_coords_capture():
         print("Install it with: pip install pynput")
         sys.exit(1)
     
-    print("Hold Alt and click anywhere to capture coordinates. Press Ctrl+C to exit.\n")
+    print("Right-click anywhere to capture coordinates. Press Esc to exit.\n")
     
-    # Track currently pressed keys
-    current_keys = set()
+    # Track running state
+    running = [True]  # Use list so nested functions can modify it
     
     def on_press(key):
-        current_keys.add(key)
+        # Exit on Escape key
+        if key == Key.esc:
+            running[0] = False
+            return False  # Stop listener
     
     def on_release(key):
-        current_keys.discard(key)
+        pass
     
     def on_click(x, y, button, pressed):
-        if pressed and Key.alt in current_keys:  # Only capture Alt+Click
+        if not running[0]:
+            return False  # Stop listener
+            
+        # Only capture right-click (button.right)
+        if pressed and button == mouse.Button.right:
             # Print captured coordinates with colors
             if platform.system() == "Windows":
                 try:
@@ -1979,10 +1986,22 @@ def run_coords_capture():
         keyboard_listener.start()
         mouse_listener.start()
         
-        # Keep running until interrupted
-        keyboard_listener.join()
+        # Keep running until Escape is pressed or KeyboardInterrupt
+        while running[0]:
+            time.sleep(0.1)
+        
+        # Clean up
+        keyboard_listener.stop()
+        mouse_listener.stop()
+        print("\nCoordinate capture stopped.")
+        
     except KeyboardInterrupt:
         print("\n\nCoordinate capture stopped.")
+        try:
+            keyboard_listener.stop()
+            mouse_listener.stop()
+        except:
+            pass
 
 
 def signal_handler(signum, frame):
