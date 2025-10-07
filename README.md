@@ -115,41 +115,6 @@ Or subscribed for remote use via Cyberdesk cloud:
 cyberdriver join --secret SK-YOUR-SECRET-KEY
 ```
 
-## Citrix/VDI Compatibility
-
-If you're using Cyberdriver with **Citrix Workspace**, **VMware Horizon**, or other virtual desktop environments, you may experience keyboard input issues like **double-typing** (e.g., typing "Cat" results in "Ccaatt"). This happens because these environments can't handle rapid-fire keyboard events.
-
-### Solution: Enable Input Delays
-
-Add the `--typing-delay` and `--key-delay` flags when starting Cyberdriver:
-
-```bash
-# Recommended settings for Citrix/VDI
-cyberdriver join --secret YOUR_API_KEY \
-  --typing-delay 0.05 \
-  --key-delay 0.01
-```
-
-**Flag Reference:**
-- `--typing-delay`: Delay between typed characters in seconds (default: 0.0)
-  - **Recommended for Citrix/VDI: 0.05** (50ms between characters)
-  - Increase to 0.1 if still experiencing issues
-  
-- `--key-delay`: Delay between key down/up events in seconds (default: 0.0)
-  - **Recommended for Citrix/VDI: 0.01** (10ms between events)
-  - Affects keyboard shortcuts like Ctrl+C, Alt+Tab, etc.
-
-When enabled, you'll see:
-```
-Citrix/VDI mode enabled: typing delay=0.05s, key delay=0.01s
-```
-
-**Troubleshooting:**
-- If characters still double, increase `--typing-delay` to 0.1 or higher
-- If keyboard shortcuts don't work reliably, increase `--key-delay` to 0.02
-- These delays apply globally to all keyboard input
-- The delays slow down typing speed slightly but ensure reliable input in virtual environments
-
 ## Common Issues
 
 ### TLS Certificate Errors
