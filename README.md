@@ -259,7 +259,7 @@ cyberdriver coords
 This starts an interactive tool that captures coordinates when you Alt+Click. Hold Alt and click anywhere on your screen:
 
 ```
-Hold Alt and click anywhere to capture coordinates. Press Ctrl+C to exit.
+Hold Alt and click anywhere to capture coordinates. Press Esc to exit.
 
 ✓ Click captured: X=10, Y=1070
 
@@ -268,7 +268,7 @@ Use with keepalive:
     --keepalive-click-x 10 --keepalive-click-y 1070
 ```
 
-Press Ctrl+C when done. You can Alt+Click multiple times to try different locations. Regular clicks (without Alt) work normally and won't be captured.
+Press Esc when done. You can Alt+Click multiple times to try different locations. Regular clicks (without Alt) work normally and won't be captured.
 
 ## Configuration
 
