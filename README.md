@@ -189,20 +189,31 @@ python cyberdriver.py join --secret YOUR_API_KEY --host https://cyberdesk-new.fl
 Some environments suspend or lock when idle, which can interrupt automation. Enable Cyberdriver's keepalive to gently simulate user activity when no work is incoming.
 
 ```bash
-cyberdriver join --secret YOUR_API_KEY --keepalive --keepalive-threshold-minutes 3
+cyberdriver join --secret YOUR_API_KEY --keepalive
 ```
 
-- `--keepalive` turns on the keepalive background worker.
-- `--keepalive-threshold-minutes` sets the idle threshold (default: 3 minutes).
+**Options:**
+- `--keepalive`: Enable keepalive background worker
+- `--keepalive-threshold-minutes`: Idle minutes before keepalive runs (default: 3)
+- `--keepalive-click-x` and `--keepalive-click-y`: Custom click coordinates (optional)
 
-Behavior:
-- Tracks last time a cloud request was received.
+**Example with custom click location:**
+```bash
+# Click at specific coordinates instead of bottom-left
+cyberdriver join --secret YOUR_API_KEY --keepalive \
+  --keepalive-click-x 100 \
+  --keepalive-click-y 100
+```
+
+**Behavior:**
+- Tracks last time a cloud request was received
 - When idle beyond the threshold, performs a short, realistic action:
-  - Clicks near the bottom-left corner of the screen, types 2–5 short phrases with natural intervals, then presses Esc. If your Windows Start icon isn't in the bottom-left, you might not see anything onscreen, but the keepalive still prevents idle timeouts.
-- If work arrives during keepalive, requests wait until keepalive finishes (cleanly closes Start/Spotlight), then execute immediately.
- - If a keepalive action is mid-run when work arrives, Cyberdriver finishes it first, then starts the workflow. This prevents leaving Start/Spotlight or other UI elements open on the wrong screen.
- - Remote activity signals (from a host-linked driver) reset the idle timer with a small random jitter (±7s) around your keepalive threshold so cadence feels natural.
-- After any request, keepalive stays off until idle threshold is reached again.
+  - Clicks at the specified coordinates (or bottom-left if not specified)
+  - Types 2–5 short phrases with natural intervals
+  - Presses Esc to close any UI
+- If work arrives during keepalive, requests wait until keepalive finishes, then execute immediately
+- Remote activity signals reset the idle timer with random jitter (±7s)
+- After any request, keepalive stays off until idle threshold is reached again
 
 ### Interactive Disable/Re-enable
 
@@ -234,6 +245,30 @@ Behavior:
  - If a keepalive action is mid-run when work arrives on the VM, Cyberdriver completes that action first to avoid disruptive UI state, then proceeds with the workflow.
  - The host’s remote activity signals reset the VM’s idle timer with a small random jitter (±7s) around the threshold.
 - If the host disconnects, the link is cleared automatically; when it reconnects, the link is re-established.
+
+## Utilities
+
+### Coordinate Capture
+
+Find screen coordinates for keepalive configuration:
+
+```bash
+cyberdriver coords
+```
+
+This starts an interactive tool that captures coordinates when you Alt+Click. Hold Alt and click anywhere on your screen:
+
+```
+Hold Alt and click anywhere to capture coordinates. Press Ctrl+C to exit.
+
+✓ Click captured: X=10, Y=1070
+
+Use with keepalive:
+  cyberdriver join --secret YOUR_KEY --keepalive \
+    --keepalive-click-x 10 --keepalive-click-y 1070
+```
+
+Press Ctrl+C when done. You can Alt+Click multiple times to try different locations. Regular clicks (without Alt) work normally and won't be captured.
 
 ## Configuration
 

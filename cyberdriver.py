@@ -1528,7 +1528,8 @@ class KeepAliveManager:
     - If enabled and idle beyond threshold, triggers a short keepalive action
     - While keepalive action runs, requests will wait until it completes
     """
-    def __init__(self, enabled: bool, threshold_minutes: float = 3.0, check_interval_seconds: float = 30.0):
+    def __init__(self, enabled: bool, threshold_minutes: float = 3.0, check_interval_seconds: float = 30.0, 
+                 click_x: Optional[int] = None, click_y: Optional[int] = None):
         self.enabled = enabled
         self.threshold_seconds = max(10.0, float(threshold_minutes) * 60.0)
         self.check_interval_seconds = max(5.0, float(check_interval_seconds))
@@ -1544,6 +1545,9 @@ class KeepAliveManager:
         self._last_countdown_len: int = 0
         # Precise scheduler event - wakes the scheduler when activity occurs
         self._schedule_event: Optional[asyncio.Event] = None
+        # Customizable click coordinates (None = use default bottom-left)
+        self.click_x = click_x
+        self.click_y = click_y
 
     def record_activity(self):
         self.last_activity_ts = time.time()
@@ -1689,10 +1693,18 @@ class KeepAliveManager:
         chosen = random.sample(phrases, k=num_phrases)
         
         try:
-            # Cross-platform approach: click near bottom-left to focus the shell/taskbar, type, then escape
+            # Determine click coordinates
             screen_width, screen_height = pyautogui.size()
-            click_x = random.randint(1, 3)
-            click_y = screen_height - random.randint(1, 3)
+            
+            if self.click_x is not None and self.click_y is not None:
+                # Use custom coordinates
+                click_x = self.click_x
+                click_y = self.click_y
+            else:
+                # Default: click near bottom-left to focus shell/taskbar
+                click_x = random.randint(1, 3)
+                click_y = screen_height - random.randint(1, 3)
+            
             try:
                 pyautogui.moveTo(click_x, click_y, duration=0)
                 short_pause(0.05, 0.12)
@@ -1778,7 +1790,10 @@ class KeepAliveManager:
         self._countdown_active = True
 
 
-async def run_join(host: str, port: int, secret: str, target_port: int, keepalive_enabled: bool = False, keepalive_threshold_minutes: float = 3.0, interactive: bool = False, register_as_keepalive_for: Optional[str] = None):
+async def run_join(host: str, port: int, secret: str, target_port: int, keepalive_enabled: bool = False, 
+                   keepalive_threshold_minutes: float = 3.0, interactive: bool = False, 
+                   register_as_keepalive_for: Optional[str] = None,
+                   keepalive_click_x: Optional[int] = None, keepalive_click_y: Optional[int] = None):
     """Run both API server and tunnel client."""
     config = get_config()
     
@@ -1802,6 +1817,8 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
         enabled=keepalive_enabled,
         threshold_minutes=keepalive_threshold_minutes,
         check_interval_seconds=30.0,
+        click_x=keepalive_click_x,
+        click_y=keepalive_click_y,
     )
     # Expose manager to API routes
     try:
@@ -1902,6 +1919,70 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
         finally:
             await stop_tunnel()
             await stop_keepalive()
+
+
+def run_coords_capture():
+    """Run interactive coordinate capture utility."""
+    try:
+        from pynput import mouse, keyboard
+        from pynput.keyboard import Key
+    except ImportError:
+        print("Error: pynput library is required for coords capture.")
+        print("Install it with: pip install pynput")
+        sys.exit(1)
+    
+    print("Hold Alt and click anywhere to capture coordinates. Press Ctrl+C to exit.\n")
+    
+    # Track currently pressed keys
+    current_keys = set()
+    
+    def on_press(key):
+        current_keys.add(key)
+    
+    def on_release(key):
+        current_keys.discard(key)
+    
+    def on_click(x, y, button, pressed):
+        if pressed and Key.alt in current_keys:  # Only capture Alt+Click
+            # Print captured coordinates with colors
+            if platform.system() == "Windows":
+                try:
+                    import ctypes
+                    kernel32 = ctypes.windll.kernel32
+                    kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+                    green = '\033[92m'
+                    white = '\033[97m'
+                    blue = '\033[94m'
+                    reset = '\033[0m'
+                    print(f"\n{green}✓{reset} {white}Click captured:{reset} X={blue}{x}{reset}, Y={blue}{y}{reset}\n")
+                except:
+                    print(f"\n✓ Click captured: X={x}, Y={y}\n")
+            else:
+                green = '\033[92m'
+                white = '\033[97m'
+                blue = '\033[94m'
+                reset = '\033[0m'
+                print(f"\n{green}✓{reset} {white}Click captured:{reset} X={blue}{x}{reset}, Y={blue}{y}{reset}\n")
+            
+            # Print usage example
+            print(f"Use with keepalive:")
+            print(f"  cyberdriver join --secret YOUR_KEY --keepalive \\")
+            print(f"    --keepalive-click-x {x} --keepalive-click-y {y}\n")
+        
+        return True  # Continue listening
+    
+    try:
+        # Start global keyboard and mouse listeners
+        keyboard_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+        mouse_listener = mouse.Listener(on_click=on_click)
+        
+        keyboard_listener.start()
+        mouse_listener.start()
+        
+        # Keep running until interrupted
+        keyboard_listener.join()
+    except KeyboardInterrupt:
+        print("\n\nCoordinate capture stopped.")
 
 
 def signal_handler(signum, frame):
@@ -2049,12 +2130,21 @@ def main():
         help="Connect to Cyberdesk Cloud",
         description="Connect your machine to Cyberdesk Cloud for remote control"
     )
+    
+    # coords command
+    coords_parser = subparsers.add_parser(
+        "coords",
+        help="Capture screen coordinates by clicking",
+        description="Interactive utility to capture X,Y coordinates for keepalive configuration"
+    )
     join_parser.add_argument("--secret", required=True, help="Your API key from Cyberdesk")
     join_parser.add_argument("--host", default="api.cyberdesk.io", help="Control server (default: api.cyberdesk.io)")
     join_parser.add_argument("--port", type=int, default=443, help="Control server port (default: 443)")
     join_parser.add_argument("--target-port", type=int, default=3000, help="Local port (default: 3000)")
     join_parser.add_argument("--keepalive", action="store_true", help="Enable keepalive actions when idle")
     join_parser.add_argument("--keepalive-threshold-minutes", type=float, default=3.0, help="Idle minutes before keepalive (default: 3)")
+    join_parser.add_argument("--keepalive-click-x", type=int, default=None, help="X coordinate for keepalive click (default: bottom-left)")
+    join_parser.add_argument("--keepalive-click-y", type=int, default=None, help="Y coordinate for keepalive click (default: bottom-left)")
     join_parser.add_argument("--interactive", action="store_true", help="Interactive CLI to Disable/Re-enable without exiting")
     join_parser.add_argument("--register-as-keepalive-for", type=str, default=None, help="Register this instance as the remote keepalive (host) for MAIN_MACHINE_ID")
     
@@ -2074,6 +2164,7 @@ def main():
         print("Commands:")
         print("  join --secret KEY                Connect to Cyberdesk Cloud")
         print("  join --secret KEY --keepalive    Enable keepalive")
+        print("  coords                           Capture screen coordinates (for keepalive)")
         print()
         print("For more info: cyberdriver join -h")
         sys.exit(0)
@@ -2104,6 +2195,9 @@ def main():
             else:
                 print(f"✓ Cyberdriver server starting on http://0.0.0.0:{actual_port}")
             run_server(actual_port)
+        
+        elif args.command == "coords":
+            run_coords_capture()
 
         elif args.command == "join":
             asyncio.run(run_join(
@@ -2115,6 +2209,8 @@ def main():
                 keepalive_threshold_minutes=float(getattr(args, "keepalive_threshold_minutes", 3.0)),
                 interactive=bool(getattr(args, "interactive", False)),
                 register_as_keepalive_for=getattr(args, "register_as_keepalive_for", None),
+                keepalive_click_x=getattr(args, "keepalive_click_x", None),
+                keepalive_click_y=getattr(args, "keepalive_click_y", None),
             ))
     except KeyboardInterrupt:
         print("\n\nKeyboard interrupt received. Shutting down...")
