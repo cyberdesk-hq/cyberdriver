@@ -1605,7 +1605,7 @@ class TunnelClient:
 # -----------------------------------------------------------------------------
 
 def run_server(port: int, display_id: Optional[int] = None):
-    """Run the FastAPI server."""
+    """Run the FastAPI server. """
     # Set the selected display if specified
     if display_id is not None:
         display = get_display_by_id(display_id)
