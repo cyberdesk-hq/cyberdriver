@@ -236,62 +236,6 @@ def get_config() -> Config:
 
 
 # -----------------------------------------------------------------------------
-# Display Management
-# -----------------------------------------------------------------------------
-
-def get_displays() -> List[Dict[str, Any]]:
-    """Get information about all available displays."""
-    with mss.mss() as sct:
-        monitors = sct.monitors[1:]  # Skip monitor 0 (all monitors combined)
-        displays = []
-        for idx, monitor in enumerate(monitors, start=1):
-            displays.append({
-                "id": idx,
-                "width": monitor["width"],
-                "height": monitor["height"],
-                "left": monitor["left"],
-                "top": monitor["top"],
-                "is_primary": idx == 1  # First monitor is typically primary
-            })
-        return displays
-
-
-def get_display_by_id(display_id: int) -> Optional[Dict[str, Any]]:
-    """Get display information by ID."""
-    displays = get_displays()
-    for display in displays:
-        if display["id"] == display_id:
-            return display
-    return None
-
-
-def print_displays():
-    """Print available displays to console."""
-    displays = get_displays()
-    
-    if not displays:
-        print("No displays found!")
-        return
-    
-    print("\nAvailable displays:")
-    for display in displays:
-        primary_marker = " [Primary]" if display["is_primary"] else ""
-        print(f"  {display['id']}: {display['width']}x{display['height']} "
-              f"at ({display['left']}, {display['top']}){primary_marker}")
-    print()
-
-
-def translate_to_global_coords(x: int, y: int, display: Dict[str, Any]) -> Tuple[int, int]:
-    """Translate display-relative coordinates to global screen coordinates."""
-    return display["left"] + x, display["top"] + y
-
-
-def translate_to_display_coords(x: int, y: int, display: Dict[str, Any]) -> Tuple[int, int]:
-    """Translate global screen coordinates to display-relative coordinates."""
-    return x - display["left"], y - display["top"]
-
-
-# -----------------------------------------------------------------------------
 # Network Utilities
 # -----------------------------------------------------------------------------
 
@@ -459,8 +403,6 @@ pyautogui.FAILSAFE = True
 async def lifespan(app: FastAPI):
     """Manage application lifespan events."""
     # Startup
-    # Initialize app state for display tracking
-    app.state.selected_display = None  # Will be set if --display is used
     yield
     # Shutdown
     print("Shutting down...")
@@ -470,19 +412,6 @@ async def lifespan(app: FastAPI):
     print("Cleanup complete")
 
 app = FastAPI(title="Cyberdriver", version=VERSION, lifespan=lifespan)
-
-
-def get_selected_display() -> Dict[str, Any]:
-    """Get the currently selected display (or primary if none selected)."""
-    if hasattr(app.state, 'selected_display') and app.state.selected_display is not None:
-        return app.state.selected_display
-    
-    # Default to primary display (monitor 1)
-    display = get_display_by_id(1)
-    if display is None:
-        # Fallback if no displays found
-        return {"id": 1, "width": 1920, "height": 1080, "left": 0, "top": 0, "is_primary": True}
-    return display
 
 
 @app.middleware("http")
@@ -578,12 +507,8 @@ async def get_screenshot(
     except ValueError:
         scale_mode = ScaleMode.EXACT
     
-    # Get the selected display
-    display = get_selected_display()
-    
     with mss.mss() as sct:
-        # Use the selected display's monitor index
-        monitor = sct.monitors[display["id"]]
+        monitor = sct.monitors[1]
         img = sct.grab(monitor)
         # Convert to PIL Image
         pil_image = Image.frombytes('RGB', img.size, img.bgra, 'raw', 'BGRX')
@@ -607,9 +532,9 @@ async def get_screenshot(
 
 @app.get("/computer/display/dimensions")
 async def get_dimensions() -> Dict[str, int]:
-    """Return the width and height of the selected monitor."""
-    display = get_selected_display()
-    return {"width": display["width"], "height": display["height"]}
+    """Return the width and height of the primary monitor."""
+    screen_width, screen_height = pyautogui.size()
+    return {"width": screen_width, "height": screen_height}
 
 
 # -----------------------------------------------------------------------------
@@ -811,10 +736,7 @@ async def post_mouse_scroll(payload: Dict[str, Any]):
     y = payload.get("y")
     if x is not None and y is not None:
         try:
-            # Translate display-relative coordinates to global coordinates
-            display = get_selected_display()
-            global_x, global_y = translate_to_global_coords(int(x), int(y), display)
-            pyautogui.moveTo(global_x, global_y, duration=0)
+            pyautogui.moveTo(int(x), int(y), duration=0)
         except Exception:
             pass
     # Map to pyautogui scroll functions
@@ -848,13 +770,8 @@ async def post_keyboard_key(payload: Dict[str, str]):
 
 @app.get("/computer/input/mouse/position")
 async def get_mouse_position() -> Dict[str, int]:
-    """Return the current mouse position (relative to selected display)."""
-    global_x, global_y = pyautogui.position()
-    
-    # Translate to display-relative coordinates
-    display = get_selected_display()
-    x, y = translate_to_display_coords(global_x, global_y, display)
-    
+    """Return the current mouse position."""
+    x, y = pyautogui.position()
     return {"x": x, "y": y}
 
 
@@ -867,11 +784,7 @@ async def post_mouse_move(payload: Dict[str, int]):
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="Missing or invalid 'x'/'y'")
     
-    # Translate display-relative coordinates to global coordinates
-    display = get_selected_display()
-    global_x, global_y = translate_to_global_coords(x, y, display)
-    
-    pyautogui.moveTo(global_x, global_y, duration=0)
+    pyautogui.moveTo(x, y, duration=0)
     return {}
 
 
@@ -888,10 +801,7 @@ async def post_mouse_click(payload: Dict[str, Any]):
     
     # Move to position if specified
     if x is not None and y is not None:
-        # Translate display-relative coordinates to global coordinates
-        display = get_selected_display()
-        global_x, global_y = translate_to_global_coords(int(x), int(y), display)
-        pyautogui.moveTo(global_x, global_y, duration=0)
+        pyautogui.moveTo(int(x), int(y), duration=0)
     
     if down is None:
         # Full click
@@ -950,32 +860,27 @@ async def post_mouse_drag(payload: Dict[str, Any]):
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid 'duration' (must be number)")
 
-    # Translate display-relative coordinates to global coordinates
-    display = get_selected_display()
-    global_start_x, global_start_y = translate_to_global_coords(start_x, start_y, display)
-    global_end_x, global_end_y = translate_to_global_coords(end_x, end_y, display)
-
     # Perform drag using native pyautogui.dragTo with safe fallback
     try:
         # If explicit start provided, move there first
         try:
-            pyautogui.moveTo(global_start_x, global_start_y, duration=0)
+            pyautogui.moveTo(int(start_x), int(start_y), duration=0)
         except Exception:
             pass
         # Native drag (absolute)
-        pyautogui.dragTo(global_end_x, global_end_y, duration=move_duration, button=button)
+        pyautogui.dragTo(int(end_x), int(end_y), duration=move_duration, button=button)
         return {}
     except Exception as e:
         # Fallback: manual press/move/release
         try:
             if start_x is not None and start_y is not None:
                 try:
-                    pyautogui.moveTo(global_start_x, global_start_y, duration=0)
+                    pyautogui.moveTo(int(start_x), int(start_y), duration=0)
                 except Exception:
                     pass
             pyautogui.mouseDown(button=button)
             time.sleep(0.02)
-            pyautogui.moveTo(global_end_x, global_end_y, duration=move_duration)
+            pyautogui.moveTo(int(end_x), int(end_y), duration=move_duration)
         finally:
             try:
                 pyautogui.mouseUp(button=button)
@@ -1604,31 +1509,13 @@ class TunnelClient:
 # Main entry point
 # -----------------------------------------------------------------------------
 
-def run_server(port: int, display_id: Optional[int] = None):
-    """Run the FastAPI server. """
-    # Set the selected display if specified
-    if display_id is not None:
-        display = get_display_by_id(display_id)
-        if display is None:
-            print(f"Error: Display {display_id} not found. Use 'cyberdriver displays' to list available displays.")
-            sys.exit(1)
-        app.state.selected_display = display
-        print(f"Using display {display_id}: {display['width']}x{display['height']} at ({display['left']}, {display['top']})")
-    
+def run_server(port: int):
+    """Run the FastAPI server."""
     uvicorn.run(app, host="0.0.0.0", port=port)
 
 
-async def run_server_async(port: int, display_id: Optional[int] = None):
+async def run_server_async(port: int):
     """Run the FastAPI server asynchronously."""
-    # Set the selected display if specified
-    if display_id is not None:
-        display = get_display_by_id(display_id)
-        if display is None:
-            print(f"Error: Display {display_id} not found. Use 'cyberdriver displays' to list available displays.")
-            sys.exit(1)
-        app.state.selected_display = display
-        print(f"Using display {display_id}: {display['width']}x{display['height']} at ({display['left']}, {display['top']})")
-    
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="info")
     server = uvicorn.Server(config)
     await server.serve()
@@ -1906,19 +1793,9 @@ class KeepAliveManager:
 async def run_join(host: str, port: int, secret: str, target_port: int, keepalive_enabled: bool = False, 
                    keepalive_threshold_minutes: float = 3.0, interactive: bool = False, 
                    register_as_keepalive_for: Optional[str] = None,
-                   keepalive_click_x: Optional[int] = None, keepalive_click_y: Optional[int] = None,
-                   display_id: Optional[int] = None):
+                   keepalive_click_x: Optional[int] = None, keepalive_click_y: Optional[int] = None):
     """Run both API server and tunnel client."""
     config = get_config()
-    
-    # Set the selected display if specified
-    if display_id is not None:
-        display = get_display_by_id(display_id)
-        if display is None:
-            print(f"Error: Display {display_id} not found. Use 'cyberdriver displays' to list available displays.")
-            sys.exit(1)
-        app.state.selected_display = display
-        print(f"Using display {display_id}: {display['width']}x{display['height']} at ({display['left']}, {display['top']})")
     
     # Find an available port for the local server, starting with the one provided
     actual_target_port = find_available_port("127.0.0.1", target_port)
@@ -1930,7 +1807,7 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
         print(f"Using available port {actual_target_port} for local server.")
 
     # Start API server asynchronously in the same event loop
-    server_task = asyncio.create_task(run_server_async(actual_target_port, display_id=display_id))
+    server_task = asyncio.create_task(run_server_async(actual_target_port))
     
     # Give server time to start
     await asyncio.sleep(1)
@@ -2258,13 +2135,6 @@ def main():
     
     subparsers = parser.add_subparsers(dest="command", metavar="")
     
-    # displays command
-    displays_parser = subparsers.add_parser(
-        "displays",
-        help="List all available displays",
-        description="Show information about all connected displays"
-    )
-    
     # start command
     start_parser = subparsers.add_parser(
         "start", 
@@ -2272,7 +2142,6 @@ def main():
         description="Start Cyberdriver API server locally for testing"
     )
     start_parser.add_argument("--port", type=int, default=3000, help="Port (default: 3000)")
-    start_parser.add_argument("--display", type=int, default=None, help="Display ID to use (default: primary)")
     
     # join command
     join_parser = subparsers.add_parser(
@@ -2291,7 +2160,6 @@ def main():
     join_parser.add_argument("--host", default="api.cyberdesk.io", help="Control server (default: api.cyberdesk.io)")
     join_parser.add_argument("--port", type=int, default=443, help="Control server port (default: 443)")
     join_parser.add_argument("--target-port", type=int, default=3000, help="Local port (default: 3000)")
-    join_parser.add_argument("--display", type=int, default=None, help="Display ID to use (default: primary)")
     join_parser.add_argument("--keepalive", action="store_true", help="Enable keepalive actions when idle")
     join_parser.add_argument("--keepalive-threshold-minutes", type=float, default=3.0, help="Idle minutes before keepalive (default: 3)")
     join_parser.add_argument("--keepalive-click-x", type=int, default=None, help="X coordinate for keepalive click (default: bottom-left)")
@@ -2313,7 +2181,6 @@ def main():
         if not (len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] in ['-h', '--help'])):
             print_banner()
         print("Commands:")
-        print("  displays                         List all available displays")
         print("  join --secret KEY                Connect to Cyberdesk Cloud")
         print("  join --secret KEY --keepalive    Enable keepalive")
         print("  coords                           Capture screen coordinates (for keepalive)")
@@ -2329,10 +2196,7 @@ def main():
     disable_windows_console_quickedit()
     
     try:
-        if args.command == "displays":
-            print_displays()
-        
-        elif args.command == "start":
+        if args.command == "start":
             actual_port = find_available_port("0.0.0.0", args.port)
             if actual_port is None:
                 print(f"Error: Could not find an available port starting from {args.port}.")
@@ -2349,7 +2213,7 @@ def main():
                     print(f"√ Cyberdriver server starting on http://0.0.0.0:{actual_port}")
             else:
                 print(f"✓ Cyberdriver server starting on http://0.0.0.0:{actual_port}")
-            run_server(actual_port, display_id=getattr(args, "display", None))
+            run_server(actual_port)
         
         elif args.command == "coords":
             run_coords_capture()
@@ -2366,7 +2230,6 @@ def main():
                 register_as_keepalive_for=getattr(args, "register_as_keepalive_for", None),
                 keepalive_click_x=getattr(args, "keepalive_click_x", None),
                 keepalive_click_y=getattr(args, "keepalive_click_y", None),
-                display_id=getattr(args, "display", None),
             ))
     except KeyboardInterrupt:
         print("\n\nKeyboard interrupt received. Shutting down...")
