@@ -48,7 +48,7 @@ $toolDir = "$env:USERPROFILE\.cyberdriver"
 New-Item -ItemType Directory -Force -Path $toolDir
 
 # Download cyberdriver
-Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.22/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe"
+Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.23/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe"
 
 # Add to PATH if not already there
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -63,7 +63,7 @@ Write-Host "Cyberdriver installed! You may need to restart your terminal for PAT
 
 ```bash
 # Choose version and target directory
-VERSION=0.0.22
+VERSION=0.0.23
 TOOL_DIR="$HOME/.cyberdriver"
 mkdir -p "$TOOL_DIR"
 
@@ -197,12 +197,15 @@ cyberdriver join --secret YOUR_API_KEY --keepalive
 - `--keepalive-threshold-minutes`: Idle minutes before keepalive runs (default: 3)
 - `--keepalive-click-x` and `--keepalive-click-y`: Custom click coordinates (optional)
 
+**⚠️ Virtual Display Warning (RustDesk, RDP, etc.):**
+If using keepalive with virtual displays (RustDesk, RDP, VNC), you **must** specify custom click coordinates away from screen edges. The default bottom-left click can trigger issues when the display disconnects/reconnects. Use `cyberdriver coords` to capture safe coordinates (center of screen recommended).
+
 **Example with custom click location:**
 ```bash
-# Click at specific coordinates instead of bottom-left
+# Click at center of 1024x768 display (recommended for virtual displays)
 cyberdriver join --secret YOUR_API_KEY --keepalive \
-  --keepalive-click-x 100 \
-  --keepalive-click-y 100
+  --keepalive-click-x 512 \
+  --keepalive-click-y 384
 ```
 
 **Behavior:**
@@ -279,7 +282,7 @@ Configuration is stored in:
 The config file contains:
 ```json
 {
-  "version": "0.0.22",
+  "version": "0.0.23",
   "fingerprint": "uuid-v4-string"
 }
 ```

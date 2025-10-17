@@ -35,7 +35,8 @@ jobs:
             This test release is always overwritten with the latest dev build.
             
             Builds are currently being generated..." \
-            --prerelease
+            --prerelease \
+            --target ${{ github.sha }}
 
   build-test:
     needs: prepare-release
