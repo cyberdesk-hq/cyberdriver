@@ -166,7 +166,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.22"
+VERSION = "0.0.23"
 
 @dataclass
 class Config:
@@ -392,8 +392,9 @@ def execute_xdo_sequence(sequence: str):
 
 # Disable PyAutoGUI's default pause between commands for better performance
 pyautogui.PAUSE = 0
-# Keep fail-safe enabled for safety (move mouse to top-left corner to abort)
-pyautogui.FAILSAFE = True
+# Disable fail-safe for virtual display environments (RustDesk, RDP, etc.)
+# where display changes can trigger false positives
+pyautogui.FAILSAFE = False
 
 # -----------------------------------------------------------------------------
 # Local API implementation
