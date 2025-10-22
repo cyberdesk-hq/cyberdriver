@@ -1522,6 +1522,156 @@ async def run_server_async(port: int):
     await server.serve()
 
 
+class BlackScreenRecoveryManager:
+    """Background manager that detects black screens and recovers by switching to console session.
+    
+    Windows RDP/session issues can cause the screen to go completely black. This manager:
+    - Periodically captures screenshots
+    - Checks if screen is truly black (no variance)
+    - Executes PowerShell script to switch session to console
+    
+    Note: This feature is Windows-only and will not run on other platforms.
+    """
+    def __init__(self, enabled: bool, check_interval_seconds: float = 30.0):
+        # Gate to Windows only
+        if platform.system() != "Windows":
+            self.enabled = False
+            if enabled:
+                print("Note: Black screen recovery is only supported on Windows")
+        else:
+            self.enabled = enabled
+        self.check_interval_seconds = max(5.0, float(check_interval_seconds))
+        self._stop = False
+        self._task: Optional[asyncio.Task] = None
+        self._initial_check_done = False
+        
+    async def run(self):
+        """Main loop that checks for black screens on a cadence."""
+        if not self.enabled:
+            return
+            
+        try:
+            # Initial check after 5 seconds
+            await asyncio.sleep(5.0)
+            if not self._stop and self.enabled:
+                await self._check_and_recover()
+                self._initial_check_done = True
+            
+            # Regular checks on interval
+            while not self._stop and self.enabled:
+                await asyncio.sleep(self.check_interval_seconds)
+                if not self._stop and self.enabled:
+                    await self._check_and_recover()
+                    
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"BlackScreenRecovery error: {e}")
+    
+    async def _check_and_recover(self):
+        """Check if screen is black and recover if needed."""
+        try:
+            # Take screenshot
+            is_black = await asyncio.to_thread(self._check_if_screen_black)
+            
+            if is_black:
+                print("\n⚠️  Black screen detected! Attempting console session recovery...")
+                await self._execute_console_switch()
+            
+        except Exception as e:
+            print(f"BlackScreenRecovery check error: {e}")
+    
+    def _check_if_screen_black(self) -> bool:
+        """Check if the screen is truly black (no variance)."""
+        try:
+            with mss.mss() as sct:
+                monitor = sct.monitors[1]
+                img = sct.grab(monitor)
+                
+                # Convert to numpy array for variance check
+                img_array = np.array(img)
+                
+                # Check if there's any variance in the image
+                # A truly black screen will have variance close to 0
+                variance = np.var(img_array)
+                
+                # Also check if mean is very low (close to black)
+                mean = np.mean(img_array)
+                
+                # Consider screen black if variance is very low (< 1.0) and mean is low (< 10)
+                is_black = variance < 1.0 and mean < 10
+                
+                if is_black:
+                    print(f"BlackScreenRecovery: Screen appears black (variance={variance:.2f}, mean={mean:.2f})")
+                
+                return is_black
+                
+        except Exception as e:
+            print(f"BlackScreenRecovery: Screenshot check failed: {e}")
+            return False
+    
+    async def _execute_console_switch(self):
+        """Execute PowerShell script to switch session to console."""
+        if platform.system() != "Windows":
+            print("BlackScreenRecovery: Console switching is only supported on Windows")
+            return
+        
+        try:
+            # PowerShell script to switch session to console with elevation
+            ps_script = """
+# Get the current PowerShell process's session id
+$sessionId = (Get-Process -Id $PID).SessionId
+
+# Helper to run tscon
+function Invoke-Tscon {
+    param($Id)
+    Write-Host "Running: tscon $Id /dest:console"
+    & tscon $Id /dest:console
+    $rc = $LASTEXITCODE
+    if ($rc -ne 0) {
+        Write-Error "tscon exited with code $rc"
+    }
+}
+
+# Check if running elevated
+$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not $isAdmin) {
+    Write-Host "Not elevated — requesting elevation (UAC)."
+    $escaped = $sessionId.ToString()
+    # Start an elevated powershell that runs tscon with the captured session id
+    Start-Process powershell -Verb RunAs -ArgumentList "-NoProfile -WindowStyle Hidden -Command `"& { tscon $escaped /dest:console }`""
+    return
+}
+
+# Already elevated — run directly
+Invoke-Tscon -Id $sessionId
+"""
+            
+            # Execute the PowerShell script
+            result = await asyncio.to_thread(
+                execute_powershell_command,
+                ps_script,
+                str(uuid.uuid4()),
+                None,
+                True,
+                30.0
+            )
+            
+            if result.get("exit_code") == 0:
+                print("✓ Console session switch executed successfully")
+            else:
+                error = result.get("stderr", "Unknown error")
+                print(f"BlackScreenRecovery: tscon execution failed: {error}")
+                
+        except Exception as e:
+            print(f"BlackScreenRecovery: Failed to execute console switch: {e}")
+    
+    def stop(self):
+        """Stop the recovery manager."""
+        self._stop = True
+
+
 class KeepAliveManager:
     """Background manager that triggers realistic user activity when idle.
     
@@ -1794,7 +1944,9 @@ class KeepAliveManager:
 async def run_join(host: str, port: int, secret: str, target_port: int, keepalive_enabled: bool = False, 
                    keepalive_threshold_minutes: float = 3.0, interactive: bool = False, 
                    register_as_keepalive_for: Optional[str] = None,
-                   keepalive_click_x: Optional[int] = None, keepalive_click_y: Optional[int] = None):
+                   keepalive_click_x: Optional[int] = None, keepalive_click_y: Optional[int] = None,
+                   black_screen_recovery_enabled: bool = False,
+                   black_screen_check_interval: float = 30.0):
     """Run both API server and tunnel client."""
     config = get_config()
     
@@ -1828,6 +1980,13 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
         pass
     keepalive_task: Optional[asyncio.Task] = None
     tunnel_task: Optional[asyncio.Task] = None
+    
+    # Prepare black screen recovery manager (optional)
+    black_screen_manager = BlackScreenRecoveryManager(
+        enabled=black_screen_recovery_enabled,
+        check_interval_seconds=black_screen_check_interval,
+    )
+    black_screen_task: Optional[asyncio.Task] = None
 
     async def start_keepalive_if_enabled():
         nonlocal keepalive_task
@@ -1845,6 +2004,24 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
             except Exception:
                 pass
             keepalive_task = None
+    
+    async def start_black_screen_recovery_if_enabled():
+        nonlocal black_screen_task
+        if black_screen_recovery_enabled and black_screen_task is None:
+            black_screen_manager.enabled = True
+            black_screen_task = asyncio.create_task(black_screen_manager.run())
+            if black_screen_recovery_enabled:
+                print(f"✓ Black screen recovery enabled (check interval: {black_screen_check_interval}s)")
+    
+    async def stop_black_screen_recovery():
+        nonlocal black_screen_task
+        if black_screen_task is not None:
+            black_screen_manager.stop()
+            try:
+                await asyncio.wait_for(black_screen_task, timeout=2.0)
+            except Exception:
+                pass
+            black_screen_task = None
 
     def make_tunnel():
         return TunnelClient(
@@ -1872,6 +2049,7 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
     # Start initially enabled
     await start_tunnel()
     await start_keepalive_if_enabled()
+    await start_black_screen_recovery_if_enabled()
 
     if not interactive:
         # Run server and tunnel until interrupted
@@ -1881,6 +2059,7 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
             print("\nShutting down...")
         finally:
             await stop_keepalive()
+            await stop_black_screen_recovery()
     else:
         # Interactive CLI loop to Disable/Re-enable without killing process
         print("\nInteractive controls: [d] Disable, [e] Re-enable, [q] Quit, [h] Help")
@@ -1900,11 +2079,13 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
                         print("Disabling Cyberdriver tunnel…")
                         await stop_tunnel()
                         await stop_keepalive()
+                        await stop_black_screen_recovery()
                         print("Disabled. The local server is still running.")
                     elif cmd in ("e", "enable", "reenable", "re-enable"):
                         print("Enabling Cyberdriver tunnel…")
                         await start_tunnel()
                         await start_keepalive_if_enabled()
+                        await start_black_screen_recovery_if_enabled()
                         print("Enabled and connected (reconnection may take a moment).")
                     elif cmd in ("q", "quit", "exit"):
                         print("Exiting…")
@@ -1920,6 +2101,7 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
         finally:
             await stop_tunnel()
             await stop_keepalive()
+            await stop_black_screen_recovery()
 
 
 def run_coords_capture():
@@ -2034,6 +2216,7 @@ def print_banner_no_color(mode="default"):
         print("Get started:")
         print("→ Join: cyberdriver join --secret YOUR_API_KEY")
         print("→ Keepalive: cyberdriver join --secret YOUR_API_KEY --keepalive")
+        print("→ Black screen recovery: cyberdriver join --secret YOUR_API_KEY --black-screen-recovery")
     
     print("→ Run -h for help")
     print("→ Visit https://docs.cyberdesk.io for documentation")
@@ -2100,6 +2283,7 @@ def print_banner(mode="default"):
         print(f"{white}Get started:{reset}")
         print(f"{white}→ {blue}Join:{reset} cyberdriver join --secret YOUR_API_KEY")
         print(f"{white}→ {blue}Keepalive:{reset} cyberdriver join --secret YOUR_API_KEY --keepalive")
+        print(f"{white}→ {blue}Black screen recovery:{reset} cyberdriver join --secret YOUR_API_KEY --black-screen-recovery")
         print(f"{white}→ {blue}Remote keepalive:{reset} cyberdriver join --secret YOUR_API_KEY --keepalive --register-as-keepalive-for MAIN_MACHINE_ID")
     
     # Always show help and docs
@@ -2165,6 +2349,8 @@ def main():
     join_parser.add_argument("--keepalive-threshold-minutes", type=float, default=3.0, help="Idle minutes before keepalive (default: 3)")
     join_parser.add_argument("--keepalive-click-x", type=int, default=None, help="X coordinate for keepalive click (default: bottom-left)")
     join_parser.add_argument("--keepalive-click-y", type=int, default=None, help="Y coordinate for keepalive click (default: bottom-left)")
+    join_parser.add_argument("--black-screen-recovery", action="store_true", help="Enable black screen detection and console recovery (Windows only)")
+    join_parser.add_argument("--black-screen-check-interval", type=float, default=30.0, help="Seconds between black screen checks (default: 30)")
     join_parser.add_argument("--interactive", action="store_true", help="Interactive CLI to Disable/Re-enable without exiting")
     join_parser.add_argument("--register-as-keepalive-for", type=str, default=None, help="Register this instance as the remote keepalive (host) for MAIN_MACHINE_ID")
     
@@ -2182,9 +2368,10 @@ def main():
         if not (len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] in ['-h', '--help'])):
             print_banner()
         print("Commands:")
-        print("  join --secret KEY                Connect to Cyberdesk Cloud")
-        print("  join --secret KEY --keepalive    Enable keepalive")
-        print("  coords                           Capture screen coordinates (for keepalive)")
+        print("  join --secret KEY                         Connect to Cyberdesk Cloud")
+        print("  join --secret KEY --keepalive             Enable keepalive")
+        print("  join --secret KEY --black-screen-recovery Enable black screen detection (Windows)")
+        print("  coords                                    Capture screen coordinates (for keepalive)")
         print()
         print("For more info: cyberdriver join -h")
         sys.exit(0)
@@ -2231,6 +2418,8 @@ def main():
                 register_as_keepalive_for=getattr(args, "register_as_keepalive_for", None),
                 keepalive_click_x=getattr(args, "keepalive_click_x", None),
                 keepalive_click_y=getattr(args, "keepalive_click_y", None),
+                black_screen_recovery_enabled=bool(getattr(args, "black_screen_recovery", False)),
+                black_screen_check_interval=float(getattr(args, "black_screen_check_interval", 30.0)),
             ))
     except KeyboardInterrupt:
         print("\n\nKeyboard interrupt received. Shutting down...")
