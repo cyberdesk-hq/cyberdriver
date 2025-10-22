@@ -2462,7 +2462,7 @@ def main():
     if args.command == "join":
         print_banner(mode="connecting")
     
-    # Check for admin privileges if black screen recovery is enabled
+    # Check for admin privileges if black screen recovery is enabled 
     if args.command == "join" and getattr(args, "black_screen_recovery", False):
         if platform.system() == "Windows":
             if not is_running_as_admin():
