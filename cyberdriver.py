@@ -70,6 +70,73 @@ import uvicorn
 import websockets
 
 # -----------------------------------------------------------------------------
+# Windows Administrator Check and Elevation
+# -----------------------------------------------------------------------------
+
+def is_running_as_admin() -> bool:
+    """Check if the process is running with administrator privileges on Windows."""
+    if platform.system() != "Windows":
+        return False
+    
+    try:
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def request_admin_elevation():
+    """Restart the current process with administrator privileges on Windows."""
+    if platform.system() != "Windows":
+        print("Error: Admin elevation is only available on Windows")
+        return False
+    
+    try:
+        import ctypes
+        
+        # Get the current script/executable path and arguments
+        if getattr(sys, 'frozen', False):
+            # Running as compiled executable
+            script = sys.executable
+        else:
+            # Running as Python script
+            script = os.path.abspath(sys.argv[0])
+        
+        # Build command line arguments
+        params = ' '.join([f'"{arg}"' if ' ' in arg else arg for arg in sys.argv[1:]])
+        
+        print("\n" + "="*60)
+        print("Administrator Privileges Required")
+        print("="*60)
+        print("\nBlack screen recovery requires administrator privileges.")
+        print("A UAC prompt will appear to elevate Cyberdriver.\n")
+        print("Restarting with administrator privileges...")
+        print("="*60 + "\n")
+        
+        # ShellExecute to run as admin
+        ret = ctypes.windll.shell32.ShellExecuteW(
+            None,           # hwnd
+            "runas",        # operation (runas = run as administrator)
+            sys.executable if getattr(sys, 'frozen', False) else "python",  # file
+            f'"{script}" {params}' if not getattr(sys, 'frozen', False) else params,  # parameters
+            None,           # directory
+            1               # show command (SW_SHOWNORMAL)
+        )
+        
+        # If ShellExecute succeeds, ret > 32
+        if ret > 32:
+            # Exit this non-admin process
+            sys.exit(0)
+        else:
+            print(f"Failed to request elevation (error code: {ret})")
+            return False
+            
+    except Exception as e:
+        print(f"Failed to request elevation: {e}")
+        return False
+
+
+# -----------------------------------------------------------------------------
 # Windows Console Fix
 # -----------------------------------------------------------------------------
 
@@ -2379,6 +2446,32 @@ def main():
     # Show banner for join command
     if args.command == "join":
         print_banner(mode="connecting")
+    
+    # Check for admin privileges if black screen recovery is enabled
+    if args.command == "join" and getattr(args, "black_screen_recovery", False):
+        if platform.system() == "Windows":
+            if not is_running_as_admin():
+                # Request elevation and exit (will restart with admin privileges)
+                request_admin_elevation()
+                # If we're still here, elevation failed or was cancelled
+                print("\nWarning: Running without administrator privileges.")
+                print("Black screen recovery may not work properly without elevation.")
+                print("You can:")
+                print("  1. Restart Cyberdriver from an Administrator PowerShell")
+                print("  2. Accept the UAC prompt when black screen is detected")
+                print("  3. Continue anyway (press Enter)")
+                input()
+            else:
+                # Running as admin - show confirmation
+                try:
+                    import ctypes
+                    kernel32 = ctypes.windll.kernel32
+                    kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+                    green = '\033[92m'
+                    reset = '\033[0m'
+                    print(f"{green}✓{reset} Running with administrator privileges\n")
+                except:
+                    print("✓ Running with administrator privileges\n")
     
     # Disable Windows console QuickEdit mode to prevent output blocking
     disable_windows_console_quickedit()
