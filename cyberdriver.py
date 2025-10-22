@@ -1636,14 +1636,29 @@ class BlackScreenRecoveryManager:
             print(f"BlackScreenRecovery error: {e}")
     
     async def _check_and_recover(self):
-        """Check if screen is black and recover if needed."""
+        """Check if screen is black and recover if needed.
+        
+        Uses a 5-second confirmation check to avoid false positives during
+        transient black screens (e.g., during RDP connection).
+        """
         try:
-            # Take screenshot
+            # Initial check
             is_black = await asyncio.to_thread(self._check_if_screen_black)
             
             if is_black:
-                print("\n⚠️  Black screen detected! Attempting console session recovery...")
-                await self._execute_console_switch()
+                print("\n⚠️  Black screen detected! Confirming in 5 seconds...")
+                
+                # Wait 5 seconds and check again to confirm it's not transient
+                await asyncio.sleep(5.0)
+                
+                # Confirmation check
+                still_black = await asyncio.to_thread(self._check_if_screen_black)
+                
+                if still_black:
+                    print("⚠️  Black screen confirmed! Attempting console session recovery...")
+                    await self._execute_console_switch()
+                else:
+                    print("✓ Screen recovered on its own (transient black screen)")
             
         except Exception as e:
             print(f"BlackScreenRecovery check error: {e}")
