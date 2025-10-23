@@ -235,7 +235,6 @@ $RECYCLE.BIN/
 # Cyberdriver-specific
 config.json
 .cyberdriver/
-*.exe
 *.app
 *.dmg
 *.deb

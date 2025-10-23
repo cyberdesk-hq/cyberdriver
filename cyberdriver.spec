@@ -16,6 +16,10 @@ for package in ['fastapi', 'uvicorn', 'mss']:
     binaries += tmp_binaries
     hiddenimports += tmp_hiddens
 
+# Bundle Amyuni virtual display driver files (Windows only, but harmless on other platforms)
+if os.path.exists('amyuni_driver'):
+    datas.append(('amyuni_driver', 'amyuni_driver'))
+
 # Add macOS-specific CoreGraphics framework if on Darwin
 if sys.platform == "darwin":
     binaries.append(('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics', 'CoreGraphics'))

@@ -53,6 +53,8 @@ import uuid
 import signal
 import threading
 import random
+import tempfile
+import shutil
 from typing import Dict, List, Optional, Tuple, Union, Any
 from enum import Enum
 from dataclasses import dataclass
@@ -68,6 +70,269 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response, JSONResponse
 import uvicorn
 import websockets
+
+# -----------------------------------------------------------------------------
+# Windows Administrator Check and Elevation
+# -----------------------------------------------------------------------------
+
+def is_running_as_admin() -> bool:
+    """Check if the process is running with administrator privileges on Windows."""
+    if platform.system() != "Windows":
+        return False
+    
+    try:
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def request_admin_elevation():
+    """Restart the current process with administrator privileges on Windows."""
+    if platform.system() != "Windows":
+        print("Error: Admin elevation is only available on Windows")
+        return False
+    
+    try:
+        import ctypes
+        
+        # Get the current script/executable path and arguments
+        if getattr(sys, 'frozen', False):
+            # Running as compiled executable
+            script = sys.executable
+        else:
+            # Running as Python script
+            script = os.path.abspath(sys.argv[0])
+        
+        # Build command line arguments
+        params = ' '.join([f'"{arg}"' if ' ' in arg else arg for arg in sys.argv[1:]])
+        
+        print("\n" + "="*60)
+        print("Administrator Privileges Required")
+        print("="*60)
+        print("\nBlack screen recovery requires administrator privileges.")
+        print("A UAC prompt will appear to elevate Cyberdriver.\n")
+        print("Restarting with administrator privileges...")
+        print("="*60 + "\n")
+        
+        # ShellExecute to run as admin
+        ret = ctypes.windll.shell32.ShellExecuteW(
+            None,           # hwnd
+            "runas",        # operation (runas = run as administrator)
+            sys.executable if getattr(sys, 'frozen', False) else "python",  # file
+            f'"{script}" {params}' if not getattr(sys, 'frozen', False) else params,  # parameters
+            None,           # directory
+            1               # show command (SW_SHOWNORMAL)
+        )
+        
+        # If ShellExecute succeeds, ret > 32
+        if ret > 32:
+            # Exit this non-admin process
+            sys.exit(0)
+        else:
+            print(f"Failed to request elevation (error code: {ret})")
+            return False
+            
+    except Exception as e:
+        print(f"Failed to request elevation: {e}")
+        return False
+
+
+# -----------------------------------------------------------------------------
+# Amyuni Virtual Display Driver Management
+# -----------------------------------------------------------------------------
+
+def get_driver_files_path() -> Optional[pathlib.Path]:
+    """Get the path to the bundled Amyuni driver files.
+    
+    Supports both running as script and as PyInstaller executable.
+    """
+    if platform.system() != "Windows":
+        return None
+    
+    # Check if running as PyInstaller bundle
+    if getattr(sys, 'frozen', False):
+        # Running as compiled executable
+        base_path = pathlib.Path(sys._MEIPASS)
+    else:
+        # Running as script - drivers should be in ./amyuni_driver directory
+        base_path = pathlib.Path(__file__).parent
+    
+    driver_path = base_path / "amyuni_driver"
+    
+    if driver_path.exists():
+        return driver_path
+    
+    return None
+
+
+def is_virtual_display_driver_installed() -> bool:
+    """Check if the Amyuni virtual display driver is already installed.
+    
+    Uses Windows Device Manager query to check for the actual device.
+    """
+    if platform.system() != "Windows":
+        return False
+    
+    try:
+        # Use PowerShell to check Device Manager for the virtual display
+        # This is more reliable than deviceinstaller's find command
+        ps_check = """
+        $device = Get-PnpDevice | Where-Object { 
+            $_.FriendlyName -like "*USB Mobile Monitor*" -or 
+            $_.FriendlyName -like "*usbmmidd*" 
+        }
+        if ($device) { 
+            exit 0 
+        } else { 
+            exit 1 
+        }
+        """
+        
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_check],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        # Exit code 0 means device found
+        return result.returncode == 0
+        
+    except Exception as e:
+        # If PowerShell check fails, fall back to assuming not installed
+        # Better to attempt installation than skip it
+        return False
+
+
+def install_virtual_display_driver() -> bool:
+    """Install and enable the Amyuni virtual display driver.
+    
+    Returns True if successful, False otherwise.
+    """
+    if platform.system() != "Windows":
+        print("Virtual display driver is only supported on Windows")
+        return False
+    
+    if not is_running_as_admin():
+        print("Error: Administrator privileges required to install virtual display driver")
+        return False
+    
+    try:
+        driver_path = get_driver_files_path()
+        if not driver_path:
+            print("Error: Amyuni driver files not found")
+            print("Please ensure the amyuni_driver folder exists in the cyberdriver directory")
+            return False
+        
+        # Determine which deviceinstaller to use
+        is_64bit = platform.machine().endswith('64')
+        installer_name = "deviceinstaller64.exe" if is_64bit else "deviceinstaller.exe"
+        installer_path = driver_path / installer_name
+        inf_path = driver_path / "usbmmidd.inf"
+        
+        if not installer_path.exists():
+            print(f"Error: {installer_name} not found in amyuni_driver folder")
+            return False
+        
+        if not inf_path.exists():
+            print("Error: usbmmidd.inf not found in amyuni_driver folder")
+            return False
+        
+        print("\nInstalling Amyuni virtual display driver...")
+        
+        # Install the driver
+        print(f"Running: {installer_name} install usbmmidd.inf usbmmidd")
+        result = subprocess.run(
+            [str(installer_path), "install", str(inf_path), "usbmmidd"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=str(driver_path)
+        )
+        
+        if result.returncode != 0:
+            print(f"Error installing driver: {result.stderr or result.stdout}")
+            return False
+        
+        print("✓ Driver installed successfully")
+        
+        # Enable the virtual display
+        print(f"Running: {installer_name} enableidd 1")
+        result = subprocess.run(
+            [str(installer_path), "enableidd", "1"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=str(driver_path)
+        )
+        
+        if result.returncode != 0:
+            print(f"Warning: Could not enable virtual display: {result.stderr or result.stdout}")
+            print("You may need to enable it manually or restart the system")
+            return False
+        
+        print("✓ Virtual display enabled successfully")
+        print("\nℹ  You can now configure the virtual display in Windows Display Settings")
+        print("   The virtual display will persist across reboots")
+        
+        return True
+        
+    except subprocess.TimeoutExpired:
+        print("Error: Driver installation timed out")
+        return False
+    except Exception as e:
+        print(f"Error installing virtual display driver: {e}")
+        return False
+
+
+def setup_persistent_display_if_needed() -> bool:
+    """Check and install virtual display driver if not already installed.
+    
+    Returns True if driver is ready (already installed or just installed), False otherwise.
+    """
+    if platform.system() != "Windows":
+        print("Note: Persistent virtual display is only supported on Windows")
+        return False
+    
+    if not is_running_as_admin():
+        print("Error: Administrator privileges required for persistent display setup")
+        return False
+    
+    # Check if already installed
+    if is_virtual_display_driver_installed():
+        print("✓ Virtual display driver already installed")
+        
+        # Make sure it's enabled
+        try:
+            driver_path = get_driver_files_path()
+            if driver_path:
+                is_64bit = platform.machine().endswith('64')
+                installer_name = "deviceinstaller64.exe" if is_64bit else "deviceinstaller.exe"
+                installer_path = driver_path / installer_name
+                
+                print("Ensuring virtual display is enabled...")
+                result = subprocess.run(
+                    [str(installer_path), "enableidd", "1"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    cwd=str(driver_path)
+                )
+                
+                if result.returncode == 0:
+                    print("✓ Virtual display is enabled")
+                else:
+                    print(f"Note: {result.stderr or result.stdout}")
+        except Exception as e:
+            print(f"Note: Could not verify display state: {e}")
+        
+        return True
+    
+    # Not installed, install it
+    print("\nVirtual display driver not detected. Installing...")
+    return install_virtual_display_driver()
+
 
 # -----------------------------------------------------------------------------
 # Windows Console Fix
@@ -166,7 +431,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.23"
+VERSION = "0.0.24"
 
 @dataclass
 class Config:
@@ -1522,6 +1787,171 @@ async def run_server_async(port: int):
     await server.serve()
 
 
+class BlackScreenRecoveryManager:
+    """Background manager that detects black screens and recovers by switching to console session.
+    
+    Windows RDP/session issues can cause the screen to go completely black. This manager:
+    - Periodically captures screenshots
+    - Checks if screen is truly black (no variance)
+    - Executes PowerShell script to switch session to console
+    
+    Note: This feature is Windows-only and will not run on other platforms.
+    """
+    def __init__(self, enabled: bool, check_interval_seconds: float = 30.0):
+        # Gate to Windows only
+        if platform.system() != "Windows":
+            self.enabled = False
+            if enabled:
+                print("Note: Black screen recovery is only supported on Windows")
+        else:
+            self.enabled = enabled
+        self.check_interval_seconds = max(5.0, float(check_interval_seconds))
+        self._stop = False
+        self._task: Optional[asyncio.Task] = None
+        self._initial_check_done = False
+        
+    async def run(self):
+        """Main loop that checks for black screens on a cadence."""
+        if not self.enabled:
+            return
+            
+        try:
+            # Initial check after 5 seconds
+            await asyncio.sleep(5.0)
+            if not self._stop and self.enabled:
+                await self._check_and_recover()
+                self._initial_check_done = True
+            
+            # Regular checks on interval
+            while not self._stop and self.enabled:
+                await asyncio.sleep(self.check_interval_seconds)
+                if not self._stop and self.enabled:
+                    await self._check_and_recover()
+                    
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"BlackScreenRecovery error: {e}")
+    
+    async def _check_and_recover(self):
+        """Check if screen is black and recover if needed.
+        
+        Uses a 5-second confirmation check to avoid false positives during
+        transient black screens (e.g., during RDP connection).
+        """
+        try:
+            # Initial check
+            is_black = await asyncio.to_thread(self._check_if_screen_black)
+            
+            if is_black:
+                print("\n⚠️  Black screen detected! Confirming in 5 seconds...")
+                
+                # Wait 5 seconds and check again to confirm it's not transient
+                await asyncio.sleep(5.0)
+                
+                # Confirmation check
+                still_black = await asyncio.to_thread(self._check_if_screen_black)
+                
+                if still_black:
+                    print("⚠️  Black screen confirmed! Attempting console session recovery...")
+                    await self._execute_console_switch()
+                else:
+                    print("✓ Screen recovered on its own (transient black screen)")
+            
+        except Exception as e:
+            print(f"BlackScreenRecovery check error: {e}")
+    
+    def _check_if_screen_black(self) -> bool:
+        """Check if the screen is truly black (no variance)."""
+        try:
+            with mss.mss() as sct:
+                monitor = sct.monitors[1]
+                img = sct.grab(monitor)
+                
+                # Convert to numpy array for variance check
+                img_array = np.array(img)
+                
+                # Check if there's any variance in the image
+                # A truly black screen will have variance close to 0
+                variance = np.var(img_array)
+                
+                # Also check if mean is very low (close to black)
+                mean = np.mean(img_array)
+                
+                # Consider screen black if variance is very low (< 1.0) and mean is low (< 10)
+                is_black = variance < 1.0 and mean < 10
+                
+                if is_black:
+                    print(f"BlackScreenRecovery: Screen appears black (variance={variance:.2f}, mean={mean:.2f})")
+                
+                return is_black
+                
+        except Exception as e:
+            print(f"BlackScreenRecovery: Screenshot check failed: {e}")
+            return False
+    
+    async def _execute_console_switch(self):
+        """Execute PowerShell script to switch session to console."""
+        if platform.system() != "Windows":
+            print("BlackScreenRecovery: Console switching is only supported on Windows")
+            return
+        
+        try:
+            # PowerShell script to switch session to console with elevation
+            ps_script = """
+# Get the current PowerShell process's session id
+$sessionId = (Get-Process -Id $PID).SessionId
+
+# Helper to run tscon
+function Invoke-Tscon {
+    param($Id)
+    Write-Host "Running: tscon $Id /dest:console"
+    & tscon $Id /dest:console
+    $rc = $LASTEXITCODE
+    if ($rc -ne 0) {
+        Write-Error "tscon exited with code $rc"
+    }
+}
+
+# Check if running elevated
+$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not $isAdmin) {
+    Write-Host "Not elevated — requesting elevation (UAC)."
+    $escaped = $sessionId.ToString()
+    # Start an elevated powershell that runs tscon with the captured session id
+    Start-Process powershell -Verb RunAs -ArgumentList "-NoProfile -WindowStyle Hidden -Command `"& { tscon $escaped /dest:console }`""
+    return
+}
+
+# Already elevated — run directly
+Invoke-Tscon -Id $sessionId
+"""
+            
+            # Execute the PowerShell script
+            result = await asyncio.to_thread(
+                execute_powershell_command,
+                ps_script,
+                str(uuid.uuid4()),
+                None,
+                True,
+                30.0
+            )
+            
+            if result.get("exit_code") == 0:
+                print("✓ Console session switch executed successfully")
+            else:
+                error = result.get("stderr", "Unknown error")
+                print(f"BlackScreenRecovery: tscon execution failed: {error}")
+                
+        except Exception as e:
+            print(f"BlackScreenRecovery: Failed to execute console switch: {e}")
+    
+    def stop(self):
+        """Stop the recovery manager."""
+        self._stop = True
+
+
 class KeepAliveManager:
     """Background manager that triggers realistic user activity when idle.
     
@@ -1794,7 +2224,9 @@ class KeepAliveManager:
 async def run_join(host: str, port: int, secret: str, target_port: int, keepalive_enabled: bool = False, 
                    keepalive_threshold_minutes: float = 3.0, interactive: bool = False, 
                    register_as_keepalive_for: Optional[str] = None,
-                   keepalive_click_x: Optional[int] = None, keepalive_click_y: Optional[int] = None):
+                   keepalive_click_x: Optional[int] = None, keepalive_click_y: Optional[int] = None,
+                   black_screen_recovery_enabled: bool = False,
+                   black_screen_check_interval: float = 30.0):
     """Run both API server and tunnel client."""
     config = get_config()
     
@@ -1828,6 +2260,13 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
         pass
     keepalive_task: Optional[asyncio.Task] = None
     tunnel_task: Optional[asyncio.Task] = None
+    
+    # Prepare black screen recovery manager (optional)
+    black_screen_manager = BlackScreenRecoveryManager(
+        enabled=black_screen_recovery_enabled,
+        check_interval_seconds=black_screen_check_interval,
+    )
+    black_screen_task: Optional[asyncio.Task] = None
 
     async def start_keepalive_if_enabled():
         nonlocal keepalive_task
@@ -1845,6 +2284,24 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
             except Exception:
                 pass
             keepalive_task = None
+    
+    async def start_black_screen_recovery_if_enabled():
+        nonlocal black_screen_task
+        if black_screen_recovery_enabled and black_screen_task is None:
+            black_screen_manager.enabled = True
+            black_screen_task = asyncio.create_task(black_screen_manager.run())
+            if black_screen_recovery_enabled:
+                print(f"✓ Black screen recovery enabled (check interval: {black_screen_check_interval}s)")
+    
+    async def stop_black_screen_recovery():
+        nonlocal black_screen_task
+        if black_screen_task is not None:
+            black_screen_manager.stop()
+            try:
+                await asyncio.wait_for(black_screen_task, timeout=2.0)
+            except Exception:
+                pass
+            black_screen_task = None
 
     def make_tunnel():
         return TunnelClient(
@@ -1872,6 +2329,7 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
     # Start initially enabled
     await start_tunnel()
     await start_keepalive_if_enabled()
+    await start_black_screen_recovery_if_enabled()
 
     if not interactive:
         # Run server and tunnel until interrupted
@@ -1881,6 +2339,7 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
             print("\nShutting down...")
         finally:
             await stop_keepalive()
+            await stop_black_screen_recovery()
     else:
         # Interactive CLI loop to Disable/Re-enable without killing process
         print("\nInteractive controls: [d] Disable, [e] Re-enable, [q] Quit, [h] Help")
@@ -1900,11 +2359,13 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
                         print("Disabling Cyberdriver tunnel…")
                         await stop_tunnel()
                         await stop_keepalive()
+                        await stop_black_screen_recovery()
                         print("Disabled. The local server is still running.")
                     elif cmd in ("e", "enable", "reenable", "re-enable"):
                         print("Enabling Cyberdriver tunnel…")
                         await start_tunnel()
                         await start_keepalive_if_enabled()
+                        await start_black_screen_recovery_if_enabled()
                         print("Enabled and connected (reconnection may take a moment).")
                     elif cmd in ("q", "quit", "exit"):
                         print("Exiting…")
@@ -1920,6 +2381,7 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
         finally:
             await stop_tunnel()
             await stop_keepalive()
+            await stop_black_screen_recovery()
 
 
 def run_coords_capture():
@@ -2034,6 +2496,8 @@ def print_banner_no_color(mode="default"):
         print("Get started:")
         print("→ Join: cyberdriver join --secret YOUR_API_KEY")
         print("→ Keepalive: cyberdriver join --secret YOUR_API_KEY --keepalive")
+        print("→ Black screen recovery: cyberdriver join --secret YOUR_API_KEY --black-screen-recovery")
+        print("→ Persistent display: cyberdriver join --secret YOUR_API_KEY --add-persistent-display")
     
     print("→ Run -h for help")
     print("→ Visit https://docs.cyberdesk.io for documentation")
@@ -2100,6 +2564,8 @@ def print_banner(mode="default"):
         print(f"{white}Get started:{reset}")
         print(f"{white}→ {blue}Join:{reset} cyberdriver join --secret YOUR_API_KEY")
         print(f"{white}→ {blue}Keepalive:{reset} cyberdriver join --secret YOUR_API_KEY --keepalive")
+        print(f"{white}→ {blue}Black screen recovery:{reset} cyberdriver join --secret YOUR_API_KEY --black-screen-recovery")
+        print(f"{white}→ {blue}Persistent display:{reset} cyberdriver join --secret YOUR_API_KEY --add-persistent-display")
         print(f"{white}→ {blue}Remote keepalive:{reset} cyberdriver join --secret YOUR_API_KEY --keepalive --register-as-keepalive-for MAIN_MACHINE_ID")
     
     # Always show help and docs
@@ -2165,6 +2631,9 @@ def main():
     join_parser.add_argument("--keepalive-threshold-minutes", type=float, default=3.0, help="Idle minutes before keepalive (default: 3)")
     join_parser.add_argument("--keepalive-click-x", type=int, default=None, help="X coordinate for keepalive click (default: bottom-left)")
     join_parser.add_argument("--keepalive-click-y", type=int, default=None, help="Y coordinate for keepalive click (default: bottom-left)")
+    join_parser.add_argument("--black-screen-recovery", action="store_true", help="Enable black screen detection and console recovery (Windows only)")
+    join_parser.add_argument("--black-screen-check-interval", type=float, default=30.0, help="Seconds between black screen checks (default: 30)")
+    join_parser.add_argument("--add-persistent-display", action="store_true", help="Install and enable Amyuni virtual display driver for persistent display (Windows only, requires admin)")
     join_parser.add_argument("--interactive", action="store_true", help="Interactive CLI to Disable/Re-enable without exiting")
     join_parser.add_argument("--register-as-keepalive-for", type=str, default=None, help="Register this instance as the remote keepalive (host) for MAIN_MACHINE_ID")
     
@@ -2182,9 +2651,11 @@ def main():
         if not (len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] in ['-h', '--help'])):
             print_banner()
         print("Commands:")
-        print("  join --secret KEY                Connect to Cyberdesk Cloud")
-        print("  join --secret KEY --keepalive    Enable keepalive")
-        print("  coords                           Capture screen coordinates (for keepalive)")
+        print("  join --secret KEY                         Connect to Cyberdesk Cloud")
+        print("  join --secret KEY --keepalive             Enable keepalive")
+        print("  join --secret KEY --black-screen-recovery Enable black screen detection (Windows)")
+        print("  join --secret KEY --add-persistent-display Install virtual display driver (Windows)")
+        print("  coords                                    Capture screen coordinates (for keepalive)")
         print()
         print("For more info: cyberdriver join -h")
         sys.exit(0)
@@ -2192,6 +2663,55 @@ def main():
     # Show banner for join command
     if args.command == "join":
         print_banner(mode="connecting")
+    
+    # Check for admin privileges if black screen recovery or persistent display is enabled
+    needs_admin = False
+    if args.command == "join":
+        if getattr(args, "black_screen_recovery", False):
+            needs_admin = True
+        if getattr(args, "add_persistent_display", False):
+            needs_admin = True
+    
+    if needs_admin and platform.system() == "Windows":
+        if not is_running_as_admin():
+            # Request elevation and exit (will restart with admin privileges)
+            request_admin_elevation()
+            # If we're still here, elevation failed or was cancelled
+            print("\nWarning: Running without administrator privileges.")
+            
+            if getattr(args, "black_screen_recovery", False):
+                print("Black screen recovery may not work properly without elevation.")
+            if getattr(args, "add_persistent_display", False):
+                print("Persistent display setup requires administrator privileges.")
+            
+            print("You can:")
+            print("  1. Restart Cyberdriver from an Administrator PowerShell")
+            if getattr(args, "black_screen_recovery", False):
+                print("  2. Accept the UAC prompt when black screen is detected")
+            print("  3. Continue anyway (press Enter)")
+            input()
+        else:
+            # Running as admin - show confirmation
+            try:
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+                green = '\033[92m'
+                reset = '\033[0m'
+                print(f"{green}✓{reset} Running with administrator privileges\n")
+            except:
+                print("✓ Running with administrator privileges\n")
+    
+    # Setup persistent display if requested
+    if args.command == "join" and getattr(args, "add_persistent_display", False):
+        if platform.system() == "Windows":
+            if not setup_persistent_display_if_needed():
+                print("\nWarning: Failed to setup persistent display")
+                print("Cyberdriver will continue, but the virtual display may not be available")
+                print("Press Enter to continue...")
+                input()
+            else:
+                print()  # Add spacing after successful setup
     
     # Disable Windows console QuickEdit mode to prevent output blocking
     disable_windows_console_quickedit()
@@ -2231,6 +2751,8 @@ def main():
                 register_as_keepalive_for=getattr(args, "register_as_keepalive_for", None),
                 keepalive_click_x=getattr(args, "keepalive_click_x", None),
                 keepalive_click_y=getattr(args, "keepalive_click_y", None),
+                black_screen_recovery_enabled=bool(getattr(args, "black_screen_recovery", False)),
+                black_screen_check_interval=float(getattr(args, "black_screen_check_interval", 30.0)),
             ))
     except KeyboardInterrupt:
         print("\n\nKeyboard interrupt received. Shutting down...")
