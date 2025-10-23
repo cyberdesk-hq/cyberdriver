@@ -167,36 +167,41 @@ def get_driver_files_path() -> Optional[pathlib.Path]:
 
 
 def is_virtual_display_driver_installed() -> bool:
-    """Check if the Amyuni virtual display driver is already installed."""
+    """Check if the Amyuni virtual display driver is already installed.
+    
+    Uses Windows Device Manager query to check for the actual device.
+    """
     if platform.system() != "Windows":
         return False
     
     try:
-        driver_path = get_driver_files_path()
-        if not driver_path:
-            return False
+        # Use PowerShell to check Device Manager for the virtual display
+        # This is more reliable than deviceinstaller's find command
+        ps_check = """
+        $device = Get-PnpDevice | Where-Object { 
+            $_.FriendlyName -like "*USB Mobile Monitor*" -or 
+            $_.FriendlyName -like "*usbmmidd*" 
+        }
+        if ($device) { 
+            exit 0 
+        } else { 
+            exit 1 
+        }
+        """
         
-        # Determine which deviceinstaller to use
-        is_64bit = platform.machine().endswith('64')
-        installer_name = "deviceinstaller64.exe" if is_64bit else "deviceinstaller.exe"
-        installer_path = driver_path / installer_name
-        
-        if not installer_path.exists():
-            return False
-        
-        # Check if driver is installed by trying to find it
         result = subprocess.run(
-            [str(installer_path), "find", "usbmmidd"],
+            ["powershell", "-NoProfile", "-Command", ps_check],
             capture_output=True,
             text=True,
             timeout=10
         )
         
-        # If find succeeds (exit code 0), driver is installed
+        # Exit code 0 means device found
         return result.returncode == 0
         
     except Exception as e:
-        print(f"Error checking virtual display driver: {e}")
+        # If PowerShell check fails, fall back to assuming not installed
+        # Better to attempt installation than skip it
         return False
 
 
