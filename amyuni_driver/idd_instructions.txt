@@ -5,7 +5,7 @@ Procedure to add a virtual monitor to your system (Windows 10 Only!)
 - Make sure you read the License.txt file as with any other software product
 - Open a command prompt window as Administrator (you cannot add a device to your system unless you "Run As Administrator")
 - Run the following commands:
-	- cd c:\temp\usbmmid (or whatever destination folder you chose)
+	- cd c:\temp\usbmmidd (or whatever destination folder you chose)
 	- deviceinstaller64 install usbmmidd.inf usbmmidd (If you are on a 32-bit system, replace "deviceinstaller64" by "deviceinstaller")
 	- Make sure you see the message that the drivers are signed by Amyuni Technologies Inc. This is a confirmation that the drivers went through Microsoft driver signing procedure and are virus free
 	
@@ -47,4 +47,4 @@ deviceinstaller64 enableidd 1
 
 To completely remove the drivers from your system, you can either go through the Device Manager and uninstall "USB Mobile Monitor Virtual Display", or run the commands:
 deviceinstaller64 stop usbmmidd
-deviceinstaller64 remove usbmmid
+deviceinstaller64 remove usbmmidd
