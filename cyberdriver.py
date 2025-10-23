@@ -53,6 +53,8 @@ import uuid
 import signal
 import threading
 import random
+import tempfile
+import shutil
 from typing import Dict, List, Optional, Tuple, Union, Any
 from enum import Enum
 from dataclasses import dataclass
@@ -134,6 +136,197 @@ def request_admin_elevation():
     except Exception as e:
         print(f"Failed to request elevation: {e}")
         return False
+
+
+# -----------------------------------------------------------------------------
+# Amyuni Virtual Display Driver Management
+# -----------------------------------------------------------------------------
+
+def get_driver_files_path() -> Optional[pathlib.Path]:
+    """Get the path to the bundled Amyuni driver files.
+    
+    Supports both running as script and as PyInstaller executable.
+    """
+    if platform.system() != "Windows":
+        return None
+    
+    # Check if running as PyInstaller bundle
+    if getattr(sys, 'frozen', False):
+        # Running as compiled executable
+        base_path = pathlib.Path(sys._MEIPASS)
+    else:
+        # Running as script - drivers should be in ./amyuni_driver directory
+        base_path = pathlib.Path(__file__).parent
+    
+    driver_path = base_path / "amyuni_driver"
+    
+    if driver_path.exists():
+        return driver_path
+    
+    return None
+
+
+def is_virtual_display_driver_installed() -> bool:
+    """Check if the Amyuni virtual display driver is already installed."""
+    if platform.system() != "Windows":
+        return False
+    
+    try:
+        driver_path = get_driver_files_path()
+        if not driver_path:
+            return False
+        
+        # Determine which deviceinstaller to use
+        is_64bit = platform.machine().endswith('64')
+        installer_name = "deviceinstaller64.exe" if is_64bit else "deviceinstaller.exe"
+        installer_path = driver_path / installer_name
+        
+        if not installer_path.exists():
+            return False
+        
+        # Check if driver is installed by trying to find it
+        result = subprocess.run(
+            [str(installer_path), "find", "usbmmidd"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        # If find succeeds (exit code 0), driver is installed
+        return result.returncode == 0
+        
+    except Exception as e:
+        print(f"Error checking virtual display driver: {e}")
+        return False
+
+
+def install_virtual_display_driver() -> bool:
+    """Install and enable the Amyuni virtual display driver.
+    
+    Returns True if successful, False otherwise.
+    """
+    if platform.system() != "Windows":
+        print("Virtual display driver is only supported on Windows")
+        return False
+    
+    if not is_running_as_admin():
+        print("Error: Administrator privileges required to install virtual display driver")
+        return False
+    
+    try:
+        driver_path = get_driver_files_path()
+        if not driver_path:
+            print("Error: Amyuni driver files not found")
+            print("Please ensure the amyuni_driver folder exists in the cyberdriver directory")
+            return False
+        
+        # Determine which deviceinstaller to use
+        is_64bit = platform.machine().endswith('64')
+        installer_name = "deviceinstaller64.exe" if is_64bit else "deviceinstaller.exe"
+        installer_path = driver_path / installer_name
+        inf_path = driver_path / "usbmmidd.inf"
+        
+        if not installer_path.exists():
+            print(f"Error: {installer_name} not found in amyuni_driver folder")
+            return False
+        
+        if not inf_path.exists():
+            print("Error: usbmmidd.inf not found in amyuni_driver folder")
+            return False
+        
+        print("\nInstalling Amyuni virtual display driver...")
+        
+        # Install the driver
+        print(f"Running: {installer_name} install usbmmidd.inf usbmmidd")
+        result = subprocess.run(
+            [str(installer_path), "install", str(inf_path), "usbmmidd"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=str(driver_path)
+        )
+        
+        if result.returncode != 0:
+            print(f"Error installing driver: {result.stderr or result.stdout}")
+            return False
+        
+        print("✓ Driver installed successfully")
+        
+        # Enable the virtual display
+        print(f"Running: {installer_name} enableidd 1")
+        result = subprocess.run(
+            [str(installer_path), "enableidd", "1"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=str(driver_path)
+        )
+        
+        if result.returncode != 0:
+            print(f"Warning: Could not enable virtual display: {result.stderr or result.stdout}")
+            print("You may need to enable it manually or restart the system")
+            return False
+        
+        print("✓ Virtual display enabled successfully")
+        print("\nℹ  You can now configure the virtual display in Windows Display Settings")
+        print("   The virtual display will persist across reboots")
+        
+        return True
+        
+    except subprocess.TimeoutExpired:
+        print("Error: Driver installation timed out")
+        return False
+    except Exception as e:
+        print(f"Error installing virtual display driver: {e}")
+        return False
+
+
+def setup_persistent_display_if_needed() -> bool:
+    """Check and install virtual display driver if not already installed.
+    
+    Returns True if driver is ready (already installed or just installed), False otherwise.
+    """
+    if platform.system() != "Windows":
+        print("Note: Persistent virtual display is only supported on Windows")
+        return False
+    
+    if not is_running_as_admin():
+        print("Error: Administrator privileges required for persistent display setup")
+        return False
+    
+    # Check if already installed
+    if is_virtual_display_driver_installed():
+        print("✓ Virtual display driver already installed")
+        
+        # Make sure it's enabled
+        try:
+            driver_path = get_driver_files_path()
+            if driver_path:
+                is_64bit = platform.machine().endswith('64')
+                installer_name = "deviceinstaller64.exe" if is_64bit else "deviceinstaller.exe"
+                installer_path = driver_path / installer_name
+                
+                print("Ensuring virtual display is enabled...")
+                result = subprocess.run(
+                    [str(installer_path), "enableidd", "1"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    cwd=str(driver_path)
+                )
+                
+                if result.returncode == 0:
+                    print("✓ Virtual display is enabled")
+                else:
+                    print(f"Note: {result.stderr or result.stdout}")
+        except Exception as e:
+            print(f"Note: Could not verify display state: {e}")
+        
+        return True
+    
+    # Not installed, install it
+    print("\nVirtual display driver not detected. Installing...")
+    return install_virtual_display_driver()
 
 
 # -----------------------------------------------------------------------------
@@ -2299,6 +2492,7 @@ def print_banner_no_color(mode="default"):
         print("→ Join: cyberdriver join --secret YOUR_API_KEY")
         print("→ Keepalive: cyberdriver join --secret YOUR_API_KEY --keepalive")
         print("→ Black screen recovery: cyberdriver join --secret YOUR_API_KEY --black-screen-recovery")
+        print("→ Persistent display: cyberdriver join --secret YOUR_API_KEY --add-persistent-display")
     
     print("→ Run -h for help")
     print("→ Visit https://docs.cyberdesk.io for documentation")
@@ -2366,6 +2560,7 @@ def print_banner(mode="default"):
         print(f"{white}→ {blue}Join:{reset} cyberdriver join --secret YOUR_API_KEY")
         print(f"{white}→ {blue}Keepalive:{reset} cyberdriver join --secret YOUR_API_KEY --keepalive")
         print(f"{white}→ {blue}Black screen recovery:{reset} cyberdriver join --secret YOUR_API_KEY --black-screen-recovery")
+        print(f"{white}→ {blue}Persistent display:{reset} cyberdriver join --secret YOUR_API_KEY --add-persistent-display")
         print(f"{white}→ {blue}Remote keepalive:{reset} cyberdriver join --secret YOUR_API_KEY --keepalive --register-as-keepalive-for MAIN_MACHINE_ID")
     
     # Always show help and docs
@@ -2433,6 +2628,7 @@ def main():
     join_parser.add_argument("--keepalive-click-y", type=int, default=None, help="Y coordinate for keepalive click (default: bottom-left)")
     join_parser.add_argument("--black-screen-recovery", action="store_true", help="Enable black screen detection and console recovery (Windows only)")
     join_parser.add_argument("--black-screen-check-interval", type=float, default=30.0, help="Seconds between black screen checks (default: 30)")
+    join_parser.add_argument("--add-persistent-display", action="store_true", help="Install and enable Amyuni virtual display driver for persistent display (Windows only, requires admin)")
     join_parser.add_argument("--interactive", action="store_true", help="Interactive CLI to Disable/Re-enable without exiting")
     join_parser.add_argument("--register-as-keepalive-for", type=str, default=None, help="Register this instance as the remote keepalive (host) for MAIN_MACHINE_ID")
     
@@ -2453,6 +2649,7 @@ def main():
         print("  join --secret KEY                         Connect to Cyberdesk Cloud")
         print("  join --secret KEY --keepalive             Enable keepalive")
         print("  join --secret KEY --black-screen-recovery Enable black screen detection (Windows)")
+        print("  join --secret KEY --add-persistent-display Install virtual display driver (Windows)")
         print("  coords                                    Capture screen coordinates (for keepalive)")
         print()
         print("For more info: cyberdriver join -h")
@@ -2462,31 +2659,54 @@ def main():
     if args.command == "join":
         print_banner(mode="connecting")
     
-    # Check for admin privileges if black screen recovery is enabled 
-    if args.command == "join" and getattr(args, "black_screen_recovery", False):
-        if platform.system() == "Windows":
-            if not is_running_as_admin():
-                # Request elevation and exit (will restart with admin privileges)
-                request_admin_elevation()
-                # If we're still here, elevation failed or was cancelled
-                print("\nWarning: Running without administrator privileges.")
+    # Check for admin privileges if black screen recovery or persistent display is enabled
+    needs_admin = False
+    if args.command == "join":
+        if getattr(args, "black_screen_recovery", False):
+            needs_admin = True
+        if getattr(args, "add_persistent_display", False):
+            needs_admin = True
+    
+    if needs_admin and platform.system() == "Windows":
+        if not is_running_as_admin():
+            # Request elevation and exit (will restart with admin privileges)
+            request_admin_elevation()
+            # If we're still here, elevation failed or was cancelled
+            print("\nWarning: Running without administrator privileges.")
+            
+            if getattr(args, "black_screen_recovery", False):
                 print("Black screen recovery may not work properly without elevation.")
-                print("You can:")
-                print("  1. Restart Cyberdriver from an Administrator PowerShell")
+            if getattr(args, "add_persistent_display", False):
+                print("Persistent display setup requires administrator privileges.")
+            
+            print("You can:")
+            print("  1. Restart Cyberdriver from an Administrator PowerShell")
+            if getattr(args, "black_screen_recovery", False):
                 print("  2. Accept the UAC prompt when black screen is detected")
-                print("  3. Continue anyway (press Enter)")
+            print("  3. Continue anyway (press Enter)")
+            input()
+        else:
+            # Running as admin - show confirmation
+            try:
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+                green = '\033[92m'
+                reset = '\033[0m'
+                print(f"{green}✓{reset} Running with administrator privileges\n")
+            except:
+                print("✓ Running with administrator privileges\n")
+    
+    # Setup persistent display if requested
+    if args.command == "join" and getattr(args, "add_persistent_display", False):
+        if platform.system() == "Windows":
+            if not setup_persistent_display_if_needed():
+                print("\nWarning: Failed to setup persistent display")
+                print("Cyberdriver will continue, but the virtual display may not be available")
+                print("Press Enter to continue...")
                 input()
             else:
-                # Running as admin - show confirmation
-                try:
-                    import ctypes
-                    kernel32 = ctypes.windll.kernel32
-                    kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
-                    green = '\033[92m'
-                    reset = '\033[0m'
-                    print(f"{green}✓{reset} Running with administrator privileges\n")
-                except:
-                    print("✓ Running with administrator privileges\n")
+                print()  # Add spacing after successful setup
     
     # Disable Windows console QuickEdit mode to prevent output blocking
     disable_windows_console_quickedit()
