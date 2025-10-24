@@ -65,6 +65,7 @@ import httpx
 import mss
 import numpy as np
 import pyautogui
+import pyperclip
 from PIL import Image
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response, JSONResponse
@@ -431,7 +432,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.24"
+VERSION = "0.0.25"
 
 @dataclass
 class Config:
@@ -1032,6 +1033,39 @@ async def post_keyboard_key(payload: Dict[str, str]):
     
     execute_xdo_sequence(sequence)
     return {}
+
+
+@app.post("/computer/copy_to_clipboard")
+async def post_copy_to_clipboard(payload: Dict[str, str]):
+    """Execute Ctrl+C and return clipboard contents with the specified key name.
+    
+    Payload:
+        - text: The key name for the copied data
+    """
+    key_name = payload.get("text")
+    if not key_name:
+        raise HTTPException(status_code=400, detail="Missing 'text' field (key name)")
+    
+    try:
+        # Clear clipboard first to detect if copy actually worked
+        pyperclip.copy('')
+        
+        # Execute Ctrl+C using existing XDO sequence handler
+        execute_xdo_sequence('ctrl+c')
+        
+        # Wait for clipboard to update
+        await asyncio.sleep(0.1)  # 100ms default wait
+        
+        # Read clipboard content
+        clipboard_content = pyperclip.paste()
+        
+        # Return JSON with key-value pair
+        return {
+            key_name: clipboard_content
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to copy to clipboard: {e}")
 
 
 @app.get("/computer/input/mouse/position")
