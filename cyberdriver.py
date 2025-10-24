@@ -1035,6 +1035,50 @@ async def post_keyboard_key(payload: Dict[str, str]):
     return {}
 
 
+def _read_clipboard_windows() -> str:
+    """Read clipboard using native Windows API (more reliable in Citrix/RDP).
+    
+    Uses win32clipboard directly instead of pyperclip for better Citrix compatibility.
+    """
+    import ctypes
+    from ctypes import wintypes
+    
+    # Windows clipboard constants
+    CF_UNICODETEXT = 13
+    GMEM_MOVEABLE = 0x0002
+    
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    
+    # Open clipboard
+    if not user32.OpenClipboard(None):
+        raise Exception("Failed to open clipboard")
+    
+    try:
+        # Check if clipboard has text
+        if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+            return ""
+        
+        # Get clipboard data handle
+        h_data = user32.GetClipboardData(CF_UNICODETEXT)
+        if not h_data:
+            return ""
+        
+        # Lock the global memory and get pointer to data
+        p_data = kernel32.GlobalLock(h_data)
+        if not p_data:
+            return ""
+        
+        try:
+            # Read unicode string from memory
+            text = ctypes.wstring_at(p_data)
+            return text
+        finally:
+            kernel32.GlobalUnlock(h_data)
+    finally:
+        user32.CloseClipboard()
+
+
 @app.post("/computer/copy_to_clipboard")
 async def post_copy_to_clipboard(payload: Dict[str, str]):
     """Execute Ctrl+C and return clipboard contents with the specified key name.
@@ -1048,16 +1092,45 @@ async def post_copy_to_clipboard(payload: Dict[str, str]):
     
     try:
         # Clear clipboard first to detect if copy actually worked
-        pyperclip.copy('')
+        if platform.system() == "Windows":
+            # Use native Windows clipboard clear for Citrix compatibility
+            try:
+                import ctypes
+                user32 = ctypes.windll.user32
+                if user32.OpenClipboard(None):
+                    user32.EmptyClipboard()
+                    user32.CloseClipboard()
+            except Exception:
+                pyperclip.copy('')
+        else:
+            pyperclip.copy('')
         
         # Execute Ctrl+C using existing XDO sequence handler
         execute_xdo_sequence('ctrl+c')
         
-        # Wait for clipboard to update
-        await asyncio.sleep(0.1)  # 100ms default wait
+        # Wait longer for clipboard to update (Citrix/RDP can be slower)
+        # Try multiple times with increasing delays to handle slow clipboard sync
+        clipboard_content = ""
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            await asyncio.sleep(0.15 + (attempt * 0.1))  # 150ms, 250ms, 350ms, 450ms, 550ms
+            
+            # Use Windows native clipboard API on Windows (more reliable in Citrix)
+            if platform.system() == "Windows":
+                try:
+                    clipboard_content = _read_clipboard_windows()
+                except Exception as e:
+                    print(f"Windows clipboard read attempt {attempt+1} failed: {e}")
+                    clipboard_content = ""
+            else:
+                clipboard_content = pyperclip.paste()
+            
+            if clipboard_content:  # Got content, break early
+                print(f"Clipboard read successful on attempt {attempt+1}")
+                break
         
-        # Read clipboard content
-        clipboard_content = pyperclip.paste()
+        if not clipboard_content:
+            print("Warning: Clipboard is empty after all retry attempts")
         
         # Return JSON with key-value pair
         return {
