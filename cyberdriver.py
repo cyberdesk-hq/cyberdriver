@@ -1130,7 +1130,7 @@ async def post_copy_to_clipboard(payload: Dict[str, str]):
                 break
         
         if not clipboard_content:
-            print("Warning: Clipboard is empty after all retry attempts")
+            print("Warning: Clipboard is empty after all retry attempts (Citrix/RDP can be slow)")
         
         # Return JSON with key-value pair
         return {
