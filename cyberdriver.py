@@ -1072,7 +1072,7 @@ async def post_copy_to_clipboard(payload: Dict[str, str]):
                 continue
         
         if not clipboard_content:
-            print("⚠ Warning: Clipboard is empty after all retry attempts")
+            print("⚠ Warning: Clipboard is empty after all retry attempts ")
             print("   This can happen in Citrix/RDP if clipboard redirection is disabled")
             print("   or if the Ctrl+C didn't select any text")
         
