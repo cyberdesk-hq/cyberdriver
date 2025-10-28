@@ -433,7 +433,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.26"
+VERSION = "0.0.27"
 
 @dataclass
 class Config:
@@ -1431,14 +1431,14 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
         }
         
     except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
+        # Don't kill the process - let it continue in background
+        # Just return a message indicating timeout while command continues
         return {
             "stdout": "",
-            "stderr": "Command timed out",
-            "exit_code": -1,
+            "stderr": f"Command timeout reached after {timeout} seconds. Process continues in background.",
+            "exit_code": 0,  # Return success code since we're allowing it to continue
             "session_id": session_id,
-            "error": f"Command timed out after {timeout} seconds"
+            "timeout_reached": True  # New flag to indicate timeout (not error)
         }
     except Exception as e:
         return {
