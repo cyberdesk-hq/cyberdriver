@@ -1630,8 +1630,8 @@ class TunnelClient:
                 close_reason = None
                 
                 if isinstance(e, ConnectionClosed):
-                    close_code = e.rcvd.code if e.rcvd else None
-                    close_reason = e.rcvd.reason if e.rcvd else None
+                    close_code = (e.rcvd.code if e.rcvd else None) or (e.sent.code if e.sent else None)
+                    close_reason = (e.rcvd.reason if e.rcvd else None) or (e.sent.reason if e.sent else None)
                 elif isinstance(e, InvalidStatusCode):
                     # Server rejected connection before WebSocket handshake
                     close_code = e.status_code
