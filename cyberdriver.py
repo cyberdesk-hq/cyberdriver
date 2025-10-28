@@ -71,7 +71,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response, JSONResponse
 import uvicorn
 import websockets
-from websockets.exceptions import ConnectionClosed, InvalidStatusCode
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 # -----------------------------------------------------------------------------
 # Windows Administrator Check and Elevation
@@ -1626,7 +1626,7 @@ class TunnelClient:
             except asyncio.CancelledError:
                 # Allow task cancellation to stop the tunnel immediately
                 raise
-            except (ConnectionClosed, InvalidStatusCode) as e:
+            except (ConnectionClosed, InvalidStatus) as e:
                 # Handle WebSocket close codes specially
                 close_code = None
                 close_reason = None
@@ -1634,9 +1634,9 @@ class TunnelClient:
                 if isinstance(e, ConnectionClosed):
                     close_code = (e.rcvd.code if e.rcvd else None) or (e.sent.code if e.sent else None)
                     close_reason = (e.rcvd.reason if e.rcvd else None) or (e.sent.reason if e.sent else None)
-                elif isinstance(e, InvalidStatusCode):
+                elif isinstance(e, InvalidStatus):
                     # Server rejected connection before WebSocket handshake
-                    close_code = e.status_code
+                    close_code = e.response.status_code
                     # Try to extract reason from exception message
                     close_reason = str(e)
                 
