@@ -1645,7 +1645,7 @@ class TunnelClient:
                 
                 if is_auth_error:
                     print(f"\n{'='*60}")
-                    print(f"❌ Authentication Failed")
+                    print(f"❌ Authentication Failed ")
                     print(f"{'='*60}")
                     print(f"\nReason: {close_reason or 'Invalid or expired API key'}")
                     print("\n⚠️  Cyberdriver will NOT retry to prevent excessive API key validation attempts.")
