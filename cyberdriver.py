@@ -71,6 +71,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response, JSONResponse
 import uvicorn
 import websockets
+from websockets.exceptions import ConnectionClosed, InvalidStatusCode
 
 # -----------------------------------------------------------------------------
 # Windows Administrator Check and Elevation
@@ -1623,6 +1624,66 @@ class TunnelClient:
             except asyncio.CancelledError:
                 # Allow task cancellation to stop the tunnel immediately
                 raise
+            except (ConnectionClosed, InvalidStatusCode) as e:
+                # Handle WebSocket close codes specially
+                close_code = None
+                close_reason = None
+                
+                if isinstance(e, ConnectionClosed):
+                    close_code = e.rcvd.code if e.rcvd else None
+                    close_reason = e.rcvd.reason if e.rcvd else None
+                elif isinstance(e, InvalidStatusCode):
+                    # Server rejected connection before WebSocket handshake
+                    close_code = e.status_code
+                    # Try to extract reason from exception message
+                    close_reason = str(e)
+                
+                # Authentication failures should NOT retry
+                # - Close code 4001 (WebSocket close after accept)
+                # - HTTP 403 (rejected before accept, which is what FastAPI sends)
+                is_auth_error = (close_code == 4001 or close_code == 403)
+                
+                if is_auth_error:
+                    print(f"\n{'='*60}")
+                    print(f"❌ Authentication Failed")
+                    print(f"{'='*60}")
+                    print(f"\nReason: {close_reason or 'Invalid or expired API key'}")
+                    print("\n⚠️  Cyberdriver will NOT retry to prevent excessive API key validation attempts.")
+                    print("\nPlease check:")
+                    print("   1. Your API key is correct (from Cyberdesk dashboard)")
+                    print("   2. The API key hasn't been revoked or regenerated")
+                    print("   3. Your organization has access to this service")
+                    print(f"\n{'='*60}\n")
+                    # Exit instead of retrying
+                    sys.exit(1)
+                
+                # For other close codes, continue with exponential backoff
+                error_msg = str(e).lower()
+                print(f"\n{'='*60}")
+                print(f"WebSocket Connection Error: {e}")
+                if close_code:
+                    print(f"Close Code: {close_code}")
+                if close_reason:
+                    print(f"Close Reason: {close_reason}")
+                print(f"{'='*60}")
+                
+                # Provide guidance for common errors
+                if close_code in [1008, 1011]:  # Policy violation or server error
+                    print("\n⚠️  Server rejected connection")
+                    print("\nThis might be a temporary server issue.")
+                else:
+                    print("\n⚠️  Connection was closed unexpectedly")
+                    print("\nCommon fixes:")
+                    print("   1. Check your internet connection")
+                    print("   2. Verify the server is accessible")
+                
+                print(f"\n{'='*60}")
+                print(f"Retrying in {sleep_time} seconds...")
+                print(f"{'='*60}\n")
+                
+                await asyncio.sleep(sleep_time)
+                sleep_time = min(sleep_time * 2, self.max_sleep)
+                
             except Exception as e:
                 error_msg = str(e).lower()
                 print(f"\n{'='*60}")
