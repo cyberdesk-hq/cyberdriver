@@ -65,11 +65,13 @@ import httpx
 import mss
 import numpy as np
 import pyautogui
+import pyperclip
 from PIL import Image
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response, JSONResponse
 import uvicorn
 import websockets
+from websockets.exceptions import ConnectionClosed, InvalidStatusCode
 
 # -----------------------------------------------------------------------------
 # Windows Administrator Check and Elevation
@@ -431,7 +433,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.24"
+VERSION = "0.0.25"
 
 @dataclass
 class Config:
@@ -1034,6 +1036,56 @@ async def post_keyboard_key(payload: Dict[str, str]):
     return {}
 
 
+@app.post("/computer/copy_to_clipboard")
+async def post_copy_to_clipboard(payload: Dict[str, str]):
+    """Execute Ctrl+C and return clipboard contents with the specified key name.
+    
+    Payload:
+        - text: The key name for the copied data
+    """
+    key_name = payload.get("text")
+    if not key_name:
+        raise HTTPException(status_code=400, detail="Missing 'text' field (key name)")
+    
+    try:
+        # Clear clipboard first to detect if copy actually worked
+        pyperclip.copy('')
+        
+        # Execute Ctrl+C using existing XDO sequence handler (uses SendInput on Windows)
+        execute_xdo_sequence('ctrl+c')
+        
+        # Citrix/RDP clipboard sync can be VERY slow - use aggressive retry with long waits
+        # Start with longer initial delay for Citrix
+        clipboard_content = ""
+        max_attempts = 8  # More attempts for slow Citrix environments
+        
+        for attempt in range(max_attempts):
+            # Progressive delays: 200ms, 300ms, 400ms, 500ms, 600ms, 700ms, 800ms, 900ms
+            await asyncio.sleep(0.2 + (attempt * 0.1))
+            
+            try:
+                clipboard_content = pyperclip.paste()
+                if clipboard_content:  # Got content, break early
+                    print(f"✓ Clipboard read successful on attempt {attempt+1} (after {int((0.2 + attempt * 0.1) * 1000)}ms)")
+                    break
+            except Exception as e:
+                print(f"Clipboard read attempt {attempt+1} failed: {e}")
+                continue
+        
+        if not clipboard_content:
+            print("⚠ Warning: Clipboard is empty after all retry attempts ")
+            print("   This can happen in Citrix/RDP if clipboard redirection is disabled")
+            print("   or if the Ctrl+C didn't select any text")
+        
+        # Return JSON with key-value pair (even if empty - let the agent handle it)
+        return {
+            key_name: clipboard_content
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to copy to clipboard: {e}")
+
+
 @app.get("/computer/input/mouse/position")
 async def get_mouse_position() -> Dict[str, int]:
     """Return the current mouse position."""
@@ -1572,6 +1624,66 @@ class TunnelClient:
             except asyncio.CancelledError:
                 # Allow task cancellation to stop the tunnel immediately
                 raise
+            except (ConnectionClosed, InvalidStatusCode) as e:
+                # Handle WebSocket close codes specially
+                close_code = None
+                close_reason = None
+                
+                if isinstance(e, ConnectionClosed):
+                    close_code = (e.rcvd.code if e.rcvd else None) or (e.sent.code if e.sent else None)
+                    close_reason = (e.rcvd.reason if e.rcvd else None) or (e.sent.reason if e.sent else None)
+                elif isinstance(e, InvalidStatusCode):
+                    # Server rejected connection before WebSocket handshake
+                    close_code = e.status_code
+                    # Try to extract reason from exception message
+                    close_reason = str(e)
+                
+                # Authentication failures should NOT retry
+                # - Close code 4001 (WebSocket close after accept)
+                # - HTTP 403 (rejected before accept, which is what FastAPI sends)
+                is_auth_error = (close_code == 4001 or close_code == 403)
+                
+                if is_auth_error:
+                    print(f"\n{'='*60}")
+                    print(f"❌ Authentication Failed ")
+                    print(f"{'='*60}")
+                    print(f"\nReason: {close_reason or 'Invalid or expired API key'}")
+                    print("\n⚠️  Cyberdriver will NOT retry to prevent excessive API key validation attempts.")
+                    print("\nPlease check:")
+                    print("   1. Your API key is correct (from Cyberdesk dashboard)")
+                    print("   2. The API key hasn't been revoked or regenerated")
+                    print("   3. Your organization has access to this service")
+                    print(f"\n{'='*60}\n")
+                    # Exit instead of retrying
+                    sys.exit(1)
+                
+                # For other close codes, continue with exponential backoff
+                error_msg = str(e).lower()
+                print(f"\n{'='*60}")
+                print(f"WebSocket Connection Error: {e}")
+                if close_code:
+                    print(f"Close Code: {close_code}")
+                if close_reason:
+                    print(f"Close Reason: {close_reason}")
+                print(f"{'='*60}")
+                
+                # Provide guidance for common errors
+                if close_code in [1008, 1011]:  # Policy violation or server error
+                    print("\n⚠️  Server rejected connection")
+                    print("\nThis might be a temporary server issue.")
+                else:
+                    print("\n⚠️  Connection was closed unexpectedly")
+                    print("\nCommon fixes:")
+                    print("   1. Check your internet connection")
+                    print("   2. Verify the server is accessible")
+                
+                print(f"\n{'='*60}")
+                print(f"Retrying in {sleep_time} seconds...")
+                print(f"{'='*60}\n")
+                
+                await asyncio.sleep(sleep_time)
+                sleep_time = min(sleep_time * 2, self.max_sleep)
+                
             except Exception as e:
                 error_msg = str(e).lower()
                 print(f"\n{'='*60}")
