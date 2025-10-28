@@ -433,7 +433,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.25"
+VERSION = "0.0.26"
 
 @dataclass
 class Config:
@@ -943,7 +943,9 @@ def _press_key_with_scancode(key: str, key_up: bool = False):
         key: Key name (e.g., 'tab', 'ctrl', 'a')
         key_up: True to release, False to press
     """
-    key_lower = key.lower()
+    # Normalize key name: lowercase and remove underscores
+    # This allows both "Page_Down" and "pagedown" to work
+    key_lower = key.lower().replace('_', '')
     
     # Check all scan code maps
     scan_code = (MODIFIER_SCANCODES.get(key_lower) or 
