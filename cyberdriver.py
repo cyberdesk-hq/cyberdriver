@@ -71,7 +71,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response, JSONResponse
 import uvicorn
 import websockets
-from websockets.exceptions import ConnectionClosed, InvalidStatusCode
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 # -----------------------------------------------------------------------------
 # Windows Administrator Check and Elevation
@@ -433,7 +433,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.25"
+VERSION = "0.0.26"
 
 @dataclass
 class Config:
@@ -943,7 +943,9 @@ def _press_key_with_scancode(key: str, key_up: bool = False):
         key: Key name (e.g., 'tab', 'ctrl', 'a')
         key_up: True to release, False to press
     """
-    key_lower = key.lower()
+    # Normalize key name: lowercase and remove underscores
+    # This allows both "Page_Down" and "pagedown" to work
+    key_lower = key.lower().replace('_', '')
     
     # Check all scan code maps
     scan_code = (MODIFIER_SCANCODES.get(key_lower) or 
@@ -1624,7 +1626,7 @@ class TunnelClient:
             except asyncio.CancelledError:
                 # Allow task cancellation to stop the tunnel immediately
                 raise
-            except (ConnectionClosed, InvalidStatusCode) as e:
+            except (ConnectionClosed, InvalidStatus) as e:
                 # Handle WebSocket close codes specially
                 close_code = None
                 close_reason = None
@@ -1632,9 +1634,9 @@ class TunnelClient:
                 if isinstance(e, ConnectionClosed):
                     close_code = (e.rcvd.code if e.rcvd else None) or (e.sent.code if e.sent else None)
                     close_reason = (e.rcvd.reason if e.rcvd else None) or (e.sent.reason if e.sent else None)
-                elif isinstance(e, InvalidStatusCode):
+                elif isinstance(e, InvalidStatus):
                     # Server rejected connection before WebSocket handshake
-                    close_code = e.status_code
+                    close_code = e.response.status_code
                     # Try to extract reason from exception message
                     close_reason = str(e)
                 
@@ -1645,7 +1647,7 @@ class TunnelClient:
                 
                 if is_auth_error:
                     print(f"\n{'='*60}")
-                    print(f"❌ Authentication Failed ")
+                    print(f"❌ Authentication Failed")
                     print(f"{'='*60}")
                     print(f"\nReason: {close_reason or 'Invalid or expired API key'}")
                     print("\n⚠️  Cyberdriver will NOT retry to prevent excessive API key validation attempts.")
