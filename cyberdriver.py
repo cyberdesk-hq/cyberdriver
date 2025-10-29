@@ -337,8 +337,119 @@ def setup_persistent_display_if_needed() -> bool:
 
 
 # -----------------------------------------------------------------------------
-# Windows Console Fix
+# Windows Console Fix and Protection
 # -----------------------------------------------------------------------------
+
+def disable_windows_console_close_button():
+    """Disable the close button (X) on Windows console to prevent accidental termination.
+    
+    This prevents the agent from accidentally closing the cyberdriver window,
+    which would disconnect the machine. The console can still be closed via Ctrl+C.
+    Minimize and maximize buttons remain functional.
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    if platform.system() != "Windows":
+        return False
+    
+    try:
+        import ctypes
+        
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+        
+        # Get console window handle
+        console_window = kernel32.GetConsoleWindow()
+        
+        if console_window:
+            # Get system menu
+            hmenu = user32.GetSystemMenu(console_window, False)
+            
+            if hmenu:
+                # Disable close button (SC_CLOSE = 0xF060) without removing system menu
+                # This keeps minimize/maximize buttons functional
+                SC_CLOSE = 0xF060
+                MF_GRAYED = 0x00000001
+                MF_BYCOMMAND = 0x00000000
+                user32.EnableMenuItem(hmenu, SC_CLOSE, MF_GRAYED | MF_BYCOMMAND)
+                
+                print("✓ Console close button disabled (use Ctrl+C to exit)")
+                return True
+        
+        return False
+            
+    except Exception as e:
+        print(f"Note: Could not disable close button: {e}")
+        return False
+
+
+def restore_windows_console_close_button():
+    """Restore the close button (X) on Windows console.
+    
+    Called during shutdown to restore normal console behavior.
+    """
+    if platform.system() != "Windows":
+        return False
+    
+    try:
+        import ctypes
+        
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+        
+        # Get console window handle
+        console_window = kernel32.GetConsoleWindow()
+        
+        if console_window:
+            # Get system menu
+            hmenu = user32.GetSystemMenu(console_window, False)
+            
+            if hmenu:
+                # Re-enable close button (SC_CLOSE = 0xF060)
+                SC_CLOSE = 0xF060
+                MF_ENABLED = 0x00000000
+                MF_BYCOMMAND = 0x00000000
+                user32.EnableMenuItem(hmenu, SC_CLOSE, MF_ENABLED | MF_BYCOMMAND)
+                return True
+        
+        return False
+            
+    except Exception:
+        # Silently fail - this is cleanup, not critical
+        return False
+
+
+def minimize_console_window():
+    """Minimize the console window on Windows to keep it out of the way.
+    
+    This helps prevent the agent from accidentally interacting with the console.
+    """
+    if platform.system() != "Windows":
+        return False
+    
+    try:
+        import ctypes
+        
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+        
+        # Get console window handle
+        console_window = kernel32.GetConsoleWindow()
+        
+        if console_window:
+            # SW_MINIMIZE = 6
+            SW_MINIMIZE = 6
+            user32.ShowWindow(console_window, SW_MINIMIZE)
+            print("✓ Console window minimized")
+            return True
+        
+        return False
+            
+    except Exception as e:
+        print(f"Note: Could not minimize console: {e}")
+        return False
+
 
 def disable_windows_console_quickedit():
     """Disable QuickEdit mode in Windows console to prevent output blocking.
@@ -423,7 +534,7 @@ async def connect_with_headers(uri, headers_dict):
         pass
     
     # Last resort - connect without headers
-    print("WARNING: Could not send custom headers with WebSocket connection")
+    print("WARNING: Could not send custom headers with WebSocket connection ")
     print("This may cause authentication to fail ")
     return await websockets.connect(uri, **ws_kwargs)
 
@@ -433,7 +544,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.27"
+VERSION = "0.0.28"
 
 @dataclass
 class Config:
@@ -2584,6 +2695,8 @@ def run_coords_capture():
 def signal_handler(signum, frame):
     """Handle Ctrl+C gracefully."""
     print("\n\nReceived interrupt signal. Shutting down gracefully...")
+    # Restore close button before shutdown
+    restore_windows_console_close_button()
     # The finally block in main() will handle cleanup
     sys.exit(0)
 
@@ -2830,6 +2943,31 @@ def main():
     # Disable Windows console QuickEdit mode to prevent output blocking
     disable_windows_console_quickedit()
     
+    # For "join" command, protect the console window from being closed by the agent
+    if args.command == "join" and platform.system() == "Windows":
+        print("\n" + "="*60)
+        print("Protecting Console Window")
+        print("="*60)
+        print("To prevent accidental termination by automated agents:")
+        
+        # Disable close button
+        if disable_windows_console_close_button():
+            print("  → Close button has been disabled")
+        else:
+            print("  → Could not disable close button (running anyway)")
+        
+        # Minimize window to keep it out of the way
+        if minimize_console_window():
+            print("  → Console window minimized")
+        else:
+            print("  → Could not minimize window (running anyway)")
+        
+        print("\nTo stop cyberdriver, use Ctrl+C in this window")
+        print("="*60 + "\n")
+        
+        # Small delay to let user see the messages before window minimizes
+        time.sleep(2)
+    
     try:
         if args.command == "start":
             actual_port = find_available_port("0.0.0.0", args.port)
@@ -2847,7 +2985,7 @@ def main():
                 except:
                     print(f"√ Cyberdriver server starting on http://0.0.0.0:{actual_port}")
             else:
-                print(f"✓ Cyberdriver server starting on http://0.0.0.0:{actual_port}")
+                print(f"✓ Cyberdriver server starting on http://0.0.0.0:{actual_port} ")
             run_server(actual_port)
         
         elif args.command == "coords":
@@ -2874,6 +3012,12 @@ def main():
         print(f"\nAn unexpected error occurred: {e}")
         sys.exit(1)
     finally:
+        # Restore close button if it was disabled
+        try:
+            if hasattr(args, 'command') and args.command == "join" and platform.system() == "Windows":
+                restore_windows_console_close_button()
+        except:
+            pass  # Silently fail if args not available
         print("Cleanup complete.")
 
 

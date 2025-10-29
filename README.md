@@ -48,7 +48,7 @@ $toolDir = "$env:USERPROFILE\.cyberdriver"
 New-Item -ItemType Directory -Force -Path $toolDir
 
 # Download cyberdriver
-Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.27/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe"
+Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.28/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe"
 
 # Add to PATH if not already there
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -63,7 +63,7 @@ Write-Host "Cyberdriver installed! You may need to restart your terminal for PAT
 
 ```bash
 # Choose version and target directory
-VERSION=0.0.27
+VERSION=0.0.28
 TOOL_DIR="$HOME/.cyberdriver"
 mkdir -p "$TOOL_DIR"
 
@@ -114,6 +114,24 @@ Or subscribed for remote use via Cyberdesk cloud:
 ```bash
 cyberdriver join --secret SK-YOUR-SECRET-KEY
 ```
+
+## Agent Protection (Preventing Accidental Termination)
+
+When running cyberdriver on Windows, the console window is visible and can be accidentally closed by AI agents during automated workflows. We provide these built in protections:
+
+### Built-in Protections (Automatic)
+
+When you run `cyberdriver join` on Windows, protection is automatically enabled:
+- **Close button disabled** - The X button is grayed out and non-functional
+- **Window minimized** - Console minimizes to taskbar, staying out of the agent's way
+- **QuickEdit disabled** - Prevents console hanging if clicked
+
+No extra setup needed! Just run:
+```bash
+cyberdriver join --secret YOUR_API_KEY
+```
+
+**To stop:** Use `Ctrl+C` in the console or Task Manager
 
 ## Common Issues
 
@@ -282,7 +300,7 @@ Configuration is stored in:
 The config file contains:
 ```json
 {
-  "version": "0.0.27",
+  "version": "0.0.28",
   "fingerprint": "uuid-v4-string"
 }
 ```
