@@ -345,6 +345,10 @@ def disable_windows_console_close_button():
     
     This prevents the agent from accidentally closing the cyberdriver window,
     which would disconnect the machine. The console can still be closed via Ctrl+C.
+    Minimize and maximize buttons remain functional.
+    
+    Returns:
+        True if successful, False otherwise
     """
     if platform.system() != "Windows":
         return False
@@ -363,18 +367,12 @@ def disable_windows_console_close_button():
             hmenu = user32.GetSystemMenu(console_window, False)
             
             if hmenu:
-                # Disable close button (SC_CLOSE = 0xF060)
+                # Disable close button (SC_CLOSE = 0xF060) without removing system menu
+                # This keeps minimize/maximize buttons functional
                 SC_CLOSE = 0xF060
                 MF_GRAYED = 0x00000001
-                user32.EnableMenuItem(hmenu, SC_CLOSE, MF_GRAYED)
-                
-                # Also disable the X button visually
-                GWL_STYLE = -16
-                WS_SYSMENU = 0x00080000
-                style = user32.GetWindowLongW(console_window, GWL_STYLE)
-                # Remove system menu (which includes close button)
-                # But keep minimize/maximize
-                user32.SetWindowLongW(console_window, GWL_STYLE, style & ~WS_SYSMENU)
+                MF_BYCOMMAND = 0x00000000
+                user32.EnableMenuItem(hmenu, SC_CLOSE, MF_GRAYED | MF_BYCOMMAND)
                 
                 print("✓ Console close button disabled (use Ctrl+C to exit)")
                 return True
@@ -383,6 +381,42 @@ def disable_windows_console_close_button():
             
     except Exception as e:
         print(f"Note: Could not disable close button: {e}")
+        return False
+
+
+def restore_windows_console_close_button():
+    """Restore the close button (X) on Windows console.
+    
+    Called during shutdown to restore normal console behavior.
+    """
+    if platform.system() != "Windows":
+        return False
+    
+    try:
+        import ctypes
+        
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+        
+        # Get console window handle
+        console_window = kernel32.GetConsoleWindow()
+        
+        if console_window:
+            # Get system menu
+            hmenu = user32.GetSystemMenu(console_window, False)
+            
+            if hmenu:
+                # Re-enable close button (SC_CLOSE = 0xF060)
+                SC_CLOSE = 0xF060
+                MF_ENABLED = 0x00000000
+                MF_BYCOMMAND = 0x00000000
+                user32.EnableMenuItem(hmenu, SC_CLOSE, MF_ENABLED | MF_BYCOMMAND)
+                return True
+        
+        return False
+            
+    except Exception:
+        # Silently fail - this is cleanup, not critical
         return False
 
 
@@ -2661,6 +2695,8 @@ def run_coords_capture():
 def signal_handler(signum, frame):
     """Handle Ctrl+C gracefully."""
     print("\n\nReceived interrupt signal. Shutting down gracefully...")
+    # Restore close button before shutdown
+    restore_windows_console_close_button()
     # The finally block in main() will handle cleanup
     sys.exit(0)
 
@@ -2976,6 +3012,12 @@ def main():
         print(f"\nAn unexpected error occurred: {e}")
         sys.exit(1)
     finally:
+        # Restore close button if it was disabled
+        try:
+            if hasattr(args, 'command') and args.command == "join" and platform.system() == "Windows":
+                restore_windows_console_close_button()
+        except:
+            pass  # Silently fail if args not available
         print("Cleanup complete.")
 
 
