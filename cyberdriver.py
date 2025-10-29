@@ -420,37 +420,6 @@ def restore_windows_console_close_button():
         return False
 
 
-def minimize_console_window():
-    """Minimize the console window on Windows to keep it out of the way.
-    
-    This helps prevent the agent from accidentally interacting with the console.
-    """
-    if platform.system() != "Windows":
-        return False
-    
-    try:
-        import ctypes
-        
-        kernel32 = ctypes.windll.kernel32
-        user32 = ctypes.windll.user32
-        
-        # Get console window handle
-        console_window = kernel32.GetConsoleWindow()
-        
-        if console_window:
-            # SW_MINIMIZE = 6
-            SW_MINIMIZE = 6
-            user32.ShowWindow(console_window, SW_MINIMIZE)
-            print("✓ Console window minimized")
-            return True
-        
-        return False
-            
-    except Exception as e:
-        print(f"Note: Could not minimize console: {e}")
-        return False
-
-
 def disable_windows_console_quickedit():
     """Disable QuickEdit mode in Windows console to prevent output blocking.
     
@@ -544,7 +513,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.28"
+VERSION = "0.0.29"
 
 @dataclass
 class Config:
@@ -2945,28 +2914,9 @@ def main():
     
     # For "join" command, protect the console window from being closed by the agent
     if args.command == "join" and platform.system() == "Windows":
-        print("\n" + "="*60)
-        print("Protecting Console Window")
-        print("="*60)
-        print("To prevent accidental termination by automated agents:")
-        
         # Disable close button
         if disable_windows_console_close_button():
-            print("  → Close button has been disabled")
-        else:
-            print("  → Could not disable close button (running anyway)")
-        
-        # Minimize window to keep it out of the way
-        if minimize_console_window():
-            print("  → Console window minimized")
-        else:
-            print("  → Could not minimize window (running anyway)")
-        
-        print("\nTo stop cyberdriver, use Ctrl+C in this window")
-        print("="*60 + "\n")
-        
-        # Small delay to let user see the messages before window minimizes
-        time.sleep(2)
+            print("✓ Console close button disabled (use Ctrl+C to exit)")
     
     try:
         if args.command == "start":
