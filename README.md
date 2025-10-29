@@ -115,6 +115,24 @@ Or subscribed for remote use via Cyberdesk cloud:
 cyberdriver join --secret SK-YOUR-SECRET-KEY
 ```
 
+## Agent Protection (Preventing Accidental Termination)
+
+When running cyberdriver on Windows, the console window is visible and can be accidentally closed by AI agents during automated workflows. We provide these built in protections:
+
+### Built-in Protections (Automatic)
+
+When you run `cyberdriver join` on Windows, protection is automatically enabled:
+- **Close button disabled** - The X button is grayed out and non-functional
+- **Window minimized** - Console minimizes to taskbar, staying out of the agent's way
+- **QuickEdit disabled** - Prevents console hanging if clicked
+
+No extra setup needed! Just run:
+```bash
+cyberdriver join --secret YOUR_API_KEY
+```
+
+**To stop:** Use `Ctrl+C` in the console or Task Manager
+
 ## Common Issues
 
 ### TLS Certificate Errors

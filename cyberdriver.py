@@ -337,8 +337,85 @@ def setup_persistent_display_if_needed() -> bool:
 
 
 # -----------------------------------------------------------------------------
-# Windows Console Fix
+# Windows Console Fix and Protection
 # -----------------------------------------------------------------------------
+
+def disable_windows_console_close_button():
+    """Disable the close button (X) on Windows console to prevent accidental termination.
+    
+    This prevents the agent from accidentally closing the cyberdriver window,
+    which would disconnect the machine. The console can still be closed via Ctrl+C.
+    """
+    if platform.system() != "Windows":
+        return False
+    
+    try:
+        import ctypes
+        
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+        
+        # Get console window handle
+        console_window = kernel32.GetConsoleWindow()
+        
+        if console_window:
+            # Get system menu
+            hmenu = user32.GetSystemMenu(console_window, False)
+            
+            if hmenu:
+                # Disable close button (SC_CLOSE = 0xF060)
+                SC_CLOSE = 0xF060
+                MF_GRAYED = 0x00000001
+                user32.EnableMenuItem(hmenu, SC_CLOSE, MF_GRAYED)
+                
+                # Also disable the X button visually
+                GWL_STYLE = -16
+                WS_SYSMENU = 0x00080000
+                style = user32.GetWindowLongW(console_window, GWL_STYLE)
+                # Remove system menu (which includes close button)
+                # But keep minimize/maximize
+                user32.SetWindowLongW(console_window, GWL_STYLE, style & ~WS_SYSMENU)
+                
+                print("✓ Console close button disabled (use Ctrl+C to exit)")
+                return True
+        
+        return False
+            
+    except Exception as e:
+        print(f"Note: Could not disable close button: {e}")
+        return False
+
+
+def minimize_console_window():
+    """Minimize the console window on Windows to keep it out of the way.
+    
+    This helps prevent the agent from accidentally interacting with the console.
+    """
+    if platform.system() != "Windows":
+        return False
+    
+    try:
+        import ctypes
+        
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+        
+        # Get console window handle
+        console_window = kernel32.GetConsoleWindow()
+        
+        if console_window:
+            # SW_MINIMIZE = 6
+            SW_MINIMIZE = 6
+            user32.ShowWindow(console_window, SW_MINIMIZE)
+            print("✓ Console window minimized")
+            return True
+        
+        return False
+            
+    except Exception as e:
+        print(f"Note: Could not minimize console: {e}")
+        return False
+
 
 def disable_windows_console_quickedit():
     """Disable QuickEdit mode in Windows console to prevent output blocking.
@@ -2829,6 +2906,31 @@ def main():
     
     # Disable Windows console QuickEdit mode to prevent output blocking
     disable_windows_console_quickedit()
+    
+    # For "join" command, protect the console window from being closed by the agent
+    if args.command == "join" and platform.system() == "Windows":
+        print("\n" + "="*60)
+        print("Protecting Console Window")
+        print("="*60)
+        print("To prevent accidental termination by automated agents:")
+        
+        # Disable close button
+        if disable_windows_console_close_button():
+            print("  → Close button has been disabled")
+        else:
+            print("  → Could not disable close button (running anyway)")
+        
+        # Minimize window to keep it out of the way
+        if minimize_console_window():
+            print("  → Console window minimized")
+        else:
+            print("  → Could not minimize window (running anyway)")
+        
+        print("\nTo stop cyberdriver, use Ctrl+C in this window")
+        print("="*60 + "\n")
+        
+        # Small delay to let user see the messages before window minimizes
+        time.sleep(2)
     
     try:
         if args.command == "start":
