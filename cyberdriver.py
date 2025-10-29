@@ -2949,7 +2949,7 @@ def main():
                 except:
                     print(f"√ Cyberdriver server starting on http://0.0.0.0:{actual_port}")
             else:
-                print(f"✓ Cyberdriver server starting on http://0.0.0.0:{actual_port}")
+                print(f"✓ Cyberdriver server starting on http://0.0.0.0:{actual_port} ")
             run_server(actual_port)
         
         elif args.command == "coords":
