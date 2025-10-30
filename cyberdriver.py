@@ -513,7 +513,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.29"
+VERSION = "0.0.30"
 
 @dataclass
 class Config:
@@ -1914,6 +1914,21 @@ class TunnelClient:
         if query:
             url += f"?{query}"
         
+        # For PowerShell exec requests, extract timeout from body and use custom client
+        # For all other requests, use the default client with 30s timeout
+        use_custom_timeout = False
+        request_timeout = 30.0
+        if path == "/computer/shell/powershell/exec" and body:
+            try:
+                import json
+                payload = json.loads(body.decode('utf-8'))
+                if "timeout" in payload:
+                    # Use exactly what the user specified - no overhead
+                    request_timeout = float(payload["timeout"])
+                    use_custom_timeout = True
+            except Exception:
+                pass  # Fall back to default client if parsing fails
+        
         try:
             # If a keepalive action is currently running, wait for it to finish
             if self.keepalive_manager is not None:
@@ -1923,19 +1938,43 @@ class TunnelClient:
                 # Record that we are actively processing a request
                 self.keepalive_manager.record_activity()
             # IMPORTANT: Use stream=True to avoid buffering the entire response
-            async with client.stream(method, url, headers=headers, content=body) as response:
-                print(f"{method} {path} -> {response.status_code}")
-                
-                # Read the response body immediately to avoid buffering
-                body_chunks = []
-                async for chunk in response.aiter_bytes():
-                    body_chunks.append(chunk)
-                
-                return {
-                    "status": response.status_code,
-                    "headers": dict(response.headers),
-                    "body": b''.join(body_chunks),
-                }
+            # For PowerShell exec with custom timeout, create a new client; otherwise use default
+            if use_custom_timeout:
+                timeout_obj = httpx.Timeout(
+                    connect=5.0,
+                    read=request_timeout,
+                    write=30.0,
+                    pool=30.0
+                )
+                async with httpx.AsyncClient(timeout=timeout_obj) as request_client:
+                    async with request_client.stream(method, url, headers=headers, content=body) as response:
+                        print(f"{method} {path} -> {response.status_code}")
+                        
+                        # Read the response body immediately to avoid buffering
+                        body_chunks = []
+                        async for chunk in response.aiter_bytes():
+                            body_chunks.append(chunk)
+                        
+                        return {
+                            "status": response.status_code,
+                            "headers": dict(response.headers),
+                            "body": b''.join(body_chunks),
+                        }
+            else:
+                # Use default client for all other requests (30s timeout) 
+                async with client.stream(method, url, headers=headers, content=body) as response:
+                    print(f"{method} {path} -> {response.status_code}")
+                    
+                    # Read the response body immediately to avoid buffering
+                    body_chunks = []
+                    async for chunk in response.aiter_bytes():
+                        body_chunks.append(chunk)
+                    
+                    return {
+                        "status": response.status_code,
+                        "headers": dict(response.headers),
+                        "body": b''.join(body_chunks),
+                    }
         except Exception as e:
             return {
                 "status": 500,
