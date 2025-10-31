@@ -45,6 +45,7 @@ import json
 import os
 import platform
 import pathlib
+import re
 import socket
 import subprocess
 import sys
@@ -1781,7 +1782,6 @@ class TunnelClient:
                     if close_reason:
                         try:
                             # Parse "Wait 60 seconds" or similar
-                            import re
                             match = re.search(r'Wait (\d+) seconds', close_reason)
                             if match:
                                 wait_seconds = int(match.group(1))
