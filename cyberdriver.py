@@ -533,7 +533,7 @@ async def connect_with_headers(uri, headers_dict):
         pass
     
     # Last resort - connect without headers
-    print("WARNING: Could not send custom headers with WebSocket connection ")
+    print("WARNING: Could not send custom headers with WebSocket connection")
     print("This may cause authentication to fail ")
     return await websockets.connect(uri, **ws_kwargs)
 
