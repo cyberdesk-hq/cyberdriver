@@ -74,6 +74,36 @@ import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 # -----------------------------------------------------------------------------
+# Output Truncation for Terminal Commands
+# -----------------------------------------------------------------------------
+
+# Maximum length for terminal command output to prevent token limit issues
+MAX_OUTPUT_LEN: int = 15000
+
+def maybe_truncate_output(content: str, max_length: int = MAX_OUTPUT_LEN) -> str:
+    """Truncate content in the middle if it exceeds the specified length.
+    
+    Shows the beginning and end of the output with a clear truncation marker in the middle.
+    This allows seeing both the start (usually important context) and end (usually the result).
+    """
+    if not content or len(content) <= max_length:
+        return content
+    
+    # Calculate how much to keep from start and end
+    truncation_message = "\n\n... [OUTPUT TRUNCATED - {} characters hidden] ...\n\n"
+    
+    # Reserve space for the truncation message (estimate ~60 chars)
+    available_space = max_length - 60
+    chars_per_side = available_space // 2
+    
+    # Get the start and end portions
+    start = content[:chars_per_side]
+    end = content[-chars_per_side:]
+    hidden_chars = len(content) - (chars_per_side * 2)
+    
+    return start + truncation_message.format(hidden_chars) + end
+
+# -----------------------------------------------------------------------------
 # Windows Administrator Check and Elevation
 # -----------------------------------------------------------------------------
 
@@ -513,7 +543,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.30"
+VERSION = "0.0.31"
 
 @dataclass
 class Config:
@@ -1503,9 +1533,13 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
         stdout_lines = [line.rstrip() for line in stdout.splitlines() if line.strip()]
         stderr_lines = [line.rstrip() for line in stderr.splitlines() if line.strip()]
         
+        # Truncate output to prevent token limit issues
+        stdout_output = maybe_truncate_output("\n".join(stdout_lines))
+        stderr_output = maybe_truncate_output("\n".join(stderr_lines))
+        
         return {
-            "stdout": "\n".join(stdout_lines),
-            "stderr": "\n".join(stderr_lines),
+            "stdout": stdout_output,
+            "stderr": stderr_output,
             "exit_code": process.returncode,
             "session_id": session_id
         }
@@ -1521,12 +1555,13 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
             "timeout_reached": True  # New flag to indicate timeout (not error)
         }
     except Exception as e:
+        error_msg = maybe_truncate_output(str(e))
         return {
             "stdout": "",
-            "stderr": str(e),
+            "stderr": error_msg,
             "exit_code": -1,
             "session_id": session_id,
-            "error": str(e)
+            "error": error_msg
         }
 
 @app.post("/computer/shell/powershell/simple")
@@ -1551,13 +1586,13 @@ async def simple_powershell_test():
         
         return {
             "returncode": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr
+            "stdout": maybe_truncate_output(result.stdout),
+            "stderr": maybe_truncate_output(result.stderr)
         }
     except subprocess.TimeoutExpired:
         return {"error": "Command timed out"}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": maybe_truncate_output(str(e))}
 
 @app.post("/computer/shell/powershell/test")
 async def test_powershell():
@@ -1738,6 +1773,34 @@ class TunnelClient:
                     print(f"\n{'='*60}\n")
                     # Exit instead of retrying
                     sys.exit(1)
+                
+                # Rate limit handling - custom close code 4008
+                if close_code == 4008:
+                    # Extract wait duration from reason (format: "Wait X seconds")
+                    wait_seconds = 60  # Default
+                    if close_reason:
+                        try:
+                            # Parse "Wait 60 seconds" or similar
+                            import re
+                            match = re.search(r'Wait (\d+) seconds', close_reason)
+                            if match:
+                                wait_seconds = int(match.group(1))
+                        except:
+                            pass
+                    
+                    print(f"\n{'='*60}")
+                    print(f"⚠️  Rate Limit Exceeded")
+                    print(f"{'='*60}")
+                    print(f"\nYou've reconnected too frequently.")
+                    print(f"This helps prevent server overload and protects your account.")
+                    print(f"\n⏱️  Waiting {wait_seconds} seconds before reconnecting...")
+                    print(f"{'='*60}\n")
+                    
+                    # Wait the exact duration (don't use exponential backoff)
+                    await asyncio.sleep(wait_seconds)
+                    # Reset sleep time after rate limit wait
+                    sleep_time = self.min_sleep
+                    continue
                 
                 # For other close codes, continue with exponential backoff
                 error_msg = str(e).lower()
