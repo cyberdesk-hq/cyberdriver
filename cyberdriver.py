@@ -544,7 +544,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.31"
+VERSION = "0.0.32"
 
 @dataclass
 class Config:
@@ -1988,7 +1988,7 @@ class TunnelClient:
                 if "timeout" in payload:
                     # Add buffer to prevent race condition with subprocess timeout
                     # The local FastAPI will timeout the subprocess at exactly `timeout` seconds,
-                    # so we need to wait slightly longer to receive that response
+                    # so we need to wait slightly longer to receive that response 
                     request_timeout = float(payload["timeout"]) + 3.0  # 3s buffer for local processing
                     use_custom_timeout = True
             except Exception:
