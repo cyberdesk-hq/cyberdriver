@@ -1477,6 +1477,8 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
     import subprocess
     import threading
     
+    print(f"🔧 [Layer 6: Cyberdriver] Executing command with subprocess timeout={timeout}s")
+    
     # For clean output, we'll use a different approach - execute each command as a separate process
     # This avoids the echo/prompt issues with interactive PowerShell
     
@@ -1528,7 +1530,9 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
         )
         
         # Wait for completion with timeout
+        print(f"⏳ [Layer 6: Cyberdriver] Waiting for subprocess (PID {process.pid}) with timeout={timeout}s")
         stdout, stderr = process.communicate(timeout=timeout)
+        print(f"✅ [Layer 6: Cyberdriver] Subprocess completed with exit_code={process.returncode}")
         
         # Clean output - remove empty lines at start/end
         stdout_lines = [line.rstrip() for line in stdout.splitlines() if line.strip()]
@@ -1548,6 +1552,7 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
     except subprocess.TimeoutExpired:
         # Don't kill the process - let it continue in background
         # Just return a message indicating timeout while command continues
+        print(f"⏰ [Layer 6: Cyberdriver] Subprocess timeout reached after {timeout}s (process continues in background)")
         return {
             "stdout": "",
             "stderr": f"Command timeout reached after {timeout} seconds. Process continues in background.",
@@ -1991,7 +1996,9 @@ class TunnelClient:
                     # so we need to wait slightly longer to receive that response 
                     request_timeout = float(payload["timeout"]) + 3.0  # 3s buffer for local processing
                     use_custom_timeout = True
-            except Exception:
+                    print(f"🔧 Tunnel: PowerShell command timeout={payload['timeout']}s, setting HTTP timeout={request_timeout}s")
+            except Exception as e:
+                print(f"⚠️  Tunnel: Failed to parse timeout from body: {e}")
                 pass  # Fall back to default client if parsing fails
         
         try:
@@ -2005,6 +2012,8 @@ class TunnelClient:
             # IMPORTANT: Use stream=True to avoid buffering the entire response
             # For PowerShell exec with custom timeout, create a new client; otherwise use default
             if use_custom_timeout:
+                print(f"🔧 [Layer 5: Tunnel] PowerShell request detected, HTTP timeout={request_timeout}s")
+            if use_custom_timeout:
                 timeout_obj = httpx.Timeout(
                     connect=5.0,
                     read=request_timeout,  # Now includes buffer to avoid race with subprocess timeout
@@ -2013,7 +2022,7 @@ class TunnelClient:
                 )
                 async with httpx.AsyncClient(timeout=timeout_obj) as request_client:
                     async with request_client.stream(method, url, headers=headers, content=body) as response:
-                        print(f"{method} {path} -> {response.status_code}")
+                        print(f"✅ [Layer 5: Tunnel] Received response from localhost: {method} {path} -> {response.status_code}")
                         
                         # Read the response body immediately to avoid buffering
                         body_chunks = []
