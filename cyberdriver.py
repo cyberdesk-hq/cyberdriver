@@ -73,6 +73,183 @@ from fastapi.responses import Response, JSONResponse
 import uvicorn
 import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatus
+from datetime import datetime
+
+# -----------------------------------------------------------------------------
+# Debug Logging System
+# -----------------------------------------------------------------------------
+
+class DebugLogger:
+    """Debug logger that writes semantic logs to daily files."""
+    
+    _instance: Optional["DebugLogger"] = None
+    
+    def __init__(self, enabled: bool = False, log_dir: Optional[str] = None):
+        self.enabled = enabled
+        self.log_dir = pathlib.Path(log_dir) if log_dir else pathlib.Path.home() / ".cyberdriver" / "logs"
+        self._current_date: Optional[str] = None
+        self._log_file: Optional[pathlib.Path] = None
+        self._connection_count = 0
+        self._start_time = time.time()
+        
+        if self.enabled:
+            self._ensure_log_dir()
+            self._write_session_start()
+    
+    @classmethod
+    def get_instance(cls) -> "DebugLogger":
+        """Get the global debug logger instance."""
+        if cls._instance is None:
+            cls._instance = cls(enabled=False)
+        return cls._instance
+    
+    @classmethod
+    def initialize(cls, enabled: bool = False, log_dir: Optional[str] = None) -> "DebugLogger":
+        """Initialize the global debug logger."""
+        cls._instance = cls(enabled=enabled, log_dir=log_dir)
+        return cls._instance
+    
+    def _ensure_log_dir(self):
+        """Ensure log directory exists."""
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+    
+    def _get_log_file(self) -> pathlib.Path:
+        """Get the current log file path, rotating by day."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self._current_date != today:
+            self._current_date = today
+            self._log_file = self.log_dir / f"cyberdriver-{today}.log"
+        return self._log_file
+    
+    def _format_timestamp(self) -> str:
+        """Get formatted timestamp for log entries."""
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    
+    def _write(self, level: str, category: str, message: str, **context):
+        """Write a log entry."""
+        if not self.enabled:
+            return
+        
+        log_file = self._get_log_file()
+        timestamp = self._format_timestamp()
+        
+        # Format context as key=value pairs
+        context_str = ""
+        if context:
+            context_parts = [f"{k}={v}" for k, v in context.items()]
+            context_str = f" | {' | '.join(context_parts)}"
+        
+        log_line = f"[{timestamp}] [{level}] [{category}] {message}{context_str}\n"
+        
+        # Also print to console in debug mode
+        print(f"[DEBUG] [{category}] {message}", flush=True)
+        
+        # Write to file
+        try:
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(log_line)
+        except Exception as e:
+            print(f"[DEBUG] Failed to write log: {e}")
+    
+    def _write_session_start(self):
+        """Write session start marker."""
+        self._write("INFO", "SESSION", "=" * 60)
+        self._write("INFO", "SESSION", "Cyberdriver debug session started", 
+                    version=VERSION if 'VERSION' in globals() else "unknown",
+                    platform=platform.system(),
+                    python=sys.version.split()[0])
+        self._write("INFO", "SESSION", "=" * 60)
+    
+    # High-level semantic logging methods
+    def connection_attempt(self, uri: str, attempt_num: int):
+        """Log a connection attempt."""
+        self._connection_count += 1
+        self._write("INFO", "CONNECTION", f"Attempting connection #{self._connection_count}",
+                    uri=uri, attempt=attempt_num)
+    
+    def connection_established(self, uri: str):
+        """Log successful connection."""
+        self._write("INFO", "CONNECTION", "WebSocket connection established", uri=uri)
+    
+    def connection_failed(self, error: str, duration_seconds: float, error_type: str = "unknown"):
+        """Log connection failure."""
+        self._write("ERROR", "CONNECTION", f"Connection failed after {duration_seconds:.2f}s",
+                    error=error, error_type=error_type, duration=f"{duration_seconds:.2f}s")
+    
+    def connection_closed(self, reason: str, duration_seconds: float, close_code: Optional[int] = None):
+        """Log connection closed."""
+        self._write("INFO", "CONNECTION", f"Connection closed after {duration_seconds:.2f}s",
+                    reason=reason, duration=f"{duration_seconds:.2f}s", close_code=close_code)
+    
+    def message_loop_entered(self):
+        """Log entering the message loop."""
+        self._write("DEBUG", "MESSAGE_LOOP", "Entered message receive loop, waiting for requests")
+    
+    def message_received(self, msg_type: str, size: int = 0):
+        """Log message received."""
+        self._write("DEBUG", "MESSAGE_LOOP", f"Received {msg_type} message", size=size)
+    
+    def request_forwarded(self, method: str, path: str, status: int, duration_ms: float):
+        """Log HTTP request forwarded to local server."""
+        self._write("INFO", "REQUEST", f"{method} {path} -> {status}",
+                    method=method, path=path, status=status, duration_ms=f"{duration_ms:.1f}ms")
+    
+    def ping_sent(self):
+        """Log ping sent."""
+        self._write("DEBUG", "PING", "WebSocket ping sent")
+    
+    def pong_received(self, latency_ms: float):
+        """Log pong received."""
+        self._write("DEBUG", "PING", f"WebSocket pong received", latency_ms=f"{latency_ms:.1f}ms")
+    
+    def keepalive_action(self, action: str):
+        """Log keepalive action."""
+        self._write("INFO", "KEEPALIVE", f"Keepalive action: {action}")
+    
+    def error(self, category: str, message: str, **context):
+        """Log an error."""
+        self._write("ERROR", category, message, **context)
+    
+    def warning(self, category: str, message: str, **context):
+        """Log a warning."""
+        self._write("WARN", category, message, **context)
+    
+    def info(self, category: str, message: str, **context):
+        """Log info."""
+        self._write("INFO", category, message, **context)
+    
+    def debug(self, category: str, message: str, **context):
+        """Log debug info."""
+        self._write("DEBUG", category, message, **context)
+    
+    def resource_stats(self):
+        """Log current resource statistics."""
+        uptime = time.time() - self._start_time
+        stats = {
+            "uptime_seconds": f"{uptime:.1f}",
+            "asyncio_tasks": len(asyncio.all_tasks()) if asyncio.get_event_loop().is_running() else "N/A",
+            "thread_count": threading.active_count(),
+            "connection_attempts": self._connection_count,
+        }
+        
+        # Try to get more stats with psutil
+        try:
+            import psutil
+            process = psutil.Process()
+            stats["memory_mb"] = f"{process.memory_info().rss / (1024 * 1024):.1f}"
+            stats["open_files"] = len(process.open_files())
+            stats["connections"] = len(process.connections())
+        except ImportError:
+            pass
+        except Exception:
+            pass
+        
+        self._write("INFO", "RESOURCES", "Resource statistics", **stats)
+
+
+# Global debug logger - initialized in main()
+debug_logger = DebugLogger.get_instance()
+
 
 # -----------------------------------------------------------------------------
 # Output Truncation for Terminal Commands
@@ -515,6 +692,10 @@ async def connect_with_headers(uri, headers_dict):
         # Faster close handshakes
         "close_timeout": 3,
     }
+    
+    debug_logger.debug("WEBSOCKET", f"Connecting to {uri}",
+                       ping_interval=ws_kwargs['ping_interval'],
+                       ping_timeout=ws_kwargs['ping_timeout'])
     # Try websockets v15+ API (uses additional_headers)
     try:
         return await websockets.connect(uri, additional_headers=headers_dict, **ws_kwargs)
@@ -544,7 +725,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.32"
+VERSION = "0.0.33"
 
 @dataclass
 class Config:
@@ -782,6 +963,7 @@ pyautogui.FAILSAFE = False
 async def lifespan(app: FastAPI):
     """Manage application lifespan events."""
     # Startup
+    app.state.start_time = time.time()
     yield
     # Shutdown
     print("Shutting down...")
@@ -872,6 +1054,37 @@ async def post_remote_keepalive_disable():
         return Response(status_code=204)
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/internal/diagnostics")
+async def get_diagnostics():
+    """Get diagnostic information for debugging connection issues."""
+    import gc
+    
+    diagnostics = {
+        "timestamp": time.time(),
+        "uptime_seconds": time.time() - app.state.start_time if hasattr(app.state, "start_time") else None,
+        "platform": platform.system(),
+        "python_version": sys.version,
+        "asyncio_tasks": len(asyncio.all_tasks()),
+        "thread_count": threading.active_count(),
+        "gc_counts": gc.get_count(),
+    }
+    
+    # Add process-level info if available
+    try:
+        import psutil
+        process = psutil.Process()
+        diagnostics["memory_mb"] = process.memory_info().rss / (1024 * 1024)
+        diagnostics["open_files"] = len(process.open_files())
+        diagnostics["num_fds"] = process.num_fds() if hasattr(process, "num_fds") else None
+        diagnostics["connections"] = len(process.connections())
+    except ImportError:
+        diagnostics["psutil"] = "not installed (pip install psutil for more diagnostics)"
+    except Exception as e:
+        diagnostics["psutil_error"] = str(e)
+    
+    return diagnostics
 
 
 @app.get("/computer/display/screenshot", response_class=Response)
@@ -1727,6 +1940,7 @@ class TunnelClient:
         self.config = config
         self.min_sleep = 1
         self.max_sleep = 16
+        self._connection_attempt = 0
         self.keepalive_manager = keepalive_manager
         self.remote_keepalive_for_main_id = remote_keepalive_for_main_id
         
@@ -1755,6 +1969,12 @@ class TunnelClient:
                     close_code = e.response.status_code
                     # Try to extract reason from exception message
                     close_reason = str(e)
+                
+                debug_logger.connection_closed(
+                    close_reason or "Unknown", 
+                    0,  # Duration unknown at this point
+                    close_code=close_code
+                )
                 
                 # Authentication failures should NOT retry
                 # - Close code 4001 (WebSocket close after accept)
@@ -1850,6 +2070,17 @@ class TunnelClient:
                     print("\nPlease check:")
                     print("   1. Your API key is correct (from Cyberdesk dashboard)")
                     print("   2. The API key hasn't been regenerated recently")
+                
+                elif "errno 2" in error_msg or "no such file or directory" in error_msg:
+                    # This is a Windows-specific error that occurs when the server closes
+                    # the connection immediately after the handshake completes
+                    print("\n⚠️  Connection Closed by Server")
+                    print("\nThe server accepted the connection but then closed it.")
+                    print("\nPossible causes:")
+                    print("   1. Server is temporarily overloaded or restarting")
+                    print("   2. Network proxy/firewall interference")
+                    print("   3. Rapid reconnection attempts triggered rate limiting")
+                    print("\nThis usually resolves after a few retries.")
                     
                 else:
                     print("\n⚠️  Unknown Connection Error")
@@ -1886,12 +2117,21 @@ class TunnelClient:
             headers["X-Remote-Keepalive-For"] = self.remote_keepalive_for_main_id
         
         # Use compatibility wrapper for connection
+        self._connection_attempt += 1
+        debug_logger.connection_attempt(uri, self._connection_attempt)
+        
         try:
             websocket = await connect_with_headers(uri, headers)
         except Exception as e:
             # Re-raise with more context about what failed
             error_type = type(e).__name__
+            debug_logger.error("CONNECTION", f"Failed to connect: {e}", error_type=error_type)
             raise ConnectionError(f"{error_type}: {str(e)} (connecting to {uri})") from e
+        
+        # Track connection timing for debugging
+        connection_start_time = time.time()
+        debug_logger.connection_established(uri)
+        
         async with websocket:
             # Print success message with green checkmark
             # Ensure countdown line (if any) is cleared before printing
@@ -1933,41 +2173,69 @@ class TunnelClient:
                 timeout=httpx.Timeout(30.0, connect=5.0),
                 limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
             ) as http_client:
-                async for message in websocket:
-                    if isinstance(message, str):
-                        if message == "end":
-                            if request_meta:
-                                # Process complete request
-                                # Note activity (work received)
+                # Log entering message loop
+                debug_logger.message_loop_entered()
+                
+                try:
+                    async for message in websocket:
+                        if isinstance(message, str):
+                            if message == "end":
+                                if request_meta:
+                                    # Process complete request
+                                    # Note activity (work received)
+                                    if self.keepalive_manager is not None:
+                                        self.keepalive_manager.record_activity()
+                                    response = await self._forward_request(
+                                        request_meta, bytes(body_buffer), http_client
+                                    )
+                                    
+                                    # Send response
+                                    await self._send_response(websocket, request_meta, response)
+                                    
+                                    # Reset state
+                                    request_meta = None
+                                    body_buffer.clear()
+                            else:
+                                # New request metadata
+                                request_meta = json.loads(message)
+                                # Note activity as soon as we receive metadata
                                 if self.keepalive_manager is not None:
                                     self.keepalive_manager.record_activity()
-                                response = await self._forward_request(
-                                    request_meta, bytes(body_buffer), http_client
-                                )
-                                
-                                # Send response
-                                await self._send_response(websocket, request_meta, response)
-                                
-                                # Reset state
-                                request_meta = None
                                 body_buffer.clear()
                         else:
-                            # New request metadata
-                            request_meta = json.loads(message)
-                            # Note activity as soon as we receive metadata
-                            if self.keepalive_manager is not None:
-                                self.keepalive_manager.record_activity()
-                            body_buffer.clear()
-                    else:
-                        # Binary body chunk
-                        body_buffer.extend(message)
+                            # Binary body chunk
+                            body_buffer.extend(message)
+                except OSError as e:
+                    # Capture detailed info about the OS-level error
+                    import errno
+                    error_code = getattr(e, 'errno', None)
+                    error_name = errno.errorcode.get(error_code, 'UNKNOWN') if error_code else 'UNKNOWN'
+                    connection_duration = time.time() - connection_start_time
+                    
+                    debug_logger.connection_failed(
+                        str(e), 
+                        connection_duration, 
+                        error_type=f"OSError({error_code}:{error_name})"
+                    )
+                    
+                    # Also log resource stats on failure to help diagnose
+                    debug_logger.resource_stats()
+                    
+                    # Always print duration for immediate failures (< 5 seconds)
+                    if connection_duration < 5.0:
+                        print(f"[Connection failed after {connection_duration:.2f}s]")
+                    raise
 
                 # If we exit the async for without an exception, the server closed gracefully
+                connection_duration = time.time() - connection_start_time
+                debug_logger.connection_closed("Server closed connection", connection_duration)
+                
                 # Ensure we signal this to the reconnection loop by raising to trigger backoff
                 raise RuntimeError("WebSocket closed by server")
     
     async def _forward_request(self, meta: dict, body: bytes, client: httpx.AsyncClient) -> dict:
         """Forward request to local API."""
+        request_start = time.time()
         method = meta["method"].upper()
         path = meta["path"]
         query = meta.get("query", "")
@@ -2013,7 +2281,9 @@ class TunnelClient:
                 )
                 async with httpx.AsyncClient(timeout=timeout_obj) as request_client:
                     async with request_client.stream(method, url, headers=headers, content=body) as response:
+                        duration_ms = (time.time() - request_start) * 1000
                         print(f"{method} {path} -> {response.status_code}")
+                        debug_logger.request_forwarded(method, path, response.status_code, duration_ms)
                         
                         # Read the response body immediately to avoid buffering
                         body_chunks = []
@@ -2028,7 +2298,9 @@ class TunnelClient:
             else:
                 # Use default client for all other requests (30s timeout) 
                 async with client.stream(method, url, headers=headers, content=body) as response:
+                    duration_ms = (time.time() - request_start) * 1000
                     print(f"{method} {path} -> {response.status_code}")
+                    debug_logger.request_forwarded(method, path, response.status_code, duration_ms)
                     
                     # Read the response body immediately to avoid buffering
                     body_chunks = []
@@ -2041,6 +2313,8 @@ class TunnelClient:
                         "body": b''.join(body_chunks),
                     }
         except Exception as e:
+            duration_ms = (time.time() - request_start) * 1000
+            debug_logger.error("REQUEST", f"Request failed: {e}", method=method, path=path, duration_ms=f"{duration_ms:.1f}ms")
             return {
                 "status": 500,
                 "headers": {"content-type": "text/plain"},
@@ -2519,14 +2793,34 @@ class KeepAliveManager:
         self._countdown_active = True
 
 
+async def _periodic_resource_logger(interval_seconds: float = 300.0):
+    """Background task to log resource stats periodically."""
+    try:
+        while True:
+            await asyncio.sleep(interval_seconds)
+            debug_logger.resource_stats()
+    except asyncio.CancelledError:
+        pass
+
+
 async def run_join(host: str, port: int, secret: str, target_port: int, keepalive_enabled: bool = False, 
                    keepalive_threshold_minutes: float = 3.0, interactive: bool = False, 
                    register_as_keepalive_for: Optional[str] = None,
                    keepalive_click_x: Optional[int] = None, keepalive_click_y: Optional[int] = None,
                    black_screen_recovery_enabled: bool = False,
-                   black_screen_check_interval: float = 30.0):
+                   black_screen_check_interval: float = 30.0,
+                   debug_enabled: bool = False):
     """Run both API server and tunnel client."""
     config = get_config()
+    
+    # Log resource stats periodically in debug mode
+    resource_logger_task = None
+    if debug_enabled:
+        debug_logger.info("STARTUP", f"Starting cyberdriver join",
+                         host=host, port=port, target_port=target_port,
+                         keepalive=keepalive_enabled)
+        # Start periodic resource logging (every 5 minutes)
+        resource_logger_task = asyncio.create_task(_periodic_resource_logger(300.0))
     
     # Find an available port for the local server, starting with the one provided
     actual_target_port = find_available_port("127.0.0.1", target_port)
@@ -2638,6 +2932,8 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
         finally:
             await stop_keepalive()
             await stop_black_screen_recovery()
+            if resource_logger_task:
+                resource_logger_task.cancel()
     else:
         # Interactive CLI loop to Disable/Re-enable without killing process
         print("\nInteractive controls: [d] Disable, [e] Re-enable, [q] Quit, [h] Help")
@@ -2680,6 +2976,8 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
             await stop_tunnel()
             await stop_keepalive()
             await stop_black_screen_recovery()
+            if resource_logger_task:
+                resource_logger_task.cancel()
 
 
 def run_coords_capture():
@@ -2936,6 +3234,7 @@ def main():
     join_parser.add_argument("--add-persistent-display", action="store_true", help="Install and enable Amyuni virtual display driver for persistent display (Windows only, requires admin)")
     join_parser.add_argument("--interactive", action="store_true", help="Interactive CLI to Disable/Re-enable without exiting")
     join_parser.add_argument("--register-as-keepalive-for", type=str, default=None, help="Register this instance as the remote keepalive (host) for MAIN_MACHINE_ID")
+    join_parser.add_argument("--debug", action="store_true", help="Enable debug logging to ~/.cyberdriver/logs/ (daily log files)")
     
     # Parse arguments with error handling
     try:
@@ -2955,6 +3254,7 @@ def main():
         print("  join --secret KEY --keepalive             Enable keepalive")
         print("  join --secret KEY --black-screen-recovery Enable black screen detection (Windows)")
         print("  join --secret KEY --add-persistent-display Install virtual display driver (Windows)")
+        print("  join --secret KEY --debug                 Enable debug logging to ~/.cyberdriver/logs/")
         print("  coords                                    Capture screen coordinates (for keepalive)")
         print()
         print("For more info: cyberdriver join -h")
@@ -3046,6 +3346,13 @@ def main():
             run_coords_capture()
 
         elif args.command == "join":
+            # Initialize debug logger if --debug flag is set
+            debug_enabled = bool(getattr(args, "debug", False))
+            if debug_enabled:
+                global debug_logger
+                debug_logger = DebugLogger.initialize(enabled=True)
+                print(f"✓ Debug logging enabled. Logs will be written to: {debug_logger.log_dir}")
+            
             asyncio.run(run_join(
                 args.host,
                 args.port,
@@ -3059,6 +3366,7 @@ def main():
                 keepalive_click_y=getattr(args, "keepalive_click_y", None),
                 black_screen_recovery_enabled=bool(getattr(args, "black_screen_recovery", False)),
                 black_screen_check_interval=float(getattr(args, "black_screen_check_interval", 30.0)),
+                debug_enabled=debug_enabled,
             ))
     except KeyboardInterrupt:
         print("\n\nKeyboard interrupt received. Shutting down...")
