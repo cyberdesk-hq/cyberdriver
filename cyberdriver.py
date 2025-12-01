@@ -961,7 +961,7 @@ pyautogui.FAILSAFE = False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage application lifespan events. """
+    """Manage application lifespan events."""
     # Startup
     app.state.start_time = time.time()
     yield
