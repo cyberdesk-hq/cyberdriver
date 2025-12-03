@@ -1960,6 +1960,10 @@ async def post_powershell_session(payload: Dict[str, Any]):
 class TunnelClient:
     """WebSocket tunnel client with proper message framing."""
     
+    # Idempotency cache settings
+    IDEMPOTENCY_CACHE_TTL = 60.0  # Seconds to keep cached responses
+    IDEMPOTENCY_CACHE_MAX_SIZE = 1000  # Maximum number of cached responses
+    
     def __init__(self, host: str, port: int, secret: str, target_port: int, config: Config, keepalive_manager: Optional["KeepAliveManager"] = None, remote_keepalive_for_main_id: Optional[str] = None):
         self.host = host
         self.port = port
@@ -1971,6 +1975,10 @@ class TunnelClient:
         self._connection_attempt = 0
         self.keepalive_manager = keepalive_manager
         self.remote_keepalive_for_main_id = remote_keepalive_for_main_id
+        
+        # Idempotency cache: key -> (timestamp, response)
+        # Used to prevent duplicate execution of actions when retries occur
+        self._idempotency_cache: Dict[str, Tuple[float, dict]] = {}
         
     async def run(self):
         """Run the tunnel with exponential backoff reconnection."""
@@ -2263,13 +2271,61 @@ class TunnelClient:
                 # Ensure we signal this to the reconnection loop by raising to trigger backoff
                 raise RuntimeError("WebSocket closed by server")
     
+    def _cleanup_idempotency_cache(self) -> None:
+        """Remove expired entries from the idempotency cache."""
+        now = time.time()
+        # Use list() to snapshot items - cache may be modified concurrently
+        expired_keys = [
+            key for key, (timestamp, _) in list(self._idempotency_cache.items())
+            if now - timestamp > self.IDEMPOTENCY_CACHE_TTL
+        ]
+        for key in expired_keys:
+            # Use pop() to safely handle concurrent deletions
+            self._idempotency_cache.pop(key, None)
+        
+        # If cache is still too large, remove oldest entries
+        if len(self._idempotency_cache) > self.IDEMPOTENCY_CACHE_MAX_SIZE:
+            # Snapshot keys and their timestamps to avoid concurrent modification
+            sorted_keys = sorted(
+                list(self._idempotency_cache.keys()),
+                key=lambda k: self._idempotency_cache.get(k, (0,))[0]
+            )
+            # Remove oldest 20% of entries
+            to_remove = sorted_keys[:len(sorted_keys) // 5]
+            for key in to_remove:
+                # Use pop() to safely handle concurrent deletions
+                self._idempotency_cache.pop(key, None)
+    
     async def _forward_request(self, meta: dict, body: bytes, client: httpx.AsyncClient) -> dict:
-        """Forward request to local API."""
+        """Forward request to local API.
+        
+        Supports idempotency via the X-Idempotency-Key header. If a request with the
+        same idempotency key was processed recently (within IDEMPOTENCY_CACHE_TTL),
+        the cached response is returned without re-executing the action. This prevents
+        duplicate actions when retries occur due to network issues or timeouts.
+        """
         request_start = time.time()
         method = meta["method"].upper()
         path = meta["path"]
         query = meta.get("query", "")
         headers = meta.get("headers", {})
+        
+        # Check for idempotency key (case-insensitive header lookup)
+        idempotency_key: Optional[str] = None
+        for key, value in headers.items():
+            if key.lower() == "x-idempotency-key":
+                idempotency_key = value
+                break
+        
+        # If idempotency key provided, check cache first
+        if idempotency_key:
+            self._cleanup_idempotency_cache()
+            
+            if idempotency_key in self._idempotency_cache:
+                cached_time, cached_response = self._idempotency_cache[idempotency_key]
+                if time.time() - cached_time < self.IDEMPOTENCY_CACHE_TTL:
+                    print(f"[Idempotency] Returning cached response for {method} {path} (key: {idempotency_key[:8]}...)")
+                    return cached_response
         
         url = f"http://127.0.0.1:{self.target_port}{path}"
         if query:
@@ -2291,6 +2347,8 @@ class TunnelClient:
                     use_custom_timeout = True
             except Exception:
                 pass  # Fall back to default client if parsing fails
+        
+        result: Optional[dict] = None
         
         try:
             # If a keepalive action is currently running, wait for it to finish
@@ -2320,7 +2378,7 @@ class TunnelClient:
                         async for chunk in response.aiter_bytes():
                             body_chunks.append(chunk)
                         
-                        return {
+                        result = {
                             "status": response.status_code,
                             "headers": dict(response.headers),
                             "body": b''.join(body_chunks),
@@ -2337,7 +2395,7 @@ class TunnelClient:
                     async for chunk in response.aiter_bytes():
                         body_chunks.append(chunk)
                     
-                    return {
+                    result = {
                         "status": response.status_code,
                         "headers": dict(response.headers),
                         "body": b''.join(body_chunks),
@@ -2345,11 +2403,18 @@ class TunnelClient:
         except Exception as e:
             duration_ms = (time.time() - request_start) * 1000
             debug_logger.error("REQUEST", f"Request failed: {e}", method=method, path=path, duration_ms=f"{duration_ms:.1f}ms")
-            return {
+            result = {
                 "status": 500,
                 "headers": {"content-type": "text/plain"},
                 "body": str(e).encode(),
             }
+        
+        # Cache the response if idempotency key was provided and request was successful
+        # We cache even 500 errors to prevent retries from re-executing a failed action
+        if idempotency_key and result:
+            self._idempotency_cache[idempotency_key] = (time.time(), result)
+        
+        return result
     
     async def _send_response(self, websocket, request_meta: dict, response: dict):
         """Send response back through tunnel."""
@@ -2960,10 +3025,19 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
         except KeyboardInterrupt:
             print("\nShutting down...")
         finally:
+            # Stop tunnel first (graceful disconnect)
+            await stop_tunnel()
             await stop_keepalive()
             await stop_black_screen_recovery()
             if resource_logger_task:
                 resource_logger_task.cancel()
+            # Cancel server task last
+            if server_task and not server_task.done():
+                server_task.cancel()
+                try:
+                    await asyncio.wait_for(server_task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    pass
     else:
         # Interactive CLI loop to Disable/Re-enable without killing process
         print("\nInteractive controls: [d] Disable, [e] Re-enable, [q] Quit, [h] Help")
@@ -3008,6 +3082,13 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
             await stop_black_screen_recovery()
             if resource_logger_task:
                 resource_logger_task.cancel()
+            # Cancel server task last
+            if server_task and not server_task.done():
+                server_task.cancel()
+                try:
+                    await asyncio.wait_for(server_task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    pass
 
 
 def run_coords_capture():
