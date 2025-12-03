@@ -2330,11 +2330,9 @@ class TunnelClient:
         
         # If cache is still too large, remove oldest entries
         if len(self._idempotency_cache) > self.IDEMPOTENCY_CACHE_MAX_SIZE:
-            # Snapshot keys and their timestamps to avoid concurrent modification
-            sorted_keys = sorted(
-                list(self._idempotency_cache.keys()),
-                key=lambda k: self._idempotency_cache.get(k, (0,))[0]
-            )
+            # Snapshot keys and timestamps together to avoid race condition
+            snapshot = [(k, v[0]) for k, v in list(self._idempotency_cache.items())]
+            sorted_keys = [k for k, _ in sorted(snapshot, key=lambda x: x[1])]
             # Remove oldest 20% of entries
             to_remove = sorted_keys[:len(sorted_keys) // 5]
             for key in to_remove:
