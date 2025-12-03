@@ -244,6 +244,18 @@ class DebugLogger:
         except Exception:
             pass
         
+        # Add GDI handle count on Windows (critical for detecting leaks)
+        if platform.system() == "Windows":
+            try:
+                import ctypes
+                GetCurrentProcess = ctypes.windll.kernel32.GetCurrentProcess
+                GetGuiResources = ctypes.windll.user32.GetGuiResources
+                handle = GetCurrentProcess()
+                stats["gdi_objects"] = GetGuiResources(handle, 0)  # GR_GDIOBJECTS
+                stats["user_objects"] = GetGuiResources(handle, 1)  # GR_USEROBJECTS
+            except Exception:
+                pass
+        
         self._write("INFO", "RESOURCES", "Resource statistics", **stats)
 
 
@@ -1083,6 +1095,22 @@ async def get_diagnostics():
         diagnostics["psutil"] = "not installed (pip install psutil for more diagnostics)"
     except Exception as e:
         diagnostics["psutil_error"] = str(e)
+    
+    # Add GDI handle count on Windows (important for detecting leaks)
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            # GetGuiResources returns the count of GDI or USER objects
+            GetCurrentProcess = ctypes.windll.kernel32.GetCurrentProcess
+            GetGuiResources = ctypes.windll.user32.GetGuiResources
+            GR_GDIOBJECTS = 0
+            GR_USEROBJECTS = 1
+            handle = GetCurrentProcess()
+            diagnostics["gdi_objects"] = GetGuiResources(handle, GR_GDIOBJECTS)
+            diagnostics["user_objects"] = GetGuiResources(handle, GR_USEROBJECTS)
+        except Exception as e:
+            diagnostics["gdi_error"] = str(e)
     
     return diagnostics
 
