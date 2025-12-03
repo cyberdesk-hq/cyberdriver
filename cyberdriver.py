@@ -1210,6 +1210,48 @@ SHIFT_MAP = {
     '<': ',', '>': '.', '?': '/',
 }
 
+def _ensure_capslock_off_linux_sync():
+    """Linux-specific caps lock check (runs in thread pool due to subprocess)."""
+    try:
+        result = subprocess.run(['xset', 'q'], capture_output=True, text=True)
+        if 'Caps Lock:   on' in result.stdout:
+            pyautogui.press('capslock')
+            print("Caps Lock was ON - toggled OFF before typing")
+    except Exception:
+        pass
+
+
+async def _ensure_capslock_off():
+    """Ensure Caps Lock is in the OFF state before typing.
+    
+    This prevents case inversion issues when Caps Lock is accidentally left on
+    in the VM/remote session.
+    
+    Windows/macOS: Synchronous (fast API calls, no thread overhead)
+    Linux: Runs in thread pool (subprocess.run would block event loop)
+    """
+    if platform.system() == "Windows":
+        import ctypes
+        VK_CAPITAL = 0x14
+        # GetKeyState is essentially instant - no need for thread pool
+        if ctypes.windll.user32.GetKeyState(VK_CAPITAL) & 1:
+            pyautogui.press('capslock')
+            print("Caps Lock was ON - toggled OFF before typing")
+    elif platform.system() == "Darwin":
+        # macOS: Quartz is fast, no thread pool needed
+        try:
+            import Quartz
+            flags = Quartz.CGEventSourceFlagsState(Quartz.kCGEventSourceStateHIDSystemState)
+            if flags & Quartz.kCGEventFlagMaskAlphaShift:
+                pyautogui.press('capslock')
+                print("Caps Lock was ON - toggled OFF before typing")
+        except ImportError:
+            pass
+    else:
+        # Linux: subprocess.run blocks, so use thread pool
+        await asyncio.to_thread(_ensure_capslock_off_linux_sync)
+
+
 def _win32_send_key(scan_code: int, key_up: bool = False):
     """Low-level helper to send a single key event using Windows SendInput with scan code."""
     import ctypes
@@ -1318,6 +1360,9 @@ async def post_keyboard_type(payload: Dict[str, str]):
     text = payload.get("text")
     if not text:
         raise HTTPException(status_code=400, detail="Missing 'text' field")
+    
+    # Ensure Caps Lock is OFF to prevent case inversion
+    await _ensure_capslock_off()
     
     # On Windows: use native SendInput with scan codes (Citrix-compatible)
     # On macOS/Linux: use PyAutoGUI
