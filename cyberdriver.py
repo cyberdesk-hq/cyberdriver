@@ -1977,6 +1977,7 @@ class TunnelClient:
         sleep_time = self.min_sleep
         
         while True:
+            connection_start = time.time()
             try:
                 await self._connect_and_run()
                 # Reset sleep time on successful connection
@@ -1998,9 +1999,10 @@ class TunnelClient:
                     # Try to extract reason from exception message
                     close_reason = str(e)
                 
+                connection_duration = time.time() - connection_start
                 debug_logger.connection_closed(
                     close_reason or "Unknown", 
-                    0,  # Duration unknown at this point
+                    connection_duration,
                     close_code=close_code
                 )
                 
