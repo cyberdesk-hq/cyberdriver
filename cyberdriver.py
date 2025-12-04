@@ -1778,7 +1778,9 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
     # Create command script that handles working directory
     script_lines = []
     if working_directory:
-        script_lines.append(f"Set-Location -Path '{working_directory}'")
+        # Escape single quotes by doubling them (PowerShell single-quote escape)
+        escaped_dir = working_directory.replace("'", "''")
+        script_lines.append(f"Set-Location -Path '{escaped_dir}'")
     script_lines.append(command)
     
     # Join with semicolons for single-line execution
