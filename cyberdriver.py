@@ -1115,6 +1115,311 @@ async def get_diagnostics():
     return diagnostics
 
 
+# -----------------------------------------------------------------------------
+# Self-Update System (Windows)
+# -----------------------------------------------------------------------------
+
+GITHUB_RELEASES_API_URL = "https://api.github.com/repos/cyberdesk-hq/cyberdriver/releases"
+GITHUB_DOWNLOAD_BASE_URL = "https://github.com/cyberdesk-hq/cyberdriver/releases/download"
+
+
+@app.post("/internal/update")
+async def post_update(payload: Dict[str, Any] = {}):
+    """
+    Self-update Cyberdriver on Windows.
+    
+    This endpoint:
+    1. Downloads the new version to a staging location
+    2. Creates an updater script that waits for this process to exit
+    3. The updater script replaces the executable and optionally restarts
+    4. This process exits gracefully
+    
+    Request body (optional):
+    {
+        "version": "0.0.34",  // Target version (without 'v' prefix), or "latest" (default)
+        "restart": true       // Whether to restart after update (default: true)
+    }
+    
+    Returns:
+    {
+        "status": "update_initiated",
+        "current_version": "0.0.33",
+        "target_version": "0.0.34",
+        "message": "Cyberdriver will exit and update. Please wait ~10 seconds."
+    }
+    """
+    if platform.system() != "Windows":
+        return JSONResponse(
+            status_code=501, 
+            content={"error": "Self-update is currently only supported on Windows"}
+        )
+    
+    target_version = payload.get("version", "latest")
+    restart_after = payload.get("restart", True)
+    
+    try:
+        # Get the current executable path
+        if getattr(sys, 'frozen', False):
+            current_exe = sys.executable
+        else:
+            # Running as script - this won't work for self-update
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Self-update only works with compiled executable, not Python script"}
+            )
+        
+        # Resolve "latest" version from GitHub API
+        if target_version == "latest":
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(
+                    f"{GITHUB_RELEASES_API_URL}/latest",
+                    headers={"Accept": "application/vnd.github.v3+json"},
+                    follow_redirects=True
+                )
+                if resp.status_code != 200:
+                    return JSONResponse(
+                        status_code=502,
+                        content={"error": f"Failed to fetch latest release from GitHub: HTTP {resp.status_code}"}
+                    )
+                release_data = resp.json()
+                target_version = release_data.get("tag_name", "").lstrip("v")
+                if not target_version:
+                    return JSONResponse(
+                        status_code=502,
+                        content={"error": "Could not determine latest version from GitHub"}
+                    )
+        
+        # Check if already at target version
+        if target_version == VERSION:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "status": "already_up_to_date",
+                    "current_version": VERSION,
+                    "target_version": target_version,
+                    "message": "Cyberdriver is already running the requested version"
+                }
+            )
+        
+        # Build download URL for Windows executable
+        download_url = f"{GITHUB_DOWNLOAD_BASE_URL}/v{target_version}/cyberdriver.exe"
+        
+        # Get staging paths in the same directory as the current executable
+        tool_dir = os.path.dirname(current_exe)
+        staging_exe = os.path.join(tool_dir, "cyberdriver-update.exe")
+        updater_script = os.path.join(tool_dir, "cyberdriver-updater.bat")
+        
+        print(f"\n{'='*60}")
+        print(f"SELF-UPDATE INITIATED")
+        print(f"{'='*60}")
+        print(f"Current version: {VERSION}")
+        print(f"Target version:  {target_version}")
+        print(f"Download URL:    {download_url}")
+        print(f"Staging path:    {staging_exe}")
+        print(f"Restart after:   {restart_after}")
+        print(f"{'='*60}\n")
+        
+        # Download new version to staging location
+        print(f"Downloading cyberdriver v{target_version}...")
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.get(download_url, follow_redirects=True)
+            if resp.status_code == 404:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": f"Version v{target_version} not found on GitHub releases"}
+                )
+            if resp.status_code != 200:
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": f"Failed to download update: HTTP {resp.status_code}"}
+                )
+            
+            # Write to staging file
+            with open(staging_exe, "wb") as f:
+                f.write(resp.content)
+        
+        download_size_mb = os.path.getsize(staging_exe) / (1024 * 1024)
+        print(f"Downloaded: {download_size_mb:.2f} MB")
+        
+        # Get current process ID for the updater to wait on
+        current_pid = os.getpid()
+        
+        # Build restart command with original arguments (only if restart_after is True)
+        # Preserve all command-line arguments so the new instance runs with the same config
+        if restart_after:
+            # Get original arguments (skip argv[0] which is the executable path)
+            original_args = sys.argv[1:] if len(sys.argv) > 1 else []
+            
+            # Escape arguments that contain spaces or special characters for batch file
+            escaped_args = []
+            for arg in original_args:
+                # If arg contains spaces, quotes, or special chars, wrap in quotes
+                if ' ' in arg or '"' in arg or '&' in arg or '|' in arg or '<' in arg or '>' in arg or '^' in arg:
+                    # Escape any existing quotes by doubling them
+                    escaped_arg = arg.replace('"', '""')
+                    escaped_args.append(f'"{escaped_arg}"')
+                else:
+                    escaped_args.append(arg)
+            
+            args_str = ' '.join(escaped_args)
+            restart_cmd = f'start "" "{current_exe}" {args_str}'
+            
+            print(f"Original arguments: {original_args}")
+            print(f"Restart command: {restart_cmd}")
+        else:
+            restart_cmd = "echo Restart skipped (restart=false)"
+        
+        # Create updater batch script
+        # This script will:
+        # 1. Wait for the current process to exit
+        # 2. Copy the staging exe over the current exe
+        # 3. Clean up staging files
+        # 4. Optionally restart cyberdriver
+        updater_content = f'''@echo off
+REM Cyberdriver Self-Updater
+REM Generated automatically - do not edit
+REM This script replaces cyberdriver.exe after the main process exits
+
+echo ============================================================
+echo Cyberdriver Self-Updater
+echo ============================================================
+echo Waiting for cyberdriver (PID {current_pid}) to exit...
+
+REM Wait for the process to exit (check every second for up to 30 seconds)
+set /a max_wait=30
+set /a waited=0
+
+:wait_loop
+tasklist /FI "PID eq {current_pid}" 2>nul | find /I "{current_pid}" >nul
+if %ERRORLEVEL% EQU 0 (
+    if %waited% LSS %max_wait% (
+        timeout /t 1 /nobreak >nul
+        set /a waited+=1
+        goto wait_loop
+    ) else (
+        echo Timeout waiting for process to exit. Forcing termination...
+        taskkill /F /PID {current_pid} >nul 2>&1
+        timeout /t 2 /nobreak >nul
+    )
+)
+
+echo Process exited. Applying update...
+echo.
+
+REM Brief delay to ensure file handles are released
+timeout /t 2 /nobreak >nul
+
+REM Replace the executable
+echo Copying new version...
+copy /Y "{staging_exe}" "{current_exe}"
+if %ERRORLEVEL% NEQ 0 (
+    echo WARNING: First copy attempt failed. Retrying after delay...
+    timeout /t 3 /nobreak >nul
+    copy /Y "{staging_exe}" "{current_exe}"
+    if %ERRORLEVEL% NEQ 0 (
+        echo ERROR: Failed to apply update. The staging file remains at:
+        echo {staging_exe}
+        echo Please manually copy it to:
+        echo {current_exe}
+        pause
+        exit /b 1
+    )
+)
+
+echo.
+echo ============================================================
+echo Update successful! Updated to version {target_version}
+echo ============================================================
+
+REM Clean up staging file
+del /F /Q "{staging_exe}" >nul 2>&1
+
+REM Restart if requested
+{restart_cmd}
+
+REM Brief pause to show completion message
+timeout /t 2 /nobreak >nul
+
+REM Clean up this script (self-delete)
+del /F /Q "%~f0" >nul 2>&1
+'''
+        
+        with open(updater_script, "w", encoding="utf-8") as f:
+            f.write(updater_content)
+        
+        print(f"Created updater script: {updater_script}")
+        
+        # Launch the updater script as a fully detached process
+        # Use Windows-specific flags to ensure it survives parent exit
+        import ctypes
+        
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        CREATE_NO_WINDOW = 0x08000000
+        
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0  # SW_HIDE
+        
+        subprocess.Popen(
+            ["cmd", "/c", updater_script],
+            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            startupinfo=startupinfo,
+            close_fds=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        
+        print(f"Updater script launched successfully.")
+        print(f"Cyberdriver will exit in 2 seconds to allow update...")
+        
+        # Schedule graceful shutdown after returning response
+        async def delayed_exit():
+            await asyncio.sleep(2.0)
+            print(f"\n{'='*60}")
+            print(f"Exiting for self-update...")
+            if restart_after:
+                print(f"Cyberdriver will restart automatically after update.")
+            print(f"{'='*60}\n")
+            os._exit(0)  # Force exit to release all file handles
+        
+        asyncio.create_task(delayed_exit())
+        
+        # Build response with preserved arguments info
+        response_content = {
+            "status": "update_initiated",
+            "current_version": VERSION,
+            "target_version": target_version,
+            "restart": restart_after,
+            "message": f"Cyberdriver will exit and update to v{target_version}. Please wait ~10 seconds for the update to complete."
+        }
+        
+        # Include preserved arguments in response if restarting
+        if restart_after:
+            original_args = sys.argv[1:] if len(sys.argv) > 1 else []
+            response_content["preserved_arguments"] = original_args
+        
+        return JSONResponse(status_code=200, content=response_content)
+        
+    except httpx.TimeoutException:
+        return JSONResponse(
+            status_code=504,
+            content={"error": "Timeout while downloading update from GitHub"}
+        )
+    except Exception as e:
+        import traceback
+        error_msg = str(e)
+        print(f"Update failed: {error_msg}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": f"Update failed: {error_msg}",
+                "details": traceback.format_exc()
+            }
+        )
+
+
 @app.get("/computer/display/screenshot", response_class=Response)
 async def get_screenshot(
     width: Optional[int] = Query(None),
