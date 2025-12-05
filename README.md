@@ -48,7 +48,7 @@ $toolDir = "$env:USERPROFILE\.cyberdriver"
 New-Item -ItemType Directory -Force -Path $toolDir
 
 # Download cyberdriver
-Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.33/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe"
+Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.34/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe"
 
 # Add to PATH if not already there
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -63,7 +63,7 @@ Write-Host "Cyberdriver installed! You may need to restart your terminal for PAT
 
 ```bash
 # Choose version and target directory
-VERSION=0.0.33
+VERSION=0.0.34
 TOOL_DIR="$HOME/.cyberdriver"
 mkdir -p "$TOOL_DIR"
 
@@ -132,6 +132,55 @@ cyberdriver join --secret YOUR_API_KEY
 ```
 
 **To stop:** Use `Ctrl+C` in the console or Task Manager
+
+## Self-Update (Windows)
+
+Cyberdriver can update itself remotely, even while running. This is useful for:
+- Updating machines managed through Cyberdesk workflows
+- Keeping all your machines on the latest version without manual intervention
+- Zero-downtime updates (machine is only offline for ~10 seconds)
+
+### Via execute_terminal_command
+
+Run this PowerShell command through `execute_terminal_command`:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://localhost:3000/internal/update" -ContentType "application/json" -Body '{"version":"latest","restart":true}'
+```
+
+Or specify a specific version:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://localhost:3000/internal/update" -ContentType "application/json" -Body '{"version":"0.0.34","restart":true}'
+```
+
+### Via Cyberdesk API
+
+You can also call the update endpoint directly through the Cyberdesk API:
+
+```bash
+curl -X POST "https://api.cyberdesk.io/v1/computer/{machine_id}/internal/update" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"version": "latest", "restart": true}'
+```
+
+### How It Works
+
+1. Downloads the new version from GitHub releases to a staging location
+2. Creates an updater batch script that waits for Cyberdriver to exit
+3. Cyberdriver exits gracefully (the updater script runs in the background)
+4. The updater replaces `cyberdriver.exe` with the new version
+5. If `restart=true`, Cyberdriver automatically restarts with the **same arguments** it was originally started with
+
+**Arguments Preserved:** All original command-line flags are preserved on restart. For example, if you started with:
+```bash
+cyberdriver join --secret SK-xxx --keepalive --keepalive-threshold-minutes 5 --black-screen-recovery
+```
+
+After the update, Cyberdriver will restart with those exact same flags.
+
+**Note:** The machine will be briefly offline (~10 seconds) during the update.
 
 ## Common Issues
 
@@ -300,7 +349,7 @@ Configuration is stored in:
 The config file contains:
 ```json
 {
-  "version": "0.0.33",
+  "version": "0.0.34",
   "fingerprint": "uuid-v4-string"
 }
 ```
