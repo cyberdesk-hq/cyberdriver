@@ -2377,9 +2377,10 @@ class TunnelClient:
         
         # 1. Reset the global ThreadPoolExecutor
         # This clears any stuck or leaked threads
+        # Using wait=True ensures cancelled futures finish before creating new executor
         global executor
         try:
-            executor.shutdown(wait=False, cancel_futures=True)
+            executor.shutdown(wait=True, cancel_futures=True)
             executor = ThreadPoolExecutor(max_workers=5)
         except Exception as e:
             debug_logger.debug("CLEANUP", f"ThreadPoolExecutor reset failed: {e}")
