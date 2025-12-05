@@ -1139,7 +1139,7 @@ GITHUB_DOWNLOAD_BASE_URL = "https://github.com/cyberdesk-hq/cyberdriver/releases
 
 
 @app.post("/internal/update")
-async def post_update(payload: Dict[str, Any] = {}):
+async def post_update(payload: Dict[str, Any] = None):
     """
     Self-update Cyberdriver on Windows.
     
@@ -1163,6 +1163,8 @@ async def post_update(payload: Dict[str, Any] = {}):
         "message": "Cyberdriver will exit and update. Please wait ~10 seconds."
     }
     """
+    if payload is None:
+        payload = {}
     if platform.system() != "Windows":
         return JSONResponse(
             status_code=501, 
