@@ -238,7 +238,7 @@ class DebugLogger:
             process = psutil.Process()
             stats["memory_mb"] = f"{process.memory_info().rss / (1024 * 1024):.1f}"
             stats["open_files"] = len(process.open_files())
-            stats["connections"] = len(process.connections())
+            stats["connections"] = len(process.net_connections())
         except ImportError:
             pass
         except Exception:
@@ -1105,7 +1105,7 @@ async def get_diagnostics():
         diagnostics["memory_mb"] = process.memory_info().rss / (1024 * 1024)
         diagnostics["open_files"] = len(process.open_files())
         diagnostics["num_fds"] = process.num_fds() if hasattr(process, "num_fds") else None
-        diagnostics["connections"] = len(process.connections())
+        diagnostics["connections"] = len(process.net_connections())
     except ImportError:
         diagnostics["psutil"] = "not installed (pip install psutil for more diagnostics)"
     except Exception as e:
@@ -2363,6 +2363,14 @@ class TunnelClient:
         This is cheap (~100-250ms) compared to retry delays (1-16s).
         """
         import gc
+        
+        # Clear the keepalive countdown line before printing debug logs
+        # (the countdown uses \r to overwrite itself, so we need to clear it first)
+        try:
+            if self.keepalive_manager is not None and hasattr(self.keepalive_manager, "_clear_countdown_line"):
+                self.keepalive_manager._clear_countdown_line()
+        except Exception:
+            pass
         
         debug_logger.debug("CLEANUP", "Cleaning up before retry",
                           consecutive_failures=self._consecutive_failures)
