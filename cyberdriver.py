@@ -691,7 +691,20 @@ def disable_windows_console_quickedit():
 
 # Define websocket compatibility helper inline
 async def connect_with_headers(uri, headers_dict):
-    """Compatibility wrapper for websocket connections with headers and keepalive settings."""
+    """Compatibility wrapper for websocket connections with headers and keepalive settings.
+    
+    IMPORTANT: Creates a fresh SSL context for EVERY connection to avoid cached
+    session issues that can cause reconnection failures. This mimics what happens
+    when you Ctrl+C and restart the process.
+    """
+    import ssl
+    
+    # Create a FRESH SSL context for every connection attempt
+    # This is critical - the default context caches SSL sessions, and if a session
+    # gets into a bad state (e.g., server closed unexpectedly), it can poison
+    # future connections. Creating a fresh context ensures we start clean.
+    ssl_context = ssl.create_default_context()
+    
     # Common kwargs for robustness across proxies
     ws_kwargs = {
         # Send pings to keep NATs and proxies alive
@@ -703,6 +716,8 @@ async def connect_with_headers(uri, headers_dict):
         "max_queue": 32,
         # Faster close handshakes
         "close_timeout": 3,
+        # Use our fresh SSL context (this is the key fix!)
+        "ssl": ssl_context,
     }
     
     debug_logger.debug("WEBSOCKET", f"Connecting to {uri}",
@@ -737,7 +752,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.33"
+VERSION = "0.0.34"
 
 @dataclass
 class Config:
@@ -1113,6 +1128,311 @@ async def get_diagnostics():
             diagnostics["gdi_error"] = str(e)
     
     return diagnostics
+
+
+# -----------------------------------------------------------------------------
+# Self-Update System (Windows)
+# -----------------------------------------------------------------------------
+
+GITHUB_RELEASES_API_URL = "https://api.github.com/repos/cyberdesk-hq/cyberdriver/releases"
+GITHUB_DOWNLOAD_BASE_URL = "https://github.com/cyberdesk-hq/cyberdriver/releases/download"
+
+
+@app.post("/internal/update")
+async def post_update(payload: Dict[str, Any] = {}):
+    """
+    Self-update Cyberdriver on Windows.
+    
+    This endpoint:
+    1. Downloads the new version to a staging location
+    2. Creates an updater script that waits for this process to exit
+    3. The updater script replaces the executable and optionally restarts
+    4. This process exits gracefully
+    
+    Request body (optional):
+    {
+        "version": "0.0.34",  // Target version (without 'v' prefix), or "latest" (default)
+        "restart": true       // Whether to restart after update (default: true)
+    }
+    
+    Returns:
+    {
+        "status": "update_initiated",
+        "current_version": "0.0.34",
+        "target_version": "0.0.34",
+        "message": "Cyberdriver will exit and update. Please wait ~10 seconds."
+    }
+    """
+    if platform.system() != "Windows":
+        return JSONResponse(
+            status_code=501, 
+            content={"error": "Self-update is currently only supported on Windows"}
+        )
+    
+    target_version = payload.get("version", "latest")
+    restart_after = payload.get("restart", True)
+    
+    try:
+        # Get the current executable path
+        if getattr(sys, 'frozen', False):
+            current_exe = sys.executable
+        else:
+            # Running as script - this won't work for self-update
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Self-update only works with compiled executable, not Python script"}
+            )
+        
+        # Resolve "latest" version from GitHub API
+        if target_version == "latest":
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(
+                    f"{GITHUB_RELEASES_API_URL}/latest",
+                    headers={"Accept": "application/vnd.github.v3+json"},
+                    follow_redirects=True
+                )
+                if resp.status_code != 200:
+                    return JSONResponse(
+                        status_code=502,
+                        content={"error": f"Failed to fetch latest release from GitHub: HTTP {resp.status_code}"}
+                    )
+                release_data = resp.json()
+                target_version = release_data.get("tag_name", "").lstrip("v")
+                if not target_version:
+                    return JSONResponse(
+                        status_code=502,
+                        content={"error": "Could not determine latest version from GitHub"}
+                    )
+        
+        # Check if already at target version
+        if target_version == VERSION:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "status": "already_up_to_date",
+                    "current_version": VERSION,
+                    "target_version": target_version,
+                    "message": "Cyberdriver is already running the requested version"
+                }
+            )
+        
+        # Build download URL for Windows executable
+        download_url = f"{GITHUB_DOWNLOAD_BASE_URL}/v{target_version}/cyberdriver.exe"
+        
+        # Get staging paths in the same directory as the current executable
+        tool_dir = os.path.dirname(current_exe)
+        staging_exe = os.path.join(tool_dir, "cyberdriver-update.exe")
+        updater_script = os.path.join(tool_dir, "cyberdriver-updater.bat")
+        
+        print(f"\n{'='*60}")
+        print(f"SELF-UPDATE INITIATED")
+        print(f"{'='*60}")
+        print(f"Current version: {VERSION}")
+        print(f"Target version:  {target_version}")
+        print(f"Download URL:    {download_url}")
+        print(f"Staging path:    {staging_exe}")
+        print(f"Restart after:   {restart_after}")
+        print(f"{'='*60}\n")
+        
+        # Download new version to staging location
+        print(f"Downloading cyberdriver v{target_version}...")
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.get(download_url, follow_redirects=True)
+            if resp.status_code == 404:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": f"Version v{target_version} not found on GitHub releases"}
+                )
+            if resp.status_code != 200:
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": f"Failed to download update: HTTP {resp.status_code}"}
+                )
+            
+            # Write to staging file
+            with open(staging_exe, "wb") as f:
+                f.write(resp.content)
+        
+        download_size_mb = os.path.getsize(staging_exe) / (1024 * 1024)
+        print(f"Downloaded: {download_size_mb:.2f} MB")
+        
+        # Get current process ID for the updater to wait on
+        current_pid = os.getpid()
+        
+        # Build restart command with original arguments (only if restart_after is True)
+        # Preserve all command-line arguments so the new instance runs with the same config
+        if restart_after:
+            # Get original arguments (skip argv[0] which is the executable path)
+            original_args = sys.argv[1:] if len(sys.argv) > 1 else []
+            
+            # Escape arguments that contain spaces or special characters for batch file
+            escaped_args = []
+            for arg in original_args:
+                # If arg contains spaces, quotes, or special chars, wrap in quotes
+                if ' ' in arg or '"' in arg or '&' in arg or '|' in arg or '<' in arg or '>' in arg or '^' in arg:
+                    # Escape any existing quotes by doubling them
+                    escaped_arg = arg.replace('"', '""')
+                    escaped_args.append(f'"{escaped_arg}"')
+                else:
+                    escaped_args.append(arg)
+            
+            args_str = ' '.join(escaped_args)
+            restart_cmd = f'start "" "{current_exe}" {args_str}'
+            
+            print(f"Original arguments: {original_args}")
+            print(f"Restart command: {restart_cmd}")
+        else:
+            restart_cmd = "echo Restart skipped (restart=false)"
+        
+        # Create updater batch script
+        # This script will:
+        # 1. Wait for the current process to exit
+        # 2. Copy the staging exe over the current exe
+        # 3. Clean up staging files
+        # 4. Optionally restart cyberdriver
+        updater_content = f'''@echo off
+REM Cyberdriver Self-Updater
+REM Generated automatically - do not edit
+REM This script replaces cyberdriver.exe after the main process exits
+
+echo ============================================================
+echo Cyberdriver Self-Updater
+echo ============================================================
+echo Waiting for cyberdriver (PID {current_pid}) to exit...
+
+REM Wait for the process to exit (check every second for up to 30 seconds)
+set /a max_wait=30
+set /a waited=0
+
+:wait_loop
+tasklist /FI "PID eq {current_pid}" 2>nul | find /I "{current_pid}" >nul
+if %ERRORLEVEL% EQU 0 (
+    if %waited% LSS %max_wait% (
+        timeout /t 1 /nobreak >nul
+        set /a waited+=1
+        goto wait_loop
+    ) else (
+        echo Timeout waiting for process to exit. Forcing termination...
+        taskkill /F /PID {current_pid} >nul 2>&1
+        timeout /t 2 /nobreak >nul
+    )
+)
+
+echo Process exited. Applying update...
+echo.
+
+REM Brief delay to ensure file handles are released
+timeout /t 2 /nobreak >nul
+
+REM Replace the executable
+echo Copying new version...
+copy /Y "{staging_exe}" "{current_exe}"
+if %ERRORLEVEL% NEQ 0 (
+    echo WARNING: First copy attempt failed. Retrying after delay...
+    timeout /t 3 /nobreak >nul
+    copy /Y "{staging_exe}" "{current_exe}"
+    if %ERRORLEVEL% NEQ 0 (
+        echo ERROR: Failed to apply update. The staging file remains at:
+        echo {staging_exe}
+        echo Please manually copy it to:
+        echo {current_exe}
+        pause
+        exit /b 1
+    )
+)
+
+echo.
+echo ============================================================
+echo Update successful! Updated to version {target_version}
+echo ============================================================
+
+REM Clean up staging file
+del /F /Q "{staging_exe}" >nul 2>&1
+
+REM Restart if requested
+{restart_cmd}
+
+REM Brief pause to show completion message
+timeout /t 2 /nobreak >nul
+
+REM Clean up this script (self-delete)
+del /F /Q "%~f0" >nul 2>&1
+'''
+        
+        with open(updater_script, "w", encoding="utf-8") as f:
+            f.write(updater_content)
+        
+        print(f"Created updater script: {updater_script}")
+        
+        # Launch the updater script as a fully detached process
+        # Use Windows-specific flags to ensure it survives parent exit
+        import ctypes
+        
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        CREATE_NO_WINDOW = 0x08000000
+        
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0  # SW_HIDE
+        
+        subprocess.Popen(
+            ["cmd", "/c", updater_script],
+            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            startupinfo=startupinfo,
+            close_fds=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        
+        print(f"Updater script launched successfully.")
+        print(f"Cyberdriver will exit in 2 seconds to allow update...")
+        
+        # Schedule graceful shutdown after returning response
+        async def delayed_exit():
+            await asyncio.sleep(2.0)
+            print(f"\n{'='*60}")
+            print(f"Exiting for self-update...")
+            if restart_after:
+                print(f"Cyberdriver will restart automatically after update.")
+            print(f"{'='*60}\n")
+            os._exit(0)  # Force exit to release all file handles
+        
+        asyncio.create_task(delayed_exit())
+        
+        # Build response with preserved arguments info
+        response_content = {
+            "status": "update_initiated",
+            "current_version": VERSION,
+            "target_version": target_version,
+            "restart": restart_after,
+            "message": f"Cyberdriver will exit and update to v{target_version}. Please wait ~10 seconds for the update to complete."
+        }
+        
+        # Include preserved arguments in response if restarting
+        if restart_after:
+            original_args = sys.argv[1:] if len(sys.argv) > 1 else []
+            response_content["preserved_arguments"] = original_args
+        
+        return JSONResponse(status_code=200, content=response_content)
+        
+    except httpx.TimeoutException:
+        return JSONResponse(
+            status_code=504,
+            content={"error": "Timeout while downloading update from GitHub"}
+        )
+    except Exception as e:
+        import traceback
+        error_msg = str(e)
+        print(f"Update failed: {error_msg}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": f"Update failed: {error_msg}",
+                "details": traceback.format_exc()
+            }
+        )
 
 
 @app.get("/computer/display/screenshot", response_class=Response)
@@ -1778,7 +2098,9 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
     # Create command script that handles working directory
     script_lines = []
     if working_directory:
-        script_lines.append(f"Set-Location -Path '{working_directory}'")
+        # Escape single quotes by doubling them (PowerShell single-quote escape)
+        escaped_dir = working_directory.replace("'", "''")
+        script_lines.append(f"Set-Location -Path '{escaped_dir}'")
     script_lines.append(command)
     
     # Join with semicolons for single-line execution
@@ -2018,6 +2340,7 @@ class TunnelClient:
         self.min_sleep = 1
         self.max_sleep = 16
         self._connection_attempt = 0
+        self._consecutive_failures = 0  # Track consecutive short-lived connections for diagnostics
         self.keepalive_manager = keepalive_manager
         self.remote_keepalive_for_main_id = remote_keepalive_for_main_id
         
@@ -2025,16 +2348,73 @@ class TunnelClient:
         # Used to prevent duplicate execution of actions when retries occur
         self._idempotency_cache: Dict[str, Tuple[float, dict]] = {}
         
+    def _cleanup_before_retry(self):
+        """Clean up state before each connection retry.
+        
+        This runs on EVERY retry to ensure we start as fresh as possible,
+        mimicking what happens during Ctrl+C + restart.
+        
+        Cleanup includes:
+        - Reset ThreadPoolExecutor (clears any stuck threads)
+        - Clear idempotency cache (removes stale entries)
+        - Multiple GC passes to clean up circular references
+        - SSL context is created fresh per-connection in connect_with_headers()
+        
+        This is cheap (~100-250ms) compared to retry delays (1-16s).
+        """
+        import gc
+        
+        debug_logger.debug("CLEANUP", "Cleaning up before retry",
+                          consecutive_failures=self._consecutive_failures)
+        
+        # 1. Reset the global ThreadPoolExecutor
+        # This clears any stuck or leaked threads
+        global executor
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+            executor = ThreadPoolExecutor(max_workers=5)
+        except Exception as e:
+            debug_logger.debug("CLEANUP", f"ThreadPoolExecutor reset failed: {e}")
+        
+        # 2. Clear the idempotency cache (might have stale entries)
+        cache_size = len(self._idempotency_cache)
+        if cache_size > 0:
+            self._idempotency_cache.clear()
+            debug_logger.debug("CLEANUP", f"Cleared idempotency cache ({cache_size} entries)")
+        
+        # 3. Multiple GC passes to clean up circular references
+        # This takes ~50-200ms but ensures no lingering objects
+        total_collected = 0
+        for i in range(3):
+            total_collected += gc.collect(i)
+        if total_collected > 0:
+            debug_logger.debug("CLEANUP", f"GC collected {total_collected} objects")
+    
     async def run(self):
-        """Run the tunnel with exponential backoff reconnection."""
+        """Run the tunnel with exponential backoff reconnection.
+        
+        IMPORTANT: Each retry does full cleanup to mimic Ctrl+C + restart:
+        - Fresh SSL context (in connect_with_headers)
+        - Reset ThreadPoolExecutor
+        - Clear caches
+        - Garbage collection
+        """
+        import random
+        
         sleep_time = self.min_sleep
         
         while True:
             connection_start = time.time()
+            
+            # Full cleanup before EVERY connection attempt
+            # This mimics what happens when you Ctrl+C and restart
+            self._cleanup_before_retry()
+            
             try:
                 await self._connect_and_run()
-                # Reset sleep time on successful connection
+                # This line is never reached - _connect_and_run always raises
                 sleep_time = self.min_sleep
+                self._consecutive_failures = 0
             except asyncio.CancelledError:
                 # Allow task cancellation to stop the tunnel immediately
                 raise
@@ -2058,6 +2438,15 @@ class TunnelClient:
                     connection_duration,
                     close_code=close_code
                 )
+                
+                # Only reset failure counter if connection lasted more than 10 seconds
+                # Short-lived connections indicate an ongoing problem
+                if connection_duration > 10:
+                    self._consecutive_failures = 0
+                else:
+                    self._consecutive_failures += 1
+                    debug_logger.warning("CONNECTION", f"Connection only lasted {connection_duration:.1f}s",
+                                        consecutive_failures=self._consecutive_failures)
                 
                 # Authentication failures should NOT retry
                 # - Close code 4001 (WebSocket close after accept)
@@ -2125,11 +2514,16 @@ class TunnelClient:
                     print("   1. Check your internet connection")
                     print("   2. Verify the server is accessible")
                 
+                # Add random jitter (0-30%) to avoid thundering herd and give network stack time to clean up
+                jittered_sleep = sleep_time * (1 + random.uniform(0, 0.3))
+                
                 print(f"\n{'='*60}")
-                print(f"Retrying in {sleep_time} seconds...")
+                print(f"Retrying in {jittered_sleep:.1f} seconds...")
                 print(f"{'='*60}\n")
                 
-                await asyncio.sleep(sleep_time)
+                # Note: _consecutive_failures is already handled above based on connection duration
+                # (reset to 0 if >10s, incremented if <10s)
+                await asyncio.sleep(jittered_sleep)
                 sleep_time = min(sleep_time * 2, self.max_sleep)
                 
             except Exception as e:
@@ -2172,11 +2566,15 @@ class TunnelClient:
                     print("   2. Install TLS certificates: https://github.com/cyberdesk-hq/cyberdriver#tls-certificate-errors")
                     print("   3. Check your internet connection")
                 
+                # Add random jitter (0-30%) to avoid thundering herd and give network stack time to clean up
+                jittered_sleep = sleep_time * (1 + random.uniform(0, 0.3))
+                
                 print(f"\n{'='*60}")
-                print(f"Retrying in {sleep_time} seconds...")
+                print(f"Retrying in {jittered_sleep:.1f} seconds...")
                 print(f"{'='*60}\n")
                 
-                await asyncio.sleep(sleep_time)
+                self._consecutive_failures += 1
+                await asyncio.sleep(jittered_sleep)
                 sleep_time = min(sleep_time * 2, self.max_sleep)
     
     async def _connect_and_run(self):
@@ -2311,10 +2709,15 @@ class TunnelClient:
 
                 # If we exit the async for without an exception, the server closed gracefully
                 connection_duration = time.time() - connection_start_time
-                debug_logger.connection_closed("Server closed connection", connection_duration)
+                
+                # Get close info from the websocket object
+                ws_close_code = getattr(websocket, 'close_code', None)
+                ws_close_reason = getattr(websocket, 'close_reason', None) or "Server closed connection"
+                
+                debug_logger.connection_closed(ws_close_reason, connection_duration, close_code=ws_close_code)
                 
                 # Ensure we signal this to the reconnection loop by raising to trigger backoff
-                raise RuntimeError("WebSocket closed by server")
+                raise RuntimeError(f"WebSocket closed by server (code={ws_close_code})")
     
     def _cleanup_idempotency_cache(self) -> None:
         """Remove expired entries from the idempotency cache."""
@@ -3074,6 +3477,10 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
             await stop_black_screen_recovery()
             if resource_logger_task:
                 resource_logger_task.cancel()
+                try:
+                    await asyncio.wait_for(resource_logger_task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
             # Cancel server task last
             if server_task and not server_task.done():
                 server_task.cancel()
@@ -3125,6 +3532,10 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
             await stop_black_screen_recovery()
             if resource_logger_task:
                 resource_logger_task.cancel()
+                try:
+                    await asyncio.wait_for(resource_logger_task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
             # Cancel server task last
             if server_task and not server_task.done():
                 server_task.cancel()
