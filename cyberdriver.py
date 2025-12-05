@@ -691,7 +691,20 @@ def disable_windows_console_quickedit():
 
 # Define websocket compatibility helper inline
 async def connect_with_headers(uri, headers_dict):
-    """Compatibility wrapper for websocket connections with headers and keepalive settings."""
+    """Compatibility wrapper for websocket connections with headers and keepalive settings.
+    
+    IMPORTANT: Creates a fresh SSL context for EVERY connection to avoid cached
+    session issues that can cause reconnection failures. This mimics what happens
+    when you Ctrl+C and restart the process.
+    """
+    import ssl
+    
+    # Create a FRESH SSL context for every connection attempt
+    # This is critical - the default context caches SSL sessions, and if a session
+    # gets into a bad state (e.g., server closed unexpectedly), it can poison
+    # future connections. Creating a fresh context ensures we start clean.
+    ssl_context = ssl.create_default_context()
+    
     # Common kwargs for robustness across proxies
     ws_kwargs = {
         # Send pings to keep NATs and proxies alive
@@ -703,6 +716,8 @@ async def connect_with_headers(uri, headers_dict):
         "max_queue": 32,
         # Faster close handshakes
         "close_timeout": 3,
+        # Use our fresh SSL context (this is the key fix!)
+        "ssl": ssl_context,
     }
     
     debug_logger.debug("WEBSOCKET", f"Connecting to {uri}",
@@ -737,7 +752,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.33"
+VERSION = "0.0.34"
 
 @dataclass
 class Config:
@@ -1143,7 +1158,7 @@ async def post_update(payload: Dict[str, Any] = {}):
     Returns:
     {
         "status": "update_initiated",
-        "current_version": "0.0.33",
+        "current_version": "0.0.34",
         "target_version": "0.0.34",
         "message": "Cyberdriver will exit and update. Please wait ~10 seconds."
     }
@@ -2325,6 +2340,7 @@ class TunnelClient:
         self.min_sleep = 1
         self.max_sleep = 16
         self._connection_attempt = 0
+        self._consecutive_failures = 0  # Track consecutive short-lived connections for diagnostics
         self.keepalive_manager = keepalive_manager
         self.remote_keepalive_for_main_id = remote_keepalive_for_main_id
         
@@ -2332,16 +2348,73 @@ class TunnelClient:
         # Used to prevent duplicate execution of actions when retries occur
         self._idempotency_cache: Dict[str, Tuple[float, dict]] = {}
         
+    def _cleanup_before_retry(self):
+        """Clean up state before each connection retry.
+        
+        This runs on EVERY retry to ensure we start as fresh as possible,
+        mimicking what happens during Ctrl+C + restart.
+        
+        Cleanup includes:
+        - Reset ThreadPoolExecutor (clears any stuck threads)
+        - Clear idempotency cache (removes stale entries)
+        - Multiple GC passes to clean up circular references
+        - SSL context is created fresh per-connection in connect_with_headers()
+        
+        This is cheap (~100-250ms) compared to retry delays (1-16s).
+        """
+        import gc
+        
+        debug_logger.debug("CLEANUP", "Cleaning up before retry",
+                          consecutive_failures=self._consecutive_failures)
+        
+        # 1. Reset the global ThreadPoolExecutor
+        # This clears any stuck or leaked threads
+        global executor
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+            executor = ThreadPoolExecutor(max_workers=5)
+        except Exception as e:
+            debug_logger.debug("CLEANUP", f"ThreadPoolExecutor reset failed: {e}")
+        
+        # 2. Clear the idempotency cache (might have stale entries)
+        cache_size = len(self._idempotency_cache)
+        if cache_size > 0:
+            self._idempotency_cache.clear()
+            debug_logger.debug("CLEANUP", f"Cleared idempotency cache ({cache_size} entries)")
+        
+        # 3. Multiple GC passes to clean up circular references
+        # This takes ~50-200ms but ensures no lingering objects
+        total_collected = 0
+        for i in range(3):
+            total_collected += gc.collect(i)
+        if total_collected > 0:
+            debug_logger.debug("CLEANUP", f"GC collected {total_collected} objects")
+    
     async def run(self):
-        """Run the tunnel with exponential backoff reconnection."""
+        """Run the tunnel with exponential backoff reconnection.
+        
+        IMPORTANT: Each retry does full cleanup to mimic Ctrl+C + restart:
+        - Fresh SSL context (in connect_with_headers)
+        - Reset ThreadPoolExecutor
+        - Clear caches
+        - Garbage collection
+        """
+        import random
+        
         sleep_time = self.min_sleep
         
         while True:
             connection_start = time.time()
+            
+            # Full cleanup before EVERY connection attempt
+            # This mimics what happens when you Ctrl+C and restart
+            self._cleanup_before_retry()
+            
             try:
                 await self._connect_and_run()
-                # Reset sleep time on successful connection
+                # This line is never reached - _connect_and_run always raises
                 sleep_time = self.min_sleep
+                self._consecutive_failures = 0
             except asyncio.CancelledError:
                 # Allow task cancellation to stop the tunnel immediately
                 raise
@@ -2365,6 +2438,15 @@ class TunnelClient:
                     connection_duration,
                     close_code=close_code
                 )
+                
+                # Only reset failure counter if connection lasted more than 10 seconds
+                # Short-lived connections indicate an ongoing problem
+                if connection_duration > 10:
+                    self._consecutive_failures = 0
+                else:
+                    self._consecutive_failures += 1
+                    debug_logger.warning("CONNECTION", f"Connection only lasted {connection_duration:.1f}s",
+                                        consecutive_failures=self._consecutive_failures)
                 
                 # Authentication failures should NOT retry
                 # - Close code 4001 (WebSocket close after accept)
@@ -2432,11 +2514,16 @@ class TunnelClient:
                     print("   1. Check your internet connection")
                     print("   2. Verify the server is accessible")
                 
+                # Add random jitter (0-30%) to avoid thundering herd and give network stack time to clean up
+                jittered_sleep = sleep_time * (1 + random.uniform(0, 0.3))
+                
                 print(f"\n{'='*60}")
-                print(f"Retrying in {sleep_time} seconds...")
+                print(f"Retrying in {jittered_sleep:.1f} seconds...")
                 print(f"{'='*60}\n")
                 
-                await asyncio.sleep(sleep_time)
+                # Note: _consecutive_failures is already handled above based on connection duration
+                # (reset to 0 if >10s, incremented if <10s)
+                await asyncio.sleep(jittered_sleep)
                 sleep_time = min(sleep_time * 2, self.max_sleep)
                 
             except Exception as e:
@@ -2479,11 +2566,15 @@ class TunnelClient:
                     print("   2. Install TLS certificates: https://github.com/cyberdesk-hq/cyberdriver#tls-certificate-errors")
                     print("   3. Check your internet connection")
                 
+                # Add random jitter (0-30%) to avoid thundering herd and give network stack time to clean up
+                jittered_sleep = sleep_time * (1 + random.uniform(0, 0.3))
+                
                 print(f"\n{'='*60}")
-                print(f"Retrying in {sleep_time} seconds...")
+                print(f"Retrying in {jittered_sleep:.1f} seconds...")
                 print(f"{'='*60}\n")
                 
-                await asyncio.sleep(sleep_time)
+                self._consecutive_failures += 1
+                await asyncio.sleep(jittered_sleep)
                 sleep_time = min(sleep_time * 2, self.max_sleep)
     
     async def _connect_and_run(self):
@@ -2618,10 +2709,15 @@ class TunnelClient:
 
                 # If we exit the async for without an exception, the server closed gracefully
                 connection_duration = time.time() - connection_start_time
-                debug_logger.connection_closed("Server closed connection", connection_duration)
+                
+                # Get close info from the websocket object
+                ws_close_code = getattr(websocket, 'close_code', None)
+                ws_close_reason = getattr(websocket, 'close_reason', None) or "Server closed connection"
+                
+                debug_logger.connection_closed(ws_close_reason, connection_duration, close_code=ws_close_code)
                 
                 # Ensure we signal this to the reconnection loop by raising to trigger backoff
-                raise RuntimeError("WebSocket closed by server")
+                raise RuntimeError(f"WebSocket closed by server (code={ws_close_code})")
     
     def _cleanup_idempotency_cache(self) -> None:
         """Remove expired entries from the idempotency cache."""
@@ -3381,6 +3477,10 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
             await stop_black_screen_recovery()
             if resource_logger_task:
                 resource_logger_task.cancel()
+                try:
+                    await asyncio.wait_for(resource_logger_task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
             # Cancel server task last
             if server_task and not server_task.done():
                 server_task.cancel()
@@ -3432,6 +3532,10 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
             await stop_black_screen_recovery()
             if resource_logger_task:
                 resource_logger_task.cancel()
+                try:
+                    await asyncio.wait_for(resource_logger_task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
             # Cancel server task last
             if server_task and not server_task.done():
                 server_task.cancel()
