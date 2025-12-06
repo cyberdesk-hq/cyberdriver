@@ -1354,12 +1354,34 @@ async def post_update(payload: UpdateRequest = UpdateRequest()):
         
         # Build restart command for PowerShell
         if restart_after:
-            # Escape for PowerShell string
-            ps_args = args_str.replace("'", "''")
+            # Escape paths and args for embedding in PowerShell
+            exe_escaped = current_exe.replace("'", "''")
+            args_escaped = args_str.replace("'", "''")
+            
             ps_restart_cmd = f'''
 # Restart cyberdriver
 Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Starting cyberdriver..."
-Start-Process -FilePath "{current_exe}" -ArgumentList '{ps_args}' -WindowStyle Hidden
+Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Exe: {exe_escaped}"
+Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Args: {args_escaped}"
+
+try {{
+    # Use Start-Process with cmd to launch cyberdriver in a new console window
+    # This ensures the console app gets a proper console to attach to
+    $exePath = '{exe_escaped}'
+    $arguments = '{args_escaped}'
+    
+    # Start via cmd which properly creates a console window for console apps
+    # cmd.exe itself runs hidden, but 'start' command creates a NEW visible console for cyberdriver
+    Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "start", '""', "`"$exePath`"", $arguments -WindowStyle Hidden
+    
+    # Brief delay to let the process spawn
+    Start-Sleep -Seconds 2
+    
+    Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Start command executed successfully"
+}} catch {{
+    Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] ERROR starting cyberdriver: $($_.Exception.Message)"
+    Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Stack trace: $($_.ScriptStackTrace)"
+}}
 '''
         else:
             ps_restart_cmd = '''
@@ -2688,7 +2710,16 @@ class TunnelClient:
                 print(f"Retrying in {jittered_sleep:.1f} seconds...")
                 print(f"{'='*60}\n")
                 
-                self._consecutive_failures += 1
+                # Apply same connection duration logic as ConnectionClosed handler
+                # Only count as failure if connection was short-lived
+                connection_duration = time.time() - connection_start
+                if connection_duration > 10:
+                    self._consecutive_failures = 0
+                else:
+                    self._consecutive_failures += 1
+                    debug_logger.warning("CONNECTION", f"Connection only lasted {connection_duration:.1f}s",
+                                        consecutive_failures=self._consecutive_failures)
+                
                 await asyncio.sleep(jittered_sleep)
                 sleep_time = min(sleep_time * 2, self.max_sleep)
     
