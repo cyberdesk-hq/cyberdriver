@@ -38,7 +38,7 @@ jobs:
           tag_name: v${{ needs.get-version.outputs.version }}
           release_name: v${{ needs.get-version.outputs.version }}
           draft: false
-          prerelease: true
+          prerelease: false
           body: |
             Cyberdriver v${{ needs.get-version.outputs.version }}
             

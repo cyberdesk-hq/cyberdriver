@@ -752,7 +752,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.34"
+VERSION = "0.0.1"
 
 @dataclass
 class Config:
@@ -1139,7 +1139,7 @@ GITHUB_DOWNLOAD_BASE_URL = "https://github.com/cyberdesk-hq/cyberdriver/releases
 
 
 @app.post("/internal/update")
-async def post_update(payload: Dict[str, Any] = None):
+async def post_update(payload: Dict[str, Any] = {}):
     """
     Self-update Cyberdriver on Windows.
     
@@ -1163,8 +1163,6 @@ async def post_update(payload: Dict[str, Any] = None):
         "message": "Cyberdriver will exit and update. Please wait ~10 seconds."
     }
     """
-    if payload is None:
-        payload = {}
     if platform.system() != "Windows":
         return JSONResponse(
             status_code=501, 
@@ -1186,25 +1184,66 @@ async def post_update(payload: Dict[str, Any] = None):
             )
         
         # Resolve "latest" version from GitHub API
+        # Note: We fetch all releases because /releases/latest only returns non-prerelease releases,
+        # and our releases are currently marked as pre-releases
         if target_version == "latest":
             async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.get(
-                    f"{GITHUB_RELEASES_API_URL}/latest",
+                    GITHUB_RELEASES_API_URL,  # Fetch all releases, not just /latest
                     headers={"Accept": "application/vnd.github.v3+json"},
                     follow_redirects=True
                 )
                 if resp.status_code != 200:
                     return JSONResponse(
                         status_code=502,
-                        content={"error": f"Failed to fetch latest release from GitHub: HTTP {resp.status_code}"}
+                        content={"error": f"Failed to fetch releases from GitHub: HTTP {resp.status_code}"}
                     )
-                release_data = resp.json()
-                target_version = release_data.get("tag_name", "").lstrip("v")
+                
+                releases = resp.json()
+                if not releases:
+                    return JSONResponse(
+                        status_code=502,
+                        content={"error": "No releases found on GitHub"}
+                    )
+                
+                # Find the latest version by parsing semantic versions
+                # Filter out non-version tags like "test" and find the highest version
+                def parse_version(tag: str) -> tuple:
+                    """Parse version tag like 'v0.0.33' or '0.0.33' into comparable tuple."""
+                    tag = tag.lstrip("v")
+                    try:
+                        parts = tag.split(".")
+                        return tuple(int(p) for p in parts)
+                    except (ValueError, AttributeError):
+                        return (0, 0, 0)  # Non-numeric tags sort lowest
+                
+                # Filter to only version-like tags (v0.0.X or 0.0.X pattern)
+                version_releases = []
+                for release in releases:
+                    tag = release.get("tag_name", "")
+                    # Skip non-version tags like "test"
+                    clean_tag = tag.lstrip("v")
+                    if clean_tag and all(p.isdigit() for p in clean_tag.split(".")):
+                        version_releases.append(release)
+                
+                if not version_releases:
+                    return JSONResponse(
+                        status_code=502,
+                        content={"error": "No version releases found on GitHub (only found non-version tags)"}
+                    )
+                
+                # Sort by version and get the latest
+                version_releases.sort(key=lambda r: parse_version(r.get("tag_name", "")), reverse=True)
+                latest_release = version_releases[0]
+                target_version = latest_release.get("tag_name", "").lstrip("v")
+                
                 if not target_version:
                     return JSONResponse(
                         status_code=502,
                         content={"error": "Could not determine latest version from GitHub"}
                     )
+                
+                print(f"Resolved 'latest' to version {target_version}")
         
         # Check if already at target version
         if target_version == VERSION:
