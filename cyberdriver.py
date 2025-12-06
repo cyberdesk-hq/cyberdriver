@@ -1166,7 +1166,7 @@ async def post_update(payload: UpdateRequest = UpdateRequest()):
         "status": "update_initiated",
         "current_version": "0.0.34",
         "target_version": "0.0.34",
-        "message": "Cyberdriver will exit and update. Please wait ~10 seconds."
+        "message": "Updating to v0.0.34. Cyberdriver will restart automatically."
     }
     """
     if platform.system() != "Windows":
@@ -1544,7 +1544,7 @@ objShell.Run "powershell -NoProfile -ExecutionPolicy Bypass -File ""{updater_ps1
             "current_version": VERSION,
             "target_version": target_version,
             "restart": restart_after,
-            "message": f"Cyberdriver will exit and update to v{target_version}. Please wait ~10 seconds for the update to complete, then refresh the page to verify the new version."
+            "message": f"Updating to v{target_version}. Cyberdriver will restart automatically."
         }
         
         # Include preserved arguments in response if restarting (obfuscate secrets)
