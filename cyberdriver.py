@@ -1283,7 +1283,7 @@ async def post_update(payload: UpdateRequest = UpdateRequest()):
                     }
                 )
         
-        # Build download URL for Windows executable
+        # Build download URL for Windows executable 
         download_url = f"{GITHUB_DOWNLOAD_BASE_URL}/v{target_version}/cyberdriver.exe"
         
         # Get staging paths in the same directory as the current executable
