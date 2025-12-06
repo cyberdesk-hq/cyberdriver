@@ -1344,7 +1344,8 @@ async def post_update(payload: UpdateRequest = UpdateRequest()):
                     escaped_args.append(arg)
             
             args_str = ' '.join(escaped_args)
-            restart_cmd = f'start "" "{current_exe}" {args_str}'
+            # Use /b flag to start without new window, /min to minimize if window is created
+            restart_cmd = f'start /b "" "{current_exe}" {args_str}'
             
             print(f"Original arguments: {original_args}")
             print(f"Restart command: {restart_cmd}")
@@ -1357,15 +1358,17 @@ async def post_update(payload: UpdateRequest = UpdateRequest()):
         # 2. Copy the staging exe over the current exe
         # 3. Clean up staging files
         # 4. Optionally restart cyberdriver
+        # Log file for update process
+        update_log = os.path.join(tool_dir, "cyberdriver-update.log")
+        
         updater_content = f'''@echo off
-REM Cyberdriver Self-Updater
+REM Cyberdriver Self-Updater - Runs silently, logs to file
 REM Generated automatically - do not edit
-REM This script replaces cyberdriver.exe after the main process exits
 
-echo ============================================================
-echo Cyberdriver Self-Updater
-echo ============================================================
-echo Waiting for cyberdriver (PID {current_pid}) to exit...
+set LOGFILE="{update_log}"
+
+echo [%date% %time%] Cyberdriver Self-Updater started >> %LOGFILE%
+echo [%date% %time%] Waiting for cyberdriver (PID {current_pid}) to exit... >> %LOGFILE%
 
 REM Wait for the process to exit (check every second for up to 30 seconds)
 set /a max_wait=30
@@ -1375,52 +1378,47 @@ set /a waited=0
 tasklist /FI "PID eq {current_pid}" 2>nul | find /I "{current_pid}" >nul
 if %ERRORLEVEL% EQU 0 (
     if %waited% LSS %max_wait% (
-        timeout /t 1 /nobreak >nul
+        ping -n 2 127.0.0.1 >nul
         set /a waited+=1
         goto wait_loop
     ) else (
-        echo Timeout waiting for process to exit. Forcing termination...
+        echo [%date% %time%] Timeout waiting for process to exit. Forcing termination... >> %LOGFILE%
         taskkill /F /PID {current_pid} >nul 2>&1
-        timeout /t 2 /nobreak >nul
+        ping -n 3 127.0.0.1 >nul
     )
 )
 
-echo Process exited. Applying update...
-echo.
+echo [%date% %time%] Process exited. Applying update... >> %LOGFILE%
 
 REM Brief delay to ensure file handles are released
-timeout /t 2 /nobreak >nul
+ping -n 3 127.0.0.1 >nul
 
 REM Replace the executable
-echo Copying new version...
-copy /Y "{staging_exe}" "{current_exe}"
+echo [%date% %time%] Copying new version... >> %LOGFILE%
+copy /Y "{staging_exe}" "{current_exe}" >> %LOGFILE% 2>&1
 if %ERRORLEVEL% NEQ 0 (
-    echo WARNING: First copy attempt failed. Retrying after delay...
-    timeout /t 3 /nobreak >nul
-    copy /Y "{staging_exe}" "{current_exe}"
+    echo [%date% %time%] First copy attempt failed. Retrying after delay... >> %LOGFILE%
+    ping -n 4 127.0.0.1 >nul
+    copy /Y "{staging_exe}" "{current_exe}" >> %LOGFILE% 2>&1
     if %ERRORLEVEL% NEQ 0 (
-        echo ERROR: Failed to apply update. The staging file remains at:
-        echo {staging_exe}
-        echo Please manually copy it to:
-        echo {current_exe}
-        pause
+        echo [%date% %time%] ERROR: Failed to apply update >> %LOGFILE%
         exit /b 1
     )
 )
 
-echo.
-echo ============================================================
-echo Update successful! Updated to version {target_version}
-echo ============================================================
+echo [%date% %time%] Update successful! Updated to version {target_version} >> %LOGFILE%
 
 REM Clean up staging file
 del /F /Q "{staging_exe}" >nul 2>&1
 
 REM Restart if requested
+echo [%date% %time%] Restarting cyberdriver... >> %LOGFILE%
 {restart_cmd}
 
-REM Brief pause to show completion message
-timeout /t 2 /nobreak >nul
+REM Brief delay before cleanup
+ping -n 3 127.0.0.1 >nul
+
+echo [%date% %time%] Self-updater completed >> %LOGFILE%
 
 REM Clean up this script (self-delete)
 del /F /Q "%~f0" >nul 2>&1
@@ -1445,7 +1443,7 @@ del /F /Q "%~f0" >nul 2>&1
         
         subprocess.Popen(
             ["cmd", "/c", updater_script],
-            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
             startupinfo=startupinfo,
             close_fds=True,
             stdin=subprocess.DEVNULL,
@@ -1474,13 +1472,29 @@ del /F /Q "%~f0" >nul 2>&1
             "current_version": VERSION,
             "target_version": target_version,
             "restart": restart_after,
-            "message": f"Cyberdriver will exit and update to v{target_version}. Please wait ~10 seconds for the update to complete."
+            "message": f"Cyberdriver will exit and update to v{target_version}. Please wait ~10 seconds for the update to complete, then refresh the page to verify the new version."
         }
         
-        # Include preserved arguments in response if restarting
+        # Include preserved arguments in response if restarting (obfuscate secrets)
         if restart_after:
             original_args = sys.argv[1:] if len(sys.argv) > 1 else []
-            response_content["preserved_arguments"] = original_args
+            # Obfuscate sensitive values (--secret, -s, etc.)
+            obfuscated_args = []
+            skip_next = False
+            for i, arg in enumerate(original_args):
+                if skip_next:
+                    obfuscated_args.append("***")
+                    skip_next = False
+                elif arg in ("--secret", "-s"):
+                    obfuscated_args.append(arg)
+                    skip_next = True
+                elif arg.startswith("--secret="):
+                    obfuscated_args.append("--secret=***")
+                elif arg.startswith("-s="):
+                    obfuscated_args.append("-s=***")
+                else:
+                    obfuscated_args.append(arg)
+            response_content["preserved_arguments"] = obfuscated_args
         
         return JSONResponse(status_code=200, content=response_content)
         
