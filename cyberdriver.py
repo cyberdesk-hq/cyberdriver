@@ -1361,11 +1361,17 @@ async def post_update(payload: UpdateRequest = UpdateRequest()):
             # Generate a unique task name
             task_name = f"CyberdriverRestart_{uuid.uuid4().hex[:8]}"
             
+            # Check if we're running elevated - if so, preserve elevation in the scheduled task
+            # This avoids UAC prompts when restarting with --black-screen-recovery or any other optional flags that need admin rights
+            needs_elevation = is_running_as_admin()
+            run_level = "Highest" if needs_elevation else "Limited"
+            
             ps_restart_cmd = f'''
 # Restart cyberdriver using scheduled task (most reliable method for hidden process -> visible console)
 Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Starting cyberdriver via scheduled task..."
 Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Exe: {exe_escaped}"
 Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Args: {args_escaped}"
+Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] RunLevel: {run_level} (was_elevated: {str(needs_elevation).lower()})"
 
 try {{
     $exePath = '{exe_escaped}'
@@ -1378,11 +1384,12 @@ try {{
     $action = New-ScheduledTaskAction -Execute $exePath -Argument $arguments
     $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(1)
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-    $principal = New-ScheduledTaskPrincipal -UserId "$env:USERNAME" -LogonType Interactive -RunLevel Limited
+    # Use Highest run level if original process was elevated, to preserve admin rights without UAC prompt
+    $principal = New-ScheduledTaskPrincipal -UserId "$env:USERNAME" -LogonType Interactive -RunLevel {run_level}
     
     # Register the task
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
-    Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Scheduled task '$taskName' created, will run in 1 second"
+    Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Scheduled task '$taskName' created with RunLevel {run_level}"
     
     # Start the task immediately (don't wait for trigger)
     Start-ScheduledTask -TaskName $taskName
