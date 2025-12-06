@@ -1289,7 +1289,6 @@ async def post_update(payload: UpdateRequest = UpdateRequest()):
         # Get staging paths in the same directory as the current executable
         tool_dir = os.path.dirname(current_exe)
         staging_exe = os.path.join(tool_dir, "cyberdriver-update.exe")
-        updater_script = os.path.join(tool_dir, "cyberdriver-updater.bat")
         
         print(f"\n{'='*60}")
         print(f"SELF-UPDATE INITIATED")
@@ -1344,107 +1343,133 @@ async def post_update(payload: UpdateRequest = UpdateRequest()):
                     escaped_args.append(arg)
             
             args_str = ' '.join(escaped_args)
-            # Use /b flag to start without new window, /min to minimize if window is created
-            restart_cmd = f'start /b "" "{current_exe}" {args_str}'
             
             print(f"Original arguments: {original_args}")
-            print(f"Restart command: {restart_cmd}")
-        else:
-            restart_cmd = "echo Restart skipped (restart=false)"
+            print(f"Escaped arguments for restart: {args_str}")
         
-        # Create updater batch script
-        # This script will:
-        # 1. Wait for the current process to exit
-        # 2. Copy the staging exe over the current exe
-        # 3. Clean up staging files
-        # 4. Optionally restart cyberdriver
+        # Create updater PowerShell script (more reliable than batch on modern Windows)
         # Log file for update process
         update_log = os.path.join(tool_dir, "cyberdriver-update.log")
+        updater_ps1 = os.path.join(tool_dir, "cyberdriver-updater.ps1")
         
-        updater_content = f'''@echo off
-REM Cyberdriver Self-Updater - Runs silently, logs to file
-REM Generated automatically - do not edit
-
-set LOGFILE="{update_log}"
-
-echo [%date% %time%] Cyberdriver Self-Updater started >> %LOGFILE%
-echo [%date% %time%] Waiting for cyberdriver (PID {current_pid}) to exit... >> %LOGFILE%
-
-REM Wait for the process to exit (check every second for up to 30 seconds)
-set /a max_wait=30
-set /a waited=0
-
-:wait_loop
-tasklist /FI "PID eq {current_pid}" 2>nul | find /I "{current_pid}" >nul
-if %ERRORLEVEL% EQU 0 (
-    if %waited% LSS %max_wait% (
-        ping -n 2 127.0.0.1 >nul
-        set /a waited+=1
-        goto wait_loop
-    ) else (
-        echo [%date% %time%] Timeout waiting for process to exit. Forcing termination... >> %LOGFILE%
-        taskkill /F /PID {current_pid} >nul 2>&1
-        ping -n 3 127.0.0.1 >nul
-    )
-)
-
-echo [%date% %time%] Process exited. Applying update... >> %LOGFILE%
-
-REM Brief delay to ensure file handles are released
-ping -n 3 127.0.0.1 >nul
-
-REM Replace the executable
-echo [%date% %time%] Copying new version... >> %LOGFILE%
-copy /Y "{staging_exe}" "{current_exe}" >> %LOGFILE% 2>&1
-if %ERRORLEVEL% NEQ 0 (
-    echo [%date% %time%] First copy attempt failed. Retrying after delay... >> %LOGFILE%
-    ping -n 4 127.0.0.1 >nul
-    copy /Y "{staging_exe}" "{current_exe}" >> %LOGFILE% 2>&1
-    if %ERRORLEVEL% NEQ 0 (
-        echo [%date% %time%] ERROR: Failed to apply update >> %LOGFILE%
-        exit /b 1
-    )
-)
-
-echo [%date% %time%] Update successful! Updated to version {target_version} >> %LOGFILE%
-
-REM Clean up staging file
-del /F /Q "{staging_exe}" >nul 2>&1
-
-REM Restart if requested
-echo [%date% %time%] Restarting cyberdriver... >> %LOGFILE%
-{restart_cmd}
-
-REM Brief delay before cleanup
-ping -n 3 127.0.0.1 >nul
-
-echo [%date% %time%] Self-updater completed >> %LOGFILE%
-
-REM Clean up this script (self-delete)
-del /F /Q "%~f0" >nul 2>&1
+        # Build restart command for PowerShell
+        if restart_after:
+            # Escape for PowerShell string
+            ps_args = args_str.replace("'", "''")
+            ps_restart_cmd = f'''
+# Restart cyberdriver
+Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Starting cyberdriver..."
+Start-Process -FilePath "{current_exe}" -ArgumentList '{ps_args}' -WindowStyle Hidden
+'''
+        else:
+            ps_restart_cmd = '''
+Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Restart skipped (restart=false)"
 '''
         
-        with open(updater_script, "w", encoding="utf-8") as f:
+        updater_content = f'''# Cyberdriver Self-Updater - PowerShell version
+# Generated automatically - do not edit
+
+$logFile = "{update_log}"
+$stagingExe = "{staging_exe}"
+$currentExe = "{current_exe}"
+$targetPid = {current_pid}
+
+Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Cyberdriver Self-Updater started (PowerShell)"
+Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Waiting for cyberdriver (PID $targetPid) to exit..."
+
+# Wait for the process to exit (up to 30 seconds)
+$maxWait = 30
+$waited = 0
+while ($waited -lt $maxWait) {{
+    try {{
+        $proc = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
+        if ($null -eq $proc) {{
+            Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Process exited"
+            break
+        }}
+    }} catch {{
+        Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Process exited (exception)"
+        break
+    }}
+    Start-Sleep -Seconds 1
+    $waited++
+}}
+
+if ($waited -ge $maxWait) {{
+    Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Timeout - force killing process"
+    try {{ Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue }} catch {{}}
+    Start-Sleep -Seconds 2
+}}
+
+Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Applying update..."
+
+# Wait a bit more for file handles to release
+Start-Sleep -Seconds 2
+
+# Replace the executable
+Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Copying new version..."
+$copySuccess = $false
+for ($i = 0; $i -lt 3; $i++) {{
+    try {{
+        Copy-Item -Path $stagingExe -Destination $currentExe -Force -ErrorAction Stop
+        $copySuccess = $true
+        Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Copy successful"
+        break
+    }} catch {{
+        Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Copy attempt $($i+1) failed: $($_.Exception.Message)"
+        Start-Sleep -Seconds 2
+    }}
+}}
+
+if (-not $copySuccess) {{
+    Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] ERROR: Failed to apply update after 3 attempts"
+    exit 1
+}}
+
+Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Update successful! Updated to version {target_version}"
+
+# Clean up staging file
+try {{
+    Remove-Item -Path $stagingExe -Force -ErrorAction SilentlyContinue
+}} catch {{}}
+
+{ps_restart_cmd}
+
+Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Self-updater completed"
+
+# Clean up scripts (self-delete with delay)
+Start-Sleep -Seconds 2
+$vbsLauncher = $MyInvocation.MyCommand.Path -replace '\.ps1$', '-launcher.vbs'
+Remove-Item -Path $vbsLauncher -Force -ErrorAction SilentlyContinue
+Remove-Item -Path $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
+'''
+        
+        with open(updater_ps1, "w", encoding="utf-8") as f:
             f.write(updater_content)
         
-        print(f"Created updater script: {updater_script}")
+        print(f"Created updater script: {updater_ps1}")
         
-        # Launch the updater script as a fully detached process
-        # Use Windows-specific flags to ensure it survives parent exit
-        import ctypes
+        # Create a VBScript wrapper to launch PowerShell truly hidden
+        # This is the industry-standard way to run scripts invisibly on Windows
+        # PowerShell's -WindowStyle Hidden is unreliable and can flash windows
+        vbs_launcher = os.path.join(tool_dir, "cyberdriver-updater-launcher.vbs")
+        vbs_content = f'''Set objShell = CreateObject("WScript.Shell")
+objShell.Run "powershell -NoProfile -ExecutionPolicy Bypass -File ""{updater_ps1}""", 0, False
+'''
+        with open(vbs_launcher, "w", encoding="utf-8") as f:
+            f.write(vbs_content)
         
+        print(f"Created VBS launcher: {vbs_launcher}")
+        
+        # Launch the VBScript which will launch PowerShell truly hidden
+        # wscript runs VBScript files without any console window
         DETACHED_PROCESS = 0x00000008
         CREATE_NEW_PROCESS_GROUP = 0x00000200
         CREATE_NO_WINDOW = 0x08000000
         
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = 0  # SW_HIDE
-        
         subprocess.Popen(
-            ["cmd", "/c", updater_script],
+            ["wscript", vbs_launcher],
             creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
-            startupinfo=startupinfo,
             close_fds=True,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
