@@ -1138,6 +1138,121 @@ async def get_diagnostics():
 GITHUB_RELEASES_API_URL = "https://api.github.com/repos/cyberdesk-hq/cyberdriver/releases"
 GITHUB_DOWNLOAD_BASE_URL = "https://github.com/cyberdesk-hq/cyberdriver/releases/download"
 
+# Global connection info (set when run_join is called)
+_connection_info: dict = {
+    "host": None,  # e.g., "api.cyberdesk.io"
+    "port": None,  # e.g., 443
+}
+
+
+def _set_connection_info(host: str, port: int) -> None:
+    """Store connection info for use by update endpoint."""
+    _connection_info["host"] = host
+    _connection_info["port"] = port
+
+
+def _get_api_base_url() -> str | None:
+    """Get the API base URL if connection info is available."""
+    if _connection_info["host"] and _connection_info["port"]:
+        protocol = "https" if _connection_info["port"] == 443 else "http"
+        return f"{protocol}://{_connection_info['host']}"
+    return None
+
+
+async def _fetch_latest_version_from_api() -> str | None:
+    """
+    Fetch the latest Cyberdriver version from Cyberdesk API.
+    Returns None if API is unavailable.
+    """
+    api_base = _get_api_base_url()
+    if not api_base:
+        return None
+    
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{api_base}/v1/internal/cyberdriver-version",
+                follow_redirects=True
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                version = data.get("latest_version")
+                if version:
+                    print(f"Got latest version from Cyberdesk API: {version}")
+                    return version
+    except Exception as e:
+        print(f"Failed to fetch version from Cyberdesk API: {e}")
+    
+    return None
+
+
+async def _fetch_latest_version_from_github() -> str | None:
+    """
+    Fetch the latest Cyberdriver version from GitHub releases.
+    Returns None if GitHub is unavailable or rate limited.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                GITHUB_RELEASES_API_URL,
+                headers={"Accept": "application/vnd.github.v3+json"},
+                follow_redirects=True
+            )
+            if resp.status_code != 200:
+                print(f"GitHub API returned {resp.status_code}")
+                return None
+            
+            releases = resp.json()
+            if not releases:
+                return None
+            
+            # Find the latest version by parsing semantic versions
+            def parse_version(tag: str) -> tuple:
+                tag = tag.lstrip("v")
+                try:
+                    parts = tag.split(".")
+                    return tuple(int(p) for p in parts)
+                except (ValueError, AttributeError):
+                    return (0, 0, 0)
+            
+            # Filter to only version-like tags
+            version_releases = []
+            for release in releases:
+                tag = release.get("tag_name", "")
+                clean_tag = tag.lstrip("v")
+                if clean_tag and all(p.isdigit() for p in clean_tag.split(".")):
+                    version_releases.append(release)
+            
+            if not version_releases:
+                return None
+            
+            # Sort by version and get the latest
+            version_releases.sort(key=lambda r: parse_version(r.get("tag_name", "")), reverse=True)
+            latest_version = version_releases[0].get("tag_name", "").lstrip("v")
+            
+            if latest_version:
+                print(f"Got latest version from GitHub: {latest_version}")
+            return latest_version
+            
+    except Exception as e:
+        print(f"Failed to fetch version from GitHub: {e}")
+        return None
+
+
+async def _resolve_latest_version() -> str | None:
+    """
+    Resolve the latest Cyberdriver version.
+    Tries Cyberdesk API first, falls back to GitHub.
+    """
+    # Try Cyberdesk API first (has caching and higher rate limits)
+    version = await _fetch_latest_version_from_api()
+    if version:
+        return version
+    
+    # Fall back to GitHub
+    print("Falling back to GitHub for version info...")
+    return await _fetch_latest_version_from_github()
+
 
 class UpdateRequest(BaseModel):
     version: str = Field(default="latest", description="Target version (e.g. '0.0.34') or 'latest'")
@@ -1189,67 +1304,16 @@ async def post_update(payload: UpdateRequest = UpdateRequest()):
                 content={"error": "Self-update only works with compiled executable, not Python script"}
             )
         
-        # Resolve "latest" version from GitHub API
-        # Note: We fetch all releases because /releases/latest only returns non-prerelease releases,
-        # and our releases are currently marked as pre-releases
+        # Resolve "latest" version - tries Cyberdesk API first, falls back to GitHub
         if target_version == "latest":
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.get(
-                    GITHUB_RELEASES_API_URL,  # Fetch all releases, not just /latest
-                    headers={"Accept": "application/vnd.github.v3+json"},
-                    follow_redirects=True
+            resolved_version = await _resolve_latest_version()
+            if not resolved_version:
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": "Could not determine latest version (API and GitHub both unavailable)"}
                 )
-                if resp.status_code != 200:
-                    return JSONResponse(
-                        status_code=502,
-                        content={"error": f"Failed to fetch releases from GitHub: HTTP {resp.status_code}"}
-                    )
-                
-                releases = resp.json()
-                if not releases:
-                    return JSONResponse(
-                        status_code=502,
-                        content={"error": "No releases found on GitHub"}
-                    )
-                
-                # Find the latest version by parsing semantic versions
-                # Filter out non-version tags like "test" and find the highest version
-                def parse_version(tag: str) -> tuple:
-                    """Parse version tag like 'v0.0.33' or '0.0.33' into comparable tuple."""
-                    tag = tag.lstrip("v")
-                    try:
-                        parts = tag.split(".")
-                        return tuple(int(p) for p in parts)
-                    except (ValueError, AttributeError):
-                        return (0, 0, 0)  # Non-numeric tags sort lowest
-                
-                # Filter to only version-like tags (v0.0.X or 0.0.X pattern)
-                version_releases = []
-                for release in releases:
-                    tag = release.get("tag_name", "")
-                    # Skip non-version tags like "test"
-                    clean_tag = tag.lstrip("v")
-                    if clean_tag and all(p.isdigit() for p in clean_tag.split(".")):
-                        version_releases.append(release)
-                
-                if not version_releases:
-                    return JSONResponse(
-                        status_code=502,
-                        content={"error": "No version releases found on GitHub (only found non-version tags)"}
-                    )
-                
-                # Sort by version and get the latest
-                version_releases.sort(key=lambda r: parse_version(r.get("tag_name", "")), reverse=True)
-                latest_release = version_releases[0]
-                target_version = latest_release.get("tag_name", "").lstrip("v")
-                
-                if not target_version:
-                    return JSONResponse(
-                        status_code=502,
-                        content={"error": "Could not determine latest version from GitHub"}
-                    )
-                
-                print(f"Resolved 'latest' to version {target_version}")
+            target_version = resolved_version
+            print(f"Resolved 'latest' to version {target_version}")
         
         # Check if already at target version or running newer
         def parse_version(v: str) -> tuple:
@@ -2551,7 +2615,7 @@ class TunnelClient:
             total_collected += gc.collect(i)
         if total_collected > 0:
             debug_logger.debug("CLEANUP", f"GC collected {total_collected} objects")
-    
+        
     async def run(self):
         """Run the tunnel with exponential backoff reconnection.
         
@@ -3523,6 +3587,9 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
                    black_screen_check_interval: float = 30.0,
                    debug_enabled: bool = False):
     """Run both API server and tunnel client."""
+    # Store connection info for use by update endpoint
+    _set_connection_info(host, port)
+    
     config = get_config()
     
     # Log resource stats periodically in debug mode
