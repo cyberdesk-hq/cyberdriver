@@ -1358,24 +1358,42 @@ async def post_update(payload: UpdateRequest = UpdateRequest()):
             exe_escaped = current_exe.replace("'", "''")
             args_escaped = args_str.replace("'", "''")
             
+            # Generate a unique task name
+            task_name = f"CyberdriverRestart_{uuid.uuid4().hex[:8]}"
+            
             ps_restart_cmd = f'''
-# Restart cyberdriver
-Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Starting cyberdriver..."
+# Restart cyberdriver using scheduled task (most reliable method for hidden process -> visible console)
+Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Starting cyberdriver via scheduled task..."
 Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Exe: {exe_escaped}"
 Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Args: {args_escaped}"
 
 try {{
-    # Use Start-Process with cmd to launch cyberdriver in a new console window
-    # This ensures the console app gets a proper console to attach to
     $exePath = '{exe_escaped}'
     $arguments = '{args_escaped}'
+    $taskName = '{task_name}'
     
-    # Start via cmd which properly creates a console window for console apps
-    # cmd.exe itself runs hidden, but 'start' command creates a NEW visible console for cyberdriver
-    Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "start", '""', "`"$exePath`"", $arguments -WindowStyle Hidden
+    # Create a scheduled task that runs immediately
+    # This creates an entirely new process tree with proper console allocation
+    # Execute cyberdriver directly - scheduled tasks create their own console for console apps
+    $action = New-ScheduledTaskAction -Execute $exePath -Argument $arguments
+    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(1)
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+    $principal = New-ScheduledTaskPrincipal -UserId "$env:USERNAME" -LogonType Interactive -RunLevel Limited
     
-    # Brief delay to let the process spawn
+    # Register the task
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
+    Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Scheduled task '$taskName' created, will run in 1 second"
+    
+    # Start the task immediately (don't wait for trigger)
+    Start-ScheduledTask -TaskName $taskName
+    Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Scheduled task started"
+    
+    # Wait a moment for task to fully start
     Start-Sleep -Seconds 2
+    
+    # Clean up the scheduled task
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Scheduled task cleaned up"
     
     Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Start command executed successfully"
 }} catch {{
