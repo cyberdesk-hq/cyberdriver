@@ -69,6 +69,7 @@ import pyautogui
 import pyperclip
 from PIL import Image
 from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
 from fastapi.responses import Response, JSONResponse
 import uvicorn
 import websockets
@@ -1138,8 +1139,13 @@ GITHUB_RELEASES_API_URL = "https://api.github.com/repos/cyberdesk-hq/cyberdriver
 GITHUB_DOWNLOAD_BASE_URL = "https://github.com/cyberdesk-hq/cyberdriver/releases/download"
 
 
+class UpdateRequest(BaseModel):
+    version: str = Field(default="latest", description="Target version (e.g. '0.0.34') or 'latest'")
+    restart: bool = Field(default=True, description="Whether to restart Cyberdriver after update")
+
+
 @app.post("/internal/update")
-async def post_update(payload: Dict[str, Any] = {}):
+async def post_update(payload: UpdateRequest = UpdateRequest()):
     """
     Self-update Cyberdriver on Windows.
     
@@ -1169,8 +1175,8 @@ async def post_update(payload: Dict[str, Any] = {}):
             content={"error": "Self-update is currently only supported on Windows"}
         )
     
-    target_version = payload.get("version", "latest")
-    restart_after = payload.get("restart", True)
+    target_version = payload.version
+    restart_after = payload.restart
     
     try:
         # Get the current executable path
@@ -1245,17 +1251,37 @@ async def post_update(payload: Dict[str, Any] = {}):
                 
                 print(f"Resolved 'latest' to version {target_version}")
         
-        # Check if already at target version
-        if target_version == VERSION:
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "status": "already_up_to_date",
-                    "current_version": VERSION,
-                    "target_version": target_version,
-                    "message": "Cyberdriver is already running the requested version"
-                }
-            )
+        # Check if already at target version or running newer
+        def parse_version(v: str) -> tuple:
+            return tuple(int(p) for p in v.replace("v", "").split("."))
+        
+        try:
+            current_parts = parse_version(VERSION)
+            target_parts = parse_version(target_version)
+            
+            if current_parts >= target_parts:
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "status": "already_up_to_date",
+                        "current_version": VERSION,
+                        "target_version": target_version,
+                        "message": "Cyberdriver is already running the requested version" if current_parts == target_parts 
+                                   else f"Cyberdriver is already running a newer version ({VERSION})"
+                    }
+                )
+        except (ValueError, AttributeError):
+            # If version parsing fails, fall back to string comparison
+            if target_version == VERSION:
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "status": "already_up_to_date",
+                        "current_version": VERSION,
+                        "target_version": target_version,
+                        "message": "Cyberdriver is already running the requested version"
+                    }
+                )
         
         # Build download URL for Windows executable
         download_url = f"{GITHUB_DOWNLOAD_BASE_URL}/v{target_version}/cyberdriver.exe"
