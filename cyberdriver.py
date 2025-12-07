@@ -1151,7 +1151,7 @@ def _set_connection_info(host: str, port: int) -> None:
     _connection_info["port"] = port
 
 
-def _get_api_base_url() -> str | None:
+def _get_api_base_url() -> Optional[str]:
     """Get the API base URL if connection info is available."""
     if _connection_info["host"] and _connection_info["port"]:
         protocol = "https" if _connection_info["port"] == 443 else "http"
@@ -1159,7 +1159,7 @@ def _get_api_base_url() -> str | None:
     return None
 
 
-async def _fetch_latest_version_from_api() -> str | None:
+async def _fetch_latest_version_from_api() -> Optional[str]:
     """
     Fetch the latest Cyberdriver version from Cyberdesk API.
     Returns None if API is unavailable.
@@ -1186,7 +1186,7 @@ async def _fetch_latest_version_from_api() -> str | None:
     return None
 
 
-async def _fetch_latest_version_from_github() -> str | None:
+async def _fetch_latest_version_from_github() -> Optional[str]:
     """
     Fetch the latest Cyberdriver version from GitHub releases.
     Returns None if GitHub is unavailable or rate limited.
@@ -1239,7 +1239,7 @@ async def _fetch_latest_version_from_github() -> str | None:
         return None
 
 
-async def _resolve_latest_version() -> str | None:
+async def _resolve_latest_version() -> Optional[str]:
     """
     Resolve the latest Cyberdriver version.
     Tries Cyberdesk API first, falls back to GitHub.
