@@ -272,7 +272,7 @@ debug_logger = DebugLogger.get_instance()
 MAX_OUTPUT_LEN: int = 15000
 
 def maybe_truncate_output(content: str, max_length: int = MAX_OUTPUT_LEN) -> str:
-    """Truncate content in the middle if it exceeds the specified length.
+    """Truncate content in the middle if it exceeds the specified length. 
     
     Shows the beginning and end of the output with a clear truncation marker in the middle.
     This allows seeing both the start (usually important context) and end (usually the result).
