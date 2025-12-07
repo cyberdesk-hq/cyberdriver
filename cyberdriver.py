@@ -753,7 +753,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.1"
+VERSION = "test"
 
 @dataclass
 class Config:
