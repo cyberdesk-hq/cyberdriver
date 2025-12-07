@@ -69,6 +69,7 @@ import pyautogui
 import pyperclip
 from PIL import Image
 from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
 from fastapi.responses import Response, JSONResponse
 import uvicorn
 import websockets
@@ -238,7 +239,7 @@ class DebugLogger:
             process = psutil.Process()
             stats["memory_mb"] = f"{process.memory_info().rss / (1024 * 1024):.1f}"
             stats["open_files"] = len(process.open_files())
-            stats["connections"] = len(process.connections())
+            stats["connections"] = len(process.net_connections())
         except ImportError:
             pass
         except Exception:
@@ -271,7 +272,7 @@ debug_logger = DebugLogger.get_instance()
 MAX_OUTPUT_LEN: int = 15000
 
 def maybe_truncate_output(content: str, max_length: int = MAX_OUTPUT_LEN) -> str:
-    """Truncate content in the middle if it exceeds the specified length.
+    """Truncate content in the middle if it exceeds the specified length. 
     
     Shows the beginning and end of the output with a clear truncation marker in the middle.
     This allows seeing both the start (usually important context) and end (usually the result).
@@ -691,7 +692,20 @@ def disable_windows_console_quickedit():
 
 # Define websocket compatibility helper inline
 async def connect_with_headers(uri, headers_dict):
-    """Compatibility wrapper for websocket connections with headers and keepalive settings."""
+    """Compatibility wrapper for websocket connections with headers and keepalive settings.
+    
+    IMPORTANT: Creates a fresh SSL context for EVERY connection to avoid cached
+    session issues that can cause reconnection failures. This mimics what happens
+    when you Ctrl+C and restart the process.
+    """
+    import ssl
+    
+    # Create a FRESH SSL context for every connection attempt
+    # This is critical - the default context caches SSL sessions, and if a session
+    # gets into a bad state (e.g., server closed unexpectedly), it can poison
+    # future connections. Creating a fresh context ensures we start clean.
+    ssl_context = ssl.create_default_context()
+    
     # Common kwargs for robustness across proxies
     ws_kwargs = {
         # Send pings to keep NATs and proxies alive
@@ -703,6 +717,8 @@ async def connect_with_headers(uri, headers_dict):
         "max_queue": 32,
         # Faster close handshakes
         "close_timeout": 3,
+        # Use our fresh SSL context (this is the key fix!)
+        "ssl": ssl_context,
     }
     
     debug_logger.debug("WEBSOCKET", f"Connecting to {uri}",
@@ -737,7 +753,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.33"
+VERSION = "0.0.34"
 
 @dataclass
 class Config:
@@ -1090,7 +1106,7 @@ async def get_diagnostics():
         diagnostics["memory_mb"] = process.memory_info().rss / (1024 * 1024)
         diagnostics["open_files"] = len(process.open_files())
         diagnostics["num_fds"] = process.num_fds() if hasattr(process, "num_fds") else None
-        diagnostics["connections"] = len(process.connections())
+        diagnostics["connections"] = len(process.net_connections())
     except ImportError:
         diagnostics["psutil"] = "not installed (pip install psutil for more diagnostics)"
     except Exception as e:
@@ -1113,6 +1129,527 @@ async def get_diagnostics():
             diagnostics["gdi_error"] = str(e)
     
     return diagnostics
+
+
+# -----------------------------------------------------------------------------
+# Self-Update System (Windows)
+# -----------------------------------------------------------------------------
+
+GITHUB_RELEASES_API_URL = "https://api.github.com/repos/cyberdesk-hq/cyberdriver/releases"
+GITHUB_DOWNLOAD_BASE_URL = "https://github.com/cyberdesk-hq/cyberdriver/releases/download"
+
+# Global connection info (set when run_join is called)
+_connection_info: dict = {
+    "host": None,  # e.g., "api.cyberdesk.io"
+    "port": None,  # e.g., 443
+}
+
+
+def _set_connection_info(host: str, port: int) -> None:
+    """Store connection info for use by update endpoint."""
+    _connection_info["host"] = host
+    _connection_info["port"] = port
+
+
+def _get_api_base_url() -> Optional[str]:
+    """Get the API base URL if connection info is available."""
+    if _connection_info["host"] and _connection_info["port"]:
+        protocol = "https" if _connection_info["port"] == 443 else "http"
+        return f"{protocol}://{_connection_info['host']}"
+    return None
+
+
+async def _fetch_latest_version_from_api() -> Optional[str]:
+    """
+    Fetch the latest Cyberdriver version from Cyberdesk API.
+    Returns None if API is unavailable.
+    """
+    api_base = _get_api_base_url()
+    if not api_base:
+        return None
+    
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{api_base}/v1/internal/cyberdriver-version",
+                follow_redirects=True
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                version = data.get("latest_version")
+                if version:
+                    print(f"Got latest version from Cyberdesk API: {version}")
+                    return version
+    except Exception as e:
+        print(f"Failed to fetch version from Cyberdesk API: {e}")
+    
+    return None
+
+
+async def _fetch_latest_version_from_github() -> Optional[str]:
+    """
+    Fetch the latest Cyberdriver version from GitHub releases.
+    Returns None if GitHub is unavailable or rate limited.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                GITHUB_RELEASES_API_URL,
+                headers={"Accept": "application/vnd.github.v3+json"},
+                follow_redirects=True
+            )
+            if resp.status_code != 200:
+                print(f"GitHub API returned {resp.status_code}")
+                return None
+            
+            releases = resp.json()
+            if not releases:
+                return None
+            
+            # Find the latest version by parsing semantic versions
+            def parse_version(tag: str) -> tuple:
+                tag = tag.lstrip("v")
+                try:
+                    parts = tag.split(".")
+                    return tuple(int(p) for p in parts)
+                except (ValueError, AttributeError):
+                    return (0, 0, 0)
+            
+            # Filter to only version-like tags
+            version_releases = []
+            for release in releases:
+                tag = release.get("tag_name", "")
+                clean_tag = tag.lstrip("v")
+                if clean_tag and all(p.isdigit() for p in clean_tag.split(".")):
+                    version_releases.append(release)
+            
+            if not version_releases:
+                return None
+            
+            # Sort by version and get the latest
+            version_releases.sort(key=lambda r: parse_version(r.get("tag_name", "")), reverse=True)
+            latest_version = version_releases[0].get("tag_name", "").lstrip("v")
+            
+            if latest_version:
+                print(f"Got latest version from GitHub: {latest_version}")
+            return latest_version
+            
+    except Exception as e:
+        print(f"Failed to fetch version from GitHub: {e}")
+        return None
+
+
+async def _resolve_latest_version() -> Optional[str]:
+    """
+    Resolve the latest Cyberdriver version.
+    Tries Cyberdesk API first, falls back to GitHub.
+    """
+    # Try Cyberdesk API first (has caching and higher rate limits)
+    version = await _fetch_latest_version_from_api()
+    if version:
+        return version
+    
+    # Fall back to GitHub
+    print("Falling back to GitHub for version info...")
+    return await _fetch_latest_version_from_github()
+
+
+class UpdateRequest(BaseModel):
+    version: str = Field(default="latest", description="Target version (e.g. '0.0.34') or 'latest'")
+    restart: bool = Field(default=True, description="Whether to restart Cyberdriver after update")
+
+
+@app.post("/internal/update")
+async def post_update(payload: UpdateRequest = UpdateRequest()):
+    """
+    Self-update Cyberdriver on Windows.
+    
+    This endpoint:
+    1. Downloads the new version to a staging location
+    2. Creates an updater script that waits for this process to exit
+    3. The updater script replaces the executable and optionally restarts
+    4. This process exits gracefully
+    
+    Request body (optional):
+    {
+        "version": "0.0.34",  // Target version (without 'v' prefix), or "latest" (default)
+        "restart": true       // Whether to restart after update (default: true)
+    }
+    
+    Returns:
+    {
+        "status": "update_initiated",
+        "current_version": "0.0.34",
+        "target_version": "0.0.34",
+        "message": "Updating to v0.0.34. Cyberdriver will restart automatically."
+    }
+    """
+    if platform.system() != "Windows":
+        return JSONResponse(
+            status_code=501, 
+            content={"error": "Self-update is currently only supported on Windows"}
+        )
+    
+    target_version = payload.version
+    restart_after = payload.restart
+    
+    try:
+        # Get the current executable path
+        if getattr(sys, 'frozen', False):
+            current_exe = sys.executable
+        else:
+            # Running as script - this won't work for self-update
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Self-update only works with compiled executable, not Python script"}
+            )
+        
+        # Resolve "latest" version - tries Cyberdesk API first, falls back to GitHub
+        if target_version == "latest":
+            resolved_version = await _resolve_latest_version()
+            if not resolved_version:
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": "Could not determine latest version (API and GitHub both unavailable)"}
+                )
+            target_version = resolved_version
+            print(f"Resolved 'latest' to version {target_version}")
+        
+        # Check if already at target version or running newer
+        def parse_version(v: str) -> tuple:
+            return tuple(int(p) for p in v.replace("v", "").split("."))
+        
+        try:
+            current_parts = parse_version(VERSION)
+            target_parts = parse_version(target_version)
+            
+            if current_parts >= target_parts:
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "status": "already_up_to_date",
+                        "current_version": VERSION,
+                        "target_version": target_version,
+                        "message": "Cyberdriver is already running the requested version" if current_parts == target_parts 
+                                   else f"Cyberdriver is already running a newer version ({VERSION})"
+                    }
+                )
+        except (ValueError, AttributeError):
+            # If version parsing fails, fall back to string comparison
+            if target_version == VERSION:
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "status": "already_up_to_date",
+                        "current_version": VERSION,
+                        "target_version": target_version,
+                        "message": "Cyberdriver is already running the requested version"
+                    }
+                )
+        
+        # Build download URL for Windows executable 
+        download_url = f"{GITHUB_DOWNLOAD_BASE_URL}/v{target_version}/cyberdriver.exe"
+        
+        # Get staging paths in the same directory as the current executable
+        tool_dir = os.path.dirname(current_exe)
+        staging_exe = os.path.join(tool_dir, "cyberdriver-update.exe")
+        
+        print(f"\n{'='*60}")
+        print(f"SELF-UPDATE INITIATED")
+        print(f"{'='*60}")
+        print(f"Current version: {VERSION}")
+        print(f"Target version:  {target_version}")
+        print(f"Download URL:    {download_url}")
+        print(f"Staging path:    {staging_exe}")
+        print(f"Restart after:   {restart_after}")
+        print(f"{'='*60}\n")
+        
+        # Download new version to staging location
+        print(f"Downloading cyberdriver v{target_version}...")
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.get(download_url, follow_redirects=True)
+            if resp.status_code == 404:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": f"Version v{target_version} not found on GitHub releases"}
+                )
+            if resp.status_code != 200:
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": f"Failed to download update: HTTP {resp.status_code}"}
+                )
+            
+            # Write to staging file
+            with open(staging_exe, "wb") as f:
+                f.write(resp.content)
+        
+        download_size_mb = os.path.getsize(staging_exe) / (1024 * 1024)
+        print(f"Downloaded: {download_size_mb:.2f} MB")
+        
+        # Get current process ID for the updater to wait on
+        current_pid = os.getpid()
+        
+        # Build restart command with original arguments (only if restart_after is True)
+        # Preserve all command-line arguments so the new instance runs with the same config
+        if restart_after:
+            # Get original arguments (skip argv[0] which is the executable path)
+            original_args = sys.argv[1:] if len(sys.argv) > 1 else []
+            
+            # Escape arguments that contain spaces or special characters for batch file
+            escaped_args = []
+            for arg in original_args:
+                # If arg contains spaces, quotes, or special chars, wrap in quotes
+                if ' ' in arg or '"' in arg or '&' in arg or '|' in arg or '<' in arg or '>' in arg or '^' in arg:
+                    # Escape any existing quotes by doubling them
+                    escaped_arg = arg.replace('"', '""')
+                    escaped_args.append(f'"{escaped_arg}"')
+                else:
+                    escaped_args.append(arg)
+            
+            args_str = ' '.join(escaped_args)
+            
+            print(f"Original arguments: {original_args}")
+            print(f"Escaped arguments for restart: {args_str}")
+        
+        # Create updater PowerShell script (more reliable than batch on modern Windows)
+        # Log file for update process
+        update_log = os.path.join(tool_dir, "cyberdriver-update.log")
+        updater_ps1 = os.path.join(tool_dir, "cyberdriver-updater.ps1")
+        
+        # Build restart command for PowerShell
+        if restart_after:
+            # Escape paths and args for embedding in PowerShell
+            exe_escaped = current_exe.replace("'", "''")
+            args_escaped = args_str.replace("'", "''")
+            
+            # Generate a unique task name
+            task_name = f"CyberdriverRestart_{uuid.uuid4().hex[:8]}"
+            
+            # Check if we're running elevated - if so, preserve elevation in the scheduled task
+            # This avoids UAC prompts when restarting with --black-screen-recovery or any other optional flags that need admin rights
+            needs_elevation = is_running_as_admin()
+            run_level = "Highest" if needs_elevation else "Limited"
+            
+            ps_restart_cmd = f'''
+# Restart cyberdriver using scheduled task (most reliable method for hidden process -> visible console)
+Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Starting cyberdriver via scheduled task..."
+Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Exe: {exe_escaped}"
+Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Args: {args_escaped}"
+Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] RunLevel: {run_level} (was_elevated: {str(needs_elevation).lower()})"
+
+try {{
+    $exePath = '{exe_escaped}'
+    $arguments = '{args_escaped}'
+    $taskName = '{task_name}'
+    
+    # Create a scheduled task that runs immediately
+    # This creates an entirely new process tree with proper console allocation
+    # Execute cyberdriver directly - scheduled tasks create their own console for console apps
+    $action = New-ScheduledTaskAction -Execute $exePath -Argument $arguments
+    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(1)
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+    # Use Highest run level if original process was elevated, to preserve admin rights without UAC prompt
+    $principal = New-ScheduledTaskPrincipal -UserId "$env:USERNAME" -LogonType Interactive -RunLevel {run_level}
+    
+    # Register the task
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
+    Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Scheduled task '$taskName' created with RunLevel {run_level}"
+    
+    # Start the task immediately (don't wait for trigger)
+    Start-ScheduledTask -TaskName $taskName
+    Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Scheduled task started"
+    
+    # Wait a moment for task to fully start
+    Start-Sleep -Seconds 2
+    
+    # Clean up the scheduled task
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Scheduled task cleaned up"
+    
+    Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Start command executed successfully"
+}} catch {{
+    Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] ERROR starting cyberdriver: $($_.Exception.Message)"
+    Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Stack trace: $($_.ScriptStackTrace)"
+}}
+'''
+        else:
+            ps_restart_cmd = '''
+Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Restart skipped (restart=false)"
+'''
+        
+        updater_content = f'''# Cyberdriver Self-Updater - PowerShell version
+# Generated automatically - do not edit
+
+$logFile = "{update_log}"
+$stagingExe = "{staging_exe}"
+$currentExe = "{current_exe}"
+$targetPid = {current_pid}
+
+Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Cyberdriver Self-Updater started (PowerShell)"
+Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Waiting for cyberdriver (PID $targetPid) to exit..."
+
+# Wait for the process to exit (up to 30 seconds)
+$maxWait = 30
+$waited = 0
+while ($waited -lt $maxWait) {{
+    try {{
+        $proc = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
+        if ($null -eq $proc) {{
+            Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Process exited"
+            break
+        }}
+    }} catch {{
+        Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Process exited (exception)"
+        break
+    }}
+    Start-Sleep -Seconds 1
+    $waited++
+}}
+
+if ($waited -ge $maxWait) {{
+    Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Timeout - force killing process"
+    try {{ Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue }} catch {{}}
+    Start-Sleep -Seconds 2
+}}
+
+Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Applying update..."
+
+# Wait a bit more for file handles to release
+Start-Sleep -Seconds 2
+
+# Replace the executable
+Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Copying new version..."
+$copySuccess = $false
+for ($i = 0; $i -lt 3; $i++) {{
+    try {{
+        Copy-Item -Path $stagingExe -Destination $currentExe -Force -ErrorAction Stop
+        $copySuccess = $true
+        Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Copy successful"
+        break
+    }} catch {{
+        Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Copy attempt $($i+1) failed: $($_.Exception.Message)"
+        Start-Sleep -Seconds 2
+    }}
+}}
+
+if (-not $copySuccess) {{
+    Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] ERROR: Failed to apply update after 3 attempts"
+    exit 1
+}}
+
+Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Update successful! Updated to version {target_version}"
+
+# Clean up staging file
+try {{
+    Remove-Item -Path $stagingExe -Force -ErrorAction SilentlyContinue
+}} catch {{}}
+
+{ps_restart_cmd}
+
+Add-Content -Path $logFile -Value "[$((Get-Date).ToString())] Self-updater completed"
+
+# Clean up scripts (self-delete with delay)
+Start-Sleep -Seconds 2
+$vbsLauncher = $MyInvocation.MyCommand.Path -replace '\.ps1$', '-launcher.vbs'
+Remove-Item -Path $vbsLauncher -Force -ErrorAction SilentlyContinue
+Remove-Item -Path $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
+'''
+        
+        with open(updater_ps1, "w", encoding="utf-8") as f:
+            f.write(updater_content)
+        
+        print(f"Created updater script: {updater_ps1}")
+        
+        # Create a VBScript wrapper to launch PowerShell truly hidden
+        # This is the industry-standard way to run scripts invisibly on Windows
+        # PowerShell's -WindowStyle Hidden is unreliable and can flash windows
+        vbs_launcher = os.path.join(tool_dir, "cyberdriver-updater-launcher.vbs")
+        vbs_content = f'''Set objShell = CreateObject("WScript.Shell")
+objShell.Run "powershell -NoProfile -ExecutionPolicy Bypass -File ""{updater_ps1}""", 0, False
+'''
+        with open(vbs_launcher, "w", encoding="utf-8") as f:
+            f.write(vbs_content)
+        
+        print(f"Created VBS launcher: {vbs_launcher}")
+        
+        # Launch the VBScript which will launch PowerShell truly hidden
+        # wscript runs VBScript files without any console window
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        CREATE_NO_WINDOW = 0x08000000
+        
+        subprocess.Popen(
+            ["wscript", vbs_launcher],
+            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+            close_fds=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        
+        print(f"Updater script launched successfully.")
+        print(f"Cyberdriver will exit in 2 seconds to allow update...")
+        
+        # Schedule graceful shutdown after returning response
+        async def delayed_exit():
+            await asyncio.sleep(2.0)
+            print(f"\n{'='*60}")
+            print(f"Exiting for self-update...")
+            if restart_after:
+                print(f"Cyberdriver will restart automatically after update.")
+            print(f"{'='*60}\n")
+            os._exit(0)  # Force exit to release all file handles
+        
+        asyncio.create_task(delayed_exit())
+        
+        # Build response with preserved arguments info
+        response_content = {
+            "status": "update_initiated",
+            "current_version": VERSION,
+            "target_version": target_version,
+            "restart": restart_after,
+            "message": f"Updating to v{target_version}. Cyberdriver will restart automatically."
+        }
+        
+        # Include preserved arguments in response if restarting (obfuscate secrets)
+        if restart_after:
+            original_args = sys.argv[1:] if len(sys.argv) > 1 else []
+            # Obfuscate sensitive values (--secret, -s, etc.)
+            obfuscated_args = []
+            skip_next = False
+            for i, arg in enumerate(original_args):
+                if skip_next:
+                    obfuscated_args.append("***")
+                    skip_next = False
+                elif arg in ("--secret", "-s"):
+                    obfuscated_args.append(arg)
+                    skip_next = True
+                elif arg.startswith("--secret="):
+                    obfuscated_args.append("--secret=***")
+                elif arg.startswith("-s="):
+                    obfuscated_args.append("-s=***")
+                else:
+                    obfuscated_args.append(arg)
+            response_content["preserved_arguments"] = obfuscated_args
+        
+        return JSONResponse(status_code=200, content=response_content)
+        
+    except httpx.TimeoutException:
+        return JSONResponse(
+            status_code=504,
+            content={"error": "Timeout while downloading update from GitHub"}
+        )
+    except Exception as e:
+        import traceback
+        error_msg = str(e)
+        print(f"Update failed: {error_msg}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": f"Update failed: {error_msg}",
+                "details": traceback.format_exc()
+            }
+        )
 
 
 @app.get("/computer/display/screenshot", response_class=Response)
@@ -1778,7 +2315,9 @@ def execute_powershell_command(command: str, session_id: str, working_directory:
     # Create command script that handles working directory
     script_lines = []
     if working_directory:
-        script_lines.append(f"Set-Location -Path '{working_directory}'")
+        # Escape single quotes by doubling them (PowerShell single-quote escape)
+        escaped_dir = working_directory.replace("'", "''")
+        script_lines.append(f"Set-Location -Path '{escaped_dir}'")
     script_lines.append(command)
     
     # Join with semicolons for single-line execution
@@ -2018,6 +2557,7 @@ class TunnelClient:
         self.min_sleep = 1
         self.max_sleep = 16
         self._connection_attempt = 0
+        self._consecutive_failures = 0  # Track consecutive short-lived connections for diagnostics
         self.keepalive_manager = keepalive_manager
         self.remote_keepalive_for_main_id = remote_keepalive_for_main_id
         
@@ -2025,16 +2565,82 @@ class TunnelClient:
         # Used to prevent duplicate execution of actions when retries occur
         self._idempotency_cache: Dict[str, Tuple[float, dict]] = {}
         
+    def _cleanup_before_retry(self):
+        """Clean up state before each connection retry.
+        
+        This runs on EVERY retry to ensure we start as fresh as possible,
+        mimicking what happens during Ctrl+C + restart.
+        
+        Cleanup includes:
+        - Reset ThreadPoolExecutor (clears any stuck threads)
+        - Clear idempotency cache (removes stale entries)
+        - Multiple GC passes to clean up circular references
+        - SSL context is created fresh per-connection in connect_with_headers()
+        
+        This is cheap (~100-250ms) compared to retry delays (1-16s).
+        """
+        import gc
+        
+        # Clear the keepalive countdown line before printing debug logs
+        # (the countdown uses \r to overwrite itself, so we need to clear it first)
+        try:
+            if self.keepalive_manager is not None and hasattr(self.keepalive_manager, "_clear_countdown_line"):
+                self.keepalive_manager._clear_countdown_line()
+        except Exception:
+            pass
+        
+        debug_logger.debug("CLEANUP", "Cleaning up before retry",
+                          consecutive_failures=self._consecutive_failures)
+        
+        # 1. Reset the global ThreadPoolExecutor
+        # This clears any stuck or leaked threads
+        # Using wait=True ensures cancelled futures finish before creating new executor
+        global executor
+        try:
+            executor.shutdown(wait=True, cancel_futures=True)
+            executor = ThreadPoolExecutor(max_workers=5)
+        except Exception as e:
+            debug_logger.debug("CLEANUP", f"ThreadPoolExecutor reset failed: {e}")
+        
+        # 2. Clear the idempotency cache (might have stale entries)
+        cache_size = len(self._idempotency_cache)
+        if cache_size > 0:
+            self._idempotency_cache.clear()
+            debug_logger.debug("CLEANUP", f"Cleared idempotency cache ({cache_size} entries)")
+        
+        # 3. Multiple GC passes to clean up circular references
+        # This takes ~50-200ms but ensures no lingering objects
+        total_collected = 0
+        for i in range(3):
+            total_collected += gc.collect(i)
+        if total_collected > 0:
+            debug_logger.debug("CLEANUP", f"GC collected {total_collected} objects")
+        
     async def run(self):
-        """Run the tunnel with exponential backoff reconnection."""
+        """Run the tunnel with exponential backoff reconnection.
+        
+        IMPORTANT: Each retry does full cleanup to mimic Ctrl+C + restart:
+        - Fresh SSL context (in connect_with_headers)
+        - Reset ThreadPoolExecutor
+        - Clear caches
+        - Garbage collection
+        """
+        import random
+        
         sleep_time = self.min_sleep
         
         while True:
             connection_start = time.time()
+            
+            # Full cleanup before EVERY connection attempt
+            # This mimics what happens when you Ctrl+C and restart
+            self._cleanup_before_retry()
+            
             try:
                 await self._connect_and_run()
-                # Reset sleep time on successful connection
+                # This line is never reached - _connect_and_run always raises
                 sleep_time = self.min_sleep
+                self._consecutive_failures = 0
             except asyncio.CancelledError:
                 # Allow task cancellation to stop the tunnel immediately
                 raise
@@ -2058,6 +2664,15 @@ class TunnelClient:
                     connection_duration,
                     close_code=close_code
                 )
+                
+                # Only reset failure counter if connection lasted more than 10 seconds
+                # Short-lived connections indicate an ongoing problem
+                if connection_duration > 10:
+                    self._consecutive_failures = 0
+                else:
+                    self._consecutive_failures += 1
+                    debug_logger.warning("CONNECTION", f"Connection only lasted {connection_duration:.1f}s",
+                                        consecutive_failures=self._consecutive_failures)
                 
                 # Authentication failures should NOT retry
                 # - Close code 4001 (WebSocket close after accept)
@@ -2125,11 +2740,16 @@ class TunnelClient:
                     print("   1. Check your internet connection")
                     print("   2. Verify the server is accessible")
                 
+                # Add random jitter (0-30%) to avoid thundering herd and give network stack time to clean up
+                jittered_sleep = sleep_time * (1 + random.uniform(0, 0.3))
+                
                 print(f"\n{'='*60}")
-                print(f"Retrying in {sleep_time} seconds...")
+                print(f"Retrying in {jittered_sleep:.1f} seconds...")
                 print(f"{'='*60}\n")
                 
-                await asyncio.sleep(sleep_time)
+                # Note: _consecutive_failures is already handled above based on connection duration
+                # (reset to 0 if >10s, incremented if <10s)
+                await asyncio.sleep(jittered_sleep)
                 sleep_time = min(sleep_time * 2, self.max_sleep)
                 
             except Exception as e:
@@ -2172,11 +2792,24 @@ class TunnelClient:
                     print("   2. Install TLS certificates: https://github.com/cyberdesk-hq/cyberdriver#tls-certificate-errors")
                     print("   3. Check your internet connection")
                 
+                # Add random jitter (0-30%) to avoid thundering herd and give network stack time to clean up
+                jittered_sleep = sleep_time * (1 + random.uniform(0, 0.3))
+                
                 print(f"\n{'='*60}")
-                print(f"Retrying in {sleep_time} seconds...")
+                print(f"Retrying in {jittered_sleep:.1f} seconds...")
                 print(f"{'='*60}\n")
                 
-                await asyncio.sleep(sleep_time)
+                # Apply same connection duration logic as ConnectionClosed handler
+                # Only count as failure if connection was short-lived
+                connection_duration = time.time() - connection_start
+                if connection_duration > 10:
+                    self._consecutive_failures = 0
+                else:
+                    self._consecutive_failures += 1
+                    debug_logger.warning("CONNECTION", f"Connection only lasted {connection_duration:.1f}s",
+                                        consecutive_failures=self._consecutive_failures)
+                
+                await asyncio.sleep(jittered_sleep)
                 sleep_time = min(sleep_time * 2, self.max_sleep)
     
     async def _connect_and_run(self):
@@ -2311,10 +2944,15 @@ class TunnelClient:
 
                 # If we exit the async for without an exception, the server closed gracefully
                 connection_duration = time.time() - connection_start_time
-                debug_logger.connection_closed("Server closed connection", connection_duration)
+                
+                # Get close info from the websocket object
+                ws_close_code = getattr(websocket, 'close_code', None)
+                ws_close_reason = getattr(websocket, 'close_reason', None) or "Server closed connection"
+                
+                debug_logger.connection_closed(ws_close_reason, connection_duration, close_code=ws_close_code)
                 
                 # Ensure we signal this to the reconnection loop by raising to trigger backoff
-                raise RuntimeError("WebSocket closed by server")
+                raise RuntimeError(f"WebSocket closed by server (code={ws_close_code})")
     
     def _cleanup_idempotency_cache(self) -> None:
         """Remove expired entries from the idempotency cache."""
@@ -2949,6 +3587,9 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
                    black_screen_check_interval: float = 30.0,
                    debug_enabled: bool = False):
     """Run both API server and tunnel client."""
+    # Store connection info for use by update endpoint
+    _set_connection_info(host, port)
+    
     config = get_config()
     
     # Log resource stats periodically in debug mode
@@ -3074,6 +3715,10 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
             await stop_black_screen_recovery()
             if resource_logger_task:
                 resource_logger_task.cancel()
+                try:
+                    await asyncio.wait_for(resource_logger_task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
             # Cancel server task last
             if server_task and not server_task.done():
                 server_task.cancel()
@@ -3125,6 +3770,10 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
             await stop_black_screen_recovery()
             if resource_logger_task:
                 resource_logger_task.cancel()
+                try:
+                    await asyncio.wait_for(resource_logger_task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
             # Cancel server task last
             if server_task and not server_task.done():
                 server_task.cancel()
