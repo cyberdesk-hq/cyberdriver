@@ -712,6 +712,15 @@ def _setup_detached_stdio_if_configured():
     if not log_path:
         return
 
+    # Ensure downstream code knows logging is redirected to a file and should avoid
+    # ANSI color sequences. We set these in-process because the VBScript launcher
+    # does not reliably propagate env vars from the parent process.
+    try:
+        os.environ["CYBERDRIVER_STDIO_LOG"] = str(log_path)
+        os.environ["CYBERDRIVER_NO_COLOR"] = "1"
+    except Exception:
+        pass
+
     try:
         log_file = open(log_path, "a", encoding="utf-8", buffering=1)
         atexit.register(lambda: log_file.close())
@@ -974,6 +983,77 @@ def _follow_log_file(path: pathlib.Path) -> None:
         print("\n\nStopped watching logs.")
     except Exception as e:
         print(f"\n\nLog tail stopped: {e}")
+
+
+def _default_stdio_log_path() -> pathlib.Path:
+    return get_config_dir() / "logs" / "cyberdriver-stdio.log"
+
+
+def _should_use_color() -> bool:
+    """Return True if we should emit ANSI color sequences to stdout."""
+    try:
+        if os.environ.get("CYBERDRIVER_NO_COLOR") or os.environ.get("NO_COLOR"):
+            return False
+        # If logging is redirected to a file, avoid ANSI escapes.
+        if os.environ.get("CYBERDRIVER_STDIO_LOG"):
+            return False
+        if any(str(a).startswith("--_stdio-log=") for a in sys.argv):
+            return False
+        if hasattr(sys.stdout, "isatty") and not sys.stdout.isatty():
+            return False
+        if platform.system() == "Windows":
+            return _windows_try_enable_ansi()
+        return True
+    except Exception:
+        return False
+
+
+def _print_prominent_stop_hint() -> None:
+    """Print a prominent 'how to stop' hint for background mode."""
+    if _should_use_color():
+        bold = "\033[1m"
+        yellow = "\033[93m"
+        reset = "\033[0m"
+        print(f"{bold}{yellow}To stop Cyberdriver:{reset} {bold}cyberdriver stop{reset}")
+        print(f"{yellow}(Optional){reset}: view logs with {bold}cyberdriver logs{reset}")
+    else:
+        print("To stop Cyberdriver: cyberdriver stop")
+        print("(Optional): view logs with cyberdriver logs")
+
+
+def _get_running_instance_pid_info() -> Optional[Dict[str, Any]]:
+    """Return pidfile info if a running Cyberdriver instance is detected."""
+    pid_path = get_pid_file_path()
+    if not pid_path.exists():
+        return None
+    try:
+        info = json.loads(pid_path.read_text(encoding="utf-8"))
+    except Exception:
+        info = {}
+    pid = info.get("pid")
+    try:
+        pid_int = int(pid)
+    except Exception:
+        pid_int = -1
+    if pid_int <= 0:
+        return None
+    if not _pid_is_running(pid_int):
+        return None
+
+    # Safety: On Windows, verify the image name (or fall back to argv heuristic) so
+    # we don't treat a recycled PID as a running Cyberdriver instance.
+    if platform.system() == "Windows":
+        image = _windows_tasklist_image_name(pid_int)
+        if image:
+            image_l = image.lower()
+            if image_l == "cyberdriver.exe":
+                return info
+            if image_l in ("python.exe", "pythonw.exe"):
+                return info if _pidfile_looks_like_cyberdriver(info) else None
+            return None
+        return info if _pidfile_looks_like_cyberdriver(info) else None
+
+    return info
 
 
 # Define websocket compatibility helper inline
@@ -1278,7 +1358,7 @@ def stop_running_instance(force: bool = False, timeout_seconds: float = 10.0) ->
     """Stop the running Cyberdriver instance found via PID file."""
     pid_path = get_pid_file_path()
     if not pid_path.exists():
-        print(f"No running Cyberdriver found (no pid file at {pid_path}).")
+        print("Cyberdriver is already stopped.")
         return 0
 
     try:
@@ -1295,7 +1375,7 @@ def stop_running_instance(force: bool = False, timeout_seconds: float = 10.0) ->
         return 0
 
     if not _pid_is_running(pid_int):
-        print("Cyberdriver is not running (stale pid file). Removing it.")
+        print("Cyberdriver is already stopped (removing stale pid file).")
         _remove_pid_file_safely()
         return 0
 
@@ -4637,6 +4717,19 @@ def main():
         action="store_true",
         help="Force stop even if the PID can't be verified as Cyberdriver.",
     )
+
+    # logs command
+    logs_parser = subparsers.add_parser(
+        "logs",
+        help="Tail Cyberdriver logs (realtime)",
+        description="Tail the Cyberdriver stdio log file in realtime (Ctrl+C stops tailing).",
+    )
+    logs_parser.add_argument(
+        "--path",
+        type=str,
+        default=None,
+        help="Path to log file (default: ~/.cyberdriver/logs/cyberdriver-stdio.log)",
+    )
     join_parser.add_argument("--secret", required=True, help="Your API key from Cyberdesk")
     join_parser.add_argument("--host", default="api.cyberdesk.io", help="Control server (default: api.cyberdesk.io)")
     join_parser.add_argument("--port", type=int, default=443, help="Control server port (default: 443)")
@@ -4700,6 +4793,7 @@ def main():
         print("  join --secret KEY --debug                 Enable debug logging to ~/.cyberdriver/logs/")
         print("  coords                                    Capture screen coordinates (for keepalive)")
         print("  stop                                     Stop running Cyberdriver")
+        print("  logs                                     Tail Cyberdriver logs (realtime)")
         print()
         print("For more info: cyberdriver join -h")
         sys.exit(0)
@@ -4707,6 +4801,29 @@ def main():
     if args.command == "stop":
         sys.exit(stop_running_instance(force=bool(getattr(args, "force", False)),
                                        timeout_seconds=float(getattr(args, "timeout", 10.0))))
+
+    if args.command == "logs":
+        default_path = _default_stdio_log_path()
+        log_path = pathlib.Path(getattr(args, "path", None) or default_path)
+        if not log_path.exists():
+            print(f"No log file found at: {log_path}")
+            print("Start Cyberdriver with `cyberdriver join` first, then retry.")
+            sys.exit(0)
+        _follow_log_file(log_path)
+        sys.exit(0)
+
+    # Idempotency: if join is invoked while Cyberdriver is already running, do not
+    # start another instance. This applies to both background (default) and --foreground.
+    if args.command == "join" and not getattr(args, "_detached_child", False):
+        info = _get_running_instance_pid_info()
+        if info:
+            pid_int = int(info.get("pid", -1))
+            print_banner(mode="connecting")
+            print(f"Cyberdriver is already running (PID {pid_int}).")
+            print(f"Logs: {_default_stdio_log_path()}")
+            _print_prominent_stop_hint()
+            print("\nIf you want to restart with different flags, run `cyberdriver stop` first.")
+            sys.exit(0)
 
     # On Windows, default to running `join` invisibly in a detached process so closing the
     # launching terminal (or an agent hitting Alt+F4) cannot kill Cyberdriver.
@@ -4736,9 +4853,10 @@ def main():
 
             # Show the nice banner in the *current* terminal (this is not the detached child).
             print_banner(mode="connecting")
-            print("Cyberdriver is now running in the background (no window).")
+            print("Cyberdriver is now running in the background.")
             print(f"Logs: {stdio_log_path}")
-            print("To stop: cyberdriver stop  (or end cyberdriver.exe in Task Manager)")
+            _print_prominent_stop_hint()
+            print("(You can also end cyberdriver.exe in Task Manager.)")
             print()
             _windows_relaunch_detached(child_argv, stdio_log_path)
 
