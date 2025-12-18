@@ -780,20 +780,22 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
     # The "0" parameter to Run means: hidden window
     # The "False" parameter means: don't wait for the process to finish
     #
-    # CRITICAL: We use "cmd /c set _MEIPASS2= &&" to clear PyInstaller's temp directory
-    # inheritance. Without this, the child process tries to use the parent's temp
-    # directory, which gets deleted when the parent exits, causing FileNotFoundError.
+    # CRITICAL: We must clear _MEIPASS2 before launching the child. Without this,
+    # PyInstaller's bootloader in the child process reuses the parent's temp directory,
+    # which gets deleted when the parent exits, causing FileNotFoundError.
     #
-    # NOTE: We pass all config via command-line args, not env vars, because
-    # WshShell.Environment("Process") does NOT inherit to child processes.
+    # We use WshShell.Environment("Process").Remove("_MEIPASS2") to clear the env var
+    # from wscript's environment BEFORE launching the child. The child inherits this
+    # clean environment and creates its own temp directory.
     
-    # Wrap command in cmd.exe to clear PyInstaller env vars
-    # This ensures the child creates its OWN temp directory
-    cmd_wrapper = f'cmd /c "set _MEIPASS2= && {raw_cmd_line}"'
-    vbs_cmd_wrapper = cmd_wrapper.replace('"', '""')
+    vbs_cmd_line = raw_cmd_line.replace('"', '""')
     
     vbs_content = f'''Set WshShell = CreateObject("WScript.Shell")
-WshShell.Run "{vbs_cmd_wrapper}", 0, False
+Set objEnv = WshShell.Environment("Process")
+On Error Resume Next
+objEnv.Remove("_MEIPASS2")
+On Error Goto 0
+WshShell.Run "{vbs_cmd_line}", 0, False
 '''
     
     # Write VBS to temp file
@@ -806,8 +808,8 @@ WshShell.Run "{vbs_cmd_wrapper}", 0, False
     try:
         with open(debug_path, "w", encoding="utf-8") as f:
             f.write(f"Raw command: {raw_cmd_line}\n")
-            f.write(f"CMD wrapper: {cmd_wrapper}\n")
-            f.write(f"VBS command: {vbs_cmd_wrapper}\n")
+            f.write(f"VBS command: {vbs_cmd_line}\n")
+            f.write(f"\nVBS script:\n{vbs_content}\n")
     except Exception:
         pass
     
