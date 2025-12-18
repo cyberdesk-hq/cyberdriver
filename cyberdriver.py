@@ -779,10 +779,21 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
     # Create VBScript that launches cyberdriver hidden
     # The "0" parameter to Run means: hidden window
     # The "False" parameter means: don't wait for the process to finish
+    #
+    # CRITICAL: We use "cmd /c set _MEIPASS2= &&" to clear PyInstaller's temp directory
+    # inheritance. Without this, the child process tries to use the parent's temp
+    # directory, which gets deleted when the parent exits, causing FileNotFoundError.
+    #
     # NOTE: We pass all config via command-line args, not env vars, because
     # WshShell.Environment("Process") does NOT inherit to child processes.
+    
+    # Wrap command in cmd.exe to clear PyInstaller env vars
+    # This ensures the child creates its OWN temp directory
+    cmd_wrapper = f'cmd /c "set _MEIPASS2= && {raw_cmd_line}"'
+    vbs_cmd_wrapper = cmd_wrapper.replace('"', '""')
+    
     vbs_content = f'''Set WshShell = CreateObject("WScript.Shell")
-WshShell.Run "{vbs_cmd_line}", 0, False
+WshShell.Run "{vbs_cmd_wrapper}", 0, False
 '''
     
     # Write VBS to temp file
@@ -795,7 +806,8 @@ WshShell.Run "{vbs_cmd_line}", 0, False
     try:
         with open(debug_path, "w", encoding="utf-8") as f:
             f.write(f"Raw command: {raw_cmd_line}\n")
-            f.write(f"VBS command: {vbs_cmd_line}\n")
+            f.write(f"CMD wrapper: {cmd_wrapper}\n")
+            f.write(f"VBS command: {vbs_cmd_wrapper}\n")
     except Exception:
         pass
     
@@ -821,16 +833,20 @@ WshShell.Run "{vbs_cmd_line}", 0, False
         import time as _time
         _time.sleep(1.0)
         
-        # Check if cyberdriver.exe is running
+        # Check if the child process is running
+        # When frozen (PyInstaller), it's cyberdriver.exe; when running from source, it's python.exe
+        is_frozen = getattr(sys, "frozen", False)
+        expected_image = "cyberdriver.exe" if is_frozen else "python.exe"
+        
         try:
             check = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq cyberdriver.exe", "/FO", "CSV", "/NH"],
+                ["tasklist", "/FI", f"IMAGENAME eq {expected_image}", "/FO", "CSV", "/NH"],
                 capture_output=True,
                 text=True,
                 timeout=5,
                 creationflags=CREATE_NO_WINDOW,
             )
-            if "cyberdriver.exe" not in check.stdout.lower():
+            if expected_image.lower() not in check.stdout.lower():
                 # Child didn't start - check if log file has any errors
                 if stdio_log_path.exists():
                     try:
@@ -839,7 +855,7 @@ WshShell.Run "{vbs_cmd_line}", 0, False
                             raise RuntimeError(f"Child process failed to stay running. Log:\n{log_content}")
                     except Exception:
                         pass
-                raise RuntimeError("Child process did not start (not found in tasklist)")
+                raise RuntimeError(f"Child process did not start ({expected_image} not found in tasklist)")
         except subprocess.TimeoutExpired:
             pass  # tasklist timed out, assume it's fine
         except RuntimeError:
@@ -1265,8 +1281,19 @@ def stop_running_instance(force: bool = False, timeout_seconds: float = 10.0) ->
         # In release builds we expect cyberdriver.exe; in source/dev we may see python.exe.
         if image:
             image_l = image.lower()
-            if image_l not in ("cyberdriver.exe", "python.exe", "pythonw.exe") and not _pidfile_looks_like_cyberdriver(info):
-                print("Refusing to stop: PID does not look like Cyberdriver.")
+            if image_l == "cyberdriver.exe":
+                # Definitely ours - proceed
+                pass
+            elif image_l in ("python.exe", "pythonw.exe"):
+                # Could be cyberdriver running from source, or a completely different Python script.
+                # Verify via PID file argv to avoid killing the wrong process if PID was recycled.
+                if not _pidfile_looks_like_cyberdriver(info):
+                    print("Refusing to stop: python.exe PID does not look like Cyberdriver.")
+                    print("Use `cyberdriver stop --force` if you're sure.")
+                    return 2
+            else:
+                # Unexpected image name - refuse unless force
+                print(f"Refusing to stop: PID {pid_int} is {image}, not cyberdriver.exe.")
                 print("Use `cyberdriver stop --force` if you're sure.")
                 return 2
         else:
@@ -1277,32 +1304,10 @@ def stop_running_instance(force: bool = False, timeout_seconds: float = 10.0) ->
                 return 2
 
     print(f"Stopping Cyberdriver (PID {pid_int})...")
-    deadline = time.time() + max(0.0, float(timeout_seconds))
 
     if platform.system() == "Windows":
-        try:
-            CREATE_NO_WINDOW = 0x08000000
-            r = subprocess.run(
-                ["taskkill", "/PID", str(pid_int), "/T"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                creationflags=CREATE_NO_WINDOW,
-            )
-            out = ((r.stdout or "") + (r.stderr or "")).strip()
-            if r.returncode != 0 and "Access is denied" in out:
-                print("Access denied. If Cyberdriver was started from an Administrator shell, run `cyberdriver stop` as Administrator.")
-        except Exception:
-            pass
-
-        while time.time() < deadline:
-            if not _pid_is_running(pid_int):
-                _remove_pid_file_safely()
-                print("Cyberdriver stopped.")
-                return 0
-            time.sleep(0.2)
-
-        print("Cyberdriver still running; forcing stop...")
+        # For Windows, go straight to force kill (/F). A hidden background process
+        # can't receive graceful termination signals, so there's no point trying.
         try:
             CREATE_NO_WINDOW = 0x08000000
             r = subprocess.run(
@@ -1315,16 +1320,20 @@ def stop_running_instance(force: bool = False, timeout_seconds: float = 10.0) ->
             out = ((r.stdout or "") + (r.stderr or "")).strip()
             if r.returncode != 0 and "Access is denied" in out:
                 print("Access denied. If Cyberdriver was started from an Administrator shell, run `cyberdriver stop` as Administrator.")
+                return 1
         except Exception:
             pass
 
         time.sleep(0.3)
         if not _pid_is_running(pid_int):
             _remove_pid_file_safely()
-            print("Cyberdriver stopped (forced).")
+            print("Cyberdriver stopped.")
             return 0
         print("Failed to stop Cyberdriver.")
         return 1
+    
+    # For non-Windows, try graceful SIGTERM first
+    deadline = time.time() + max(0.0, float(timeout_seconds))
 
     try:
         os.kill(pid_int, signal.SIGTERM)
