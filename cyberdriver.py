@@ -736,31 +736,38 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
 
     cmd = _build_relaunch_command(child_argv)
     
-    # Build the command string for VBScript. We need to:
-    # 1. Quote the exe path (may contain spaces)
-    # 2. Properly quote/escape arguments
-    # 3. Handle VBScript string escaping (double quotes become "")
+    # Build the command string for VBScript.
+    # VBScript string escaping: double-quotes inside a string become ""
+    # The WshShell.Run method takes a string, so we need:
+    #   WshShell.Run "command line here", 0, False
+    # If the command line itself needs quotes (for paths with spaces), we double them.
+    
     exe_path = cmd[0]
     args = cmd[1:] if len(cmd) > 1 else []
     
-    # Build command line with proper quoting for Windows
-    # Each argument that contains spaces needs to be quoted
-    def quote_arg(arg: str) -> str:
-        # If arg contains spaces or quotes, wrap in quotes and escape internal quotes
+    # Build Windows command line with proper quoting
+    def quote_arg_for_cmdline(arg: str) -> str:
+        """Quote an argument for Windows command line if needed."""
         if ' ' in arg or '"' in arg or not arg:
-            # Escape existing quotes by doubling them
-            escaped = arg.replace('"', '""')
-            return f'"""{escaped}"""'
+            # Escape quotes by doubling, then wrap in quotes
+            escaped = arg.replace('"', '\\"')
+            return f'"{escaped}"'
         return arg
     
-    quoted_args = [quote_arg(a) for a in args]
+    # Build the raw command line (as you'd type it in cmd.exe)
+    quoted_exe = f'"{exe_path}"'
+    quoted_args = [quote_arg_for_cmdline(a) for a in args]
     
-    # Build the full command line
-    # The exe path is always quoted (may contain spaces like "Program Files")
     if quoted_args:
-        cmd_line = f'"""{exe_path}""" {" ".join(quoted_args)}'
+        raw_cmd_line = f'{quoted_exe} {" ".join(quoted_args)}'
     else:
-        cmd_line = f'"""{exe_path}"""'
+        raw_cmd_line = quoted_exe
+    
+    # Now escape for VBScript string: double all quotes
+    vbs_cmd_line = raw_cmd_line.replace('"', '""')
+    
+    # Also escape the log path for VBScript
+    vbs_log_path = str(stdio_log_path).replace('"', '""')
     
     # Create VBScript that sets env vars and launches cyberdriver hidden
     # The "0" parameter to Run means: hidden window
@@ -768,10 +775,10 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
     vbs_content = f'''Set WshShell = CreateObject("WScript.Shell")
 Set objEnv = WshShell.Environment("Process")
 objEnv("CYBERDRIVER_DETACHED") = "1"
-objEnv("CYBERDRIVER_STDIO_LOG") = "{stdio_log_path}"
+objEnv("CYBERDRIVER_STDIO_LOG") = "{vbs_log_path}"
 objEnv("CYBERDRIVER_NO_COLOR") = "1"
 objEnv("PYTHONUNBUFFERED") = "1"
-WshShell.Run {cmd_line}, 0, False
+WshShell.Run "{vbs_cmd_line}", 0, False
 '''
     
     # Write VBS to temp file
