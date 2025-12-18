@@ -753,7 +753,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.34"
+VERSION = "0.0.35"
 
 @dataclass
 class Config:
@@ -1664,27 +1664,47 @@ async def get_screenshot(
     except ValueError:
         scale_mode = ScaleMode.EXACT
     
-    with mss.mss() as sct:
-        monitor = sct.monitors[1]
-        img = sct.grab(monitor)
-        # Convert to PIL Image
-        pil_image = Image.frombytes('RGB', img.size, img.bgra, 'raw', 'BGRX')
-        
-        # Default to 1024x768 if no dimensions specified
-        if width is None and height is None:
-            width = 1024
-            height = 768
-        
-        # Apply scaling
-        if width is not None or height is not None:
-            pil_image = scale_image(pil_image, width, height, scale_mode)
-        
-        # Convert to PNG
-        output = BytesIO()
-        pil_image.save(output, format='PNG')
-        png_bytes = output.getvalue()
+    # Retry logic for transient mss failures (Windows Desktop Duplication API can fail randomly)
+    max_retries = 3
+    last_error = None
     
-    return Response(content=png_bytes, media_type="image/png")
+    for attempt in range(max_retries):
+        try:
+            with mss.mss() as sct:
+                monitor = sct.monitors[1]
+                img = sct.grab(monitor)
+                # Convert to PIL Image
+                pil_image = Image.frombytes('RGB', img.size, img.bgra, 'raw', 'BGRX')
+                
+                # Default to 1024x768 if no dimensions specified
+                if width is None and height is None:
+                    width = 1024
+                    height = 768
+                
+                # Apply scaling
+                if width is not None or height is not None:
+                    pil_image = scale_image(pil_image, width, height, scale_mode)
+                
+                # Convert to PNG
+                output = BytesIO()
+                pil_image.save(output, format='PNG')
+                png_bytes = output.getvalue()
+            
+            return Response(content=png_bytes, media_type="image/png")
+        
+        except Exception as e:
+            last_error = e
+            error_msg = str(e) if str(e) else type(e).__name__
+            if attempt < max_retries - 1:
+                # Brief delay before retry
+                await asyncio.sleep(0.05)
+                print(f"Screenshot capture failed (attempt {attempt + 1}/{max_retries}): {error_msg}, retrying...")
+            else:
+                print(f"Screenshot capture failed after {max_retries} attempts: {error_msg}")
+    
+    # All retries exhausted
+    error_detail = str(last_error) if last_error and str(last_error) else f"Screen capture failed ({type(last_error).__name__})"
+    raise HTTPException(status_code=500, detail=error_detail)
 
 
 @app.get("/computer/display/dimensions")
@@ -3083,11 +3103,13 @@ class TunnelClient:
                     }
         except Exception as e:
             duration_ms = (time.time() - request_start) * 1000
-            debug_logger.error("REQUEST", f"Request failed: {e}", method=method, path=path, duration_ms=f"{duration_ms:.1f}ms")
+            # Ensure we always have a meaningful error message
+            error_msg = str(e) if str(e) else f"{type(e).__name__}: (no details)"
+            debug_logger.error("REQUEST", f"Request failed: {error_msg}", method=method, path=path, duration_ms=f"{duration_ms:.1f}ms")
             result = {
                 "status": 500,
                 "headers": {"content-type": "text/plain"},
-                "body": str(e).encode(),
+                "body": error_msg.encode(),
             }
         
         # Cache the response if idempotency key was provided and request was successful
