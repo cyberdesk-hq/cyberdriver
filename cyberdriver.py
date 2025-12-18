@@ -914,7 +914,22 @@ async def connect_with_headers(uri, headers_dict):
     #
     # We use certifi's CA bundle to ensure we have up-to-date root certificates,
     # which fixes TLS errors on Windows machines missing Let's Encrypt's ISRG Root X1.
-    ssl_context = ssl.create_default_context(cafile=certifi.where())
+    try:
+        ca_file = certifi.where()
+        if os.path.exists(ca_file):
+            ssl_context = ssl.create_default_context(cafile=ca_file)
+            if DEBUG:
+                print(f"[DEBUG] Using certifi CA bundle: {ca_file}")
+        else:
+            # Certifi bundle not found (PyInstaller bundling issue?) - fall back to system
+            print(f"[WARNING] Certifi CA bundle not found at: {ca_file}")
+            print("[WARNING] Falling back to system CA store")
+            ssl_context = ssl.create_default_context()
+    except Exception as e:
+        # Any error with certifi - fall back to system defaults
+        print(f"[WARNING] Certifi error: {e}")
+        print("[WARNING] Falling back to system CA store")
+        ssl_context = ssl.create_default_context()
     
     # Common kwargs for robustness across proxies
     ws_kwargs = {
