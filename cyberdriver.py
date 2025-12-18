@@ -726,42 +726,85 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
 
     This ensures Cyberdriver keeps running even if the launching terminal window
     (PowerShell/cmd/etc.) is closed (e.g., by an automation agent hitting Alt+F4).
+    
+    We use a VBScript wrapper because it's the most reliable way to launch a console
+    application truly hidden on Windows. Direct subprocess flags (DETACHED_PROCESS,
+    CREATE_NO_WINDOW) have compatibility issues with PyInstaller frozen executables.
     """
     if platform.system() != "Windows":
         raise RuntimeError("_windows_relaunch_detached called on non-Windows")
 
-    DETACHED_PROCESS = 0x00000008
-    CREATE_NEW_PROCESS_GROUP = 0x00000200
-    # Note: CREATE_NO_WINDOW (0x08000000) can cause PyInstaller frozen exes to crash
-    # during bootloader. We use DETACHED_PROCESS instead which still detaches from
-    # the parent console but allows the child to have its own (hidden) console.
-
     cmd = _build_relaunch_command(child_argv)
     
-    env = os.environ.copy()
-    env["CYBERDRIVER_DETACHED"] = "1"
-    env["CYBERDRIVER_STDIO_LOG"] = str(stdio_log_path)
-    # When writing logs to a file (and then tailing them), ANSI color codes often
-    # render as garbage in some Windows console hosts. Prefer clean text logs.
-    env["CYBERDRIVER_NO_COLOR"] = "1"
-    env["PYTHONUNBUFFERED"] = "1"
-
-    proc = subprocess.Popen(
-        cmd,
-        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-        close_fds=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=env,
-    )
+    # Build the command string for VBScript. We need to:
+    # 1. Quote the exe path (may contain spaces)
+    # 2. Properly quote/escape arguments
+    # 3. Handle VBScript string escaping (double quotes become "")
+    exe_path = cmd[0]
+    args = cmd[1:] if len(cmd) > 1 else []
     
-    # Brief sanity check: if the child exits immediately, something is wrong.
-    import time as _time
-    _time.sleep(0.3)
-    exit_code = proc.poll()
-    if exit_code is not None:
-        raise RuntimeError(f"Background process exited immediately with code {exit_code}")
+    # Build command line with proper quoting for Windows
+    # Each argument that contains spaces needs to be quoted
+    def quote_arg(arg: str) -> str:
+        # If arg contains spaces or quotes, wrap in quotes and escape internal quotes
+        if ' ' in arg or '"' in arg or not arg:
+            # Escape existing quotes by doubling them
+            escaped = arg.replace('"', '""')
+            return f'"""{escaped}"""'
+        return arg
+    
+    quoted_args = [quote_arg(a) for a in args]
+    
+    # Build the full command line
+    # The exe path is always quoted (may contain spaces like "Program Files")
+    if quoted_args:
+        cmd_line = f'"""{exe_path}""" {" ".join(quoted_args)}'
+    else:
+        cmd_line = f'"""{exe_path}"""'
+    
+    # Create VBScript that sets env vars and launches cyberdriver hidden
+    # The "0" parameter to Run means: hidden window
+    # The "False" parameter means: don't wait for the process to finish
+    vbs_content = f'''Set WshShell = CreateObject("WScript.Shell")
+Set objEnv = WshShell.Environment("Process")
+objEnv("CYBERDRIVER_DETACHED") = "1"
+objEnv("CYBERDRIVER_STDIO_LOG") = "{stdio_log_path}"
+objEnv("CYBERDRIVER_NO_COLOR") = "1"
+objEnv("PYTHONUNBUFFERED") = "1"
+WshShell.Run {cmd_line}, 0, False
+'''
+    
+    # Write VBS to temp file
+    config_dir = get_config_dir()
+    config_dir.mkdir(parents=True, exist_ok=True)
+    vbs_path = config_dir / "launch-hidden.vbs"
+    
+    try:
+        with open(vbs_path, "w", encoding="utf-8") as f:
+            f.write(vbs_content)
+        
+        # Run the VBS with wscript (silent VBS executor)
+        # wscript runs VBScript without showing any console window
+        result = subprocess.run(
+            ["wscript", "//NoLogo", str(vbs_path)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        
+        if result.returncode != 0:
+            raise RuntimeError(f"VBScript launcher failed: {result.stderr or result.stdout}")
+        
+        # Give the child a moment to start
+        import time as _time
+        _time.sleep(0.5)
+        
+    finally:
+        # Clean up VBS file
+        try:
+            vbs_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def _windows_try_enable_ansi() -> bool:
