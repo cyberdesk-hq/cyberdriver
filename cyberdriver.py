@@ -745,6 +745,32 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
         raise RuntimeError("_windows_relaunch_detached called on non-Windows")
 
     cmd = _build_relaunch_command(child_argv)
+
+    # PyInstaller onefile spawns a "child" process that can inherit special env vars
+    # from the parent process. If those env vars leak into our hidden launcher (wscript)
+    # and then into the detached Cyberdriver process, the child may incorrectly reuse
+    # the parent's extraction directory. When the parent exits, PyInstaller attempts to
+    # delete that directory and you'll see:
+    #   [PYI-xxxx:WARNING] Failed to remove temporary directory: ...\_MEI...
+    # and the detached process may crash with FileNotFoundError for base_library.zip.
+    #
+    # Historically this was `_MEIPASS2`; in newer PyInstaller versions it is
+    # `_PYI_APPLICATION_HOME_DIR` (and there are other `_PYI_*` vars).
+    #
+    # Make sure wscript starts with a clean environment so the detached process
+    # creates its *own* extraction directory.
+    wscript_env = os.environ.copy()
+    for k in list(wscript_env.keys()):
+        if k == "_MEIPASS2" or k.startswith("_PYI_"):
+            wscript_env.pop(k, None)
+
+    # PyInstaller also adjusts the process DLL search path in onefile mode, which can
+    # leak into child processes on Windows. Reset it before launching `wscript`.
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetDllDirectoryW(None)
+    except Exception:
+        pass
     
     # Build the command string for VBScript.
     # VBScript string escaping: double-quotes inside a string become ""
@@ -780,20 +806,14 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
     # The "0" parameter to Run means: hidden window
     # The "False" parameter means: don't wait for the process to finish
     #
-    # CRITICAL: We must clear _MEIPASS2 before launching the child. Without this,
-    # PyInstaller's bootloader in the child process reuses the parent's temp directory,
-    # which gets deleted when the parent exits, causing FileNotFoundError.
-    #
-    # We use WshShell.Environment("Process").Remove("_MEIPASS2") to clear the env var
-    # from wscript's environment BEFORE launching the child. The child inherits this
-    # clean environment and creates its own temp directory.
-    
-    vbs_cmd_line = raw_cmd_line.replace('"', '""')
+    # Belt-and-suspenders: also attempt to clear the env vars from within the VBScript
+    # process, in case the user's environment is unusual.
     
     vbs_content = f'''Set WshShell = CreateObject("WScript.Shell")
 Set objEnv = WshShell.Environment("Process")
 On Error Resume Next
-objEnv.Remove("_MEIPASS2")
+objEnv.Remove "_MEIPASS2"
+objEnv.Remove "_PYI_APPLICATION_HOME_DIR"
 On Error Goto 0
 WshShell.Run "{vbs_cmd_line}", 0, False
 '''
@@ -826,6 +846,7 @@ WshShell.Run "{vbs_cmd_line}", 0, False
             text=True,
             timeout=10,
             creationflags=CREATE_NO_WINDOW,
+            env=wscript_env,
         )
         
         if result.returncode != 0:
