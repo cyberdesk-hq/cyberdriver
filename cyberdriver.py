@@ -944,13 +944,42 @@ def _windows_try_enable_ansi() -> bool:
 
 
 def _follow_log_file(path: pathlib.Path) -> None:
-    """Tail a log file to stdout until Ctrl+C."""
+    """Tail a log file to stdout until Ctrl+C or Enter."""
     print("\n--- Cyberdriver logs (tail) ---")
-    print("(Press Ctrl+C to stop watching logs. Cyberdriver will continue running.)\n")
+    print("(Press Ctrl+C or Enter to stop watching logs. Cyberdriver will continue running.)\n")
+
+    # Allow "press Enter to stop" without breaking Ctrl+C behavior.
+    # We only enable this when stdin is interactive (tty).
+    stop_event = None
+    try:
+        import threading
+
+        if hasattr(sys.stdin, "isatty") and sys.stdin.isatty():
+            stop_event = threading.Event()
+
+            def _wait_for_enter() -> None:
+                try:
+                    sys.stdin.readline()
+                except Exception:
+                    return
+                try:
+                    stop_event.set()  # type: ignore[union-attr]
+                except Exception:
+                    pass
+
+            threading.Thread(target=_wait_for_enter, daemon=True).start()
+    except Exception:
+        stop_event = None
 
     # Wait briefly for the child to create the log file.
     start = time.time()
     while not path.exists() and (time.time() - start) < 5.0:
+        try:
+            if stop_event is not None and stop_event.is_set():  # type: ignore[union-attr]
+                print("\n\nStopped watching logs.")
+                return
+        except Exception:
+            pass
         time.sleep(0.1)
 
     try:
@@ -974,6 +1003,12 @@ def _follow_log_file(path: pathlib.Path) -> None:
             # Now follow new lines.
             f.seek(0, os.SEEK_END)
             while True:
+                try:
+                    if stop_event is not None and stop_event.is_set():  # type: ignore[union-attr]
+                        print("\n\nStopped watching logs.")
+                        return
+                except Exception:
+                    pass
                 line = f.readline()
                 if line:
                     print(line, end="")
@@ -1012,10 +1047,10 @@ def _print_prominent_stop_hint() -> None:
     """Print a prominent 'how to stop' hint for background mode."""
     if _should_use_color():
         bold = "\033[1m"
-        yellow = "\033[93m"
+        red = "\033[91m"
         reset = "\033[0m"
-        print(f"{bold}{yellow}To stop Cyberdriver:{reset} {bold}cyberdriver stop{reset}")
-        print(f"{yellow}(Optional){reset}: view logs with {bold}cyberdriver logs{reset}")
+        print(f"{bold}{red}To stop Cyberdriver:{reset} {bold}cyberdriver stop{reset}")
+        print(f"(Optional): view logs with {bold}cyberdriver logs{reset}")
     else:
         print("To stop Cyberdriver: cyberdriver stop")
         print("(Optional): view logs with cyberdriver logs")
@@ -1077,8 +1112,11 @@ async def connect_with_headers(uri, headers_dict):
         ca_file = certifi.where()
         if os.path.exists(ca_file):
             ssl_context = ssl.create_default_context(cafile=ca_file)
-            if DEBUG:
-                print(f"[DEBUG] Using certifi CA bundle: {ca_file}")
+            # Best-effort debug signal (no-op unless debug logger is enabled).
+            try:
+                debug_logger.debug("SSL", f"Using certifi CA bundle: {ca_file}")
+            except Exception:
+                pass
         else:
             # Certifi bundle not found (PyInstaller bundling issue?) - fall back to system
             print(f"[WARNING] Certifi CA bundle not found at: {ca_file}")
@@ -3510,30 +3548,22 @@ class TunnelClient:
         debug_logger.connection_established(uri)
         
         async with websocket:
-            # Print success message with green checkmark
-            # Ensure countdown line (if any) is cleared before printing
+            # Print a success message. If we're logging to a file (detached/background mode),
+            # avoid ANSI escape sequences so logs stay readable.
+            # Ensure countdown line (if any) is cleared before printing.
             try:
                 if self.keepalive_manager is not None and hasattr(self.keepalive_manager, "_clear_countdown_line"):
                     self.keepalive_manager._clear_countdown_line()
             except Exception:
                 pass
-            if platform.system() == "Windows":
-                # Check if colors are supported
-                try:
-                    import ctypes
-                    kernel32 = ctypes.windll.kernel32
-                    kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
-                    green = '\033[92m'
-                    white = '\033[97m'
-                    reset = '\033[0m'
-                    print(f"{green}✓{reset} {white}Connected!{reset} Forwarding to http://127.0.0.1:{self.target_port}")
-                except:
-                    print(f"√ Connected! Forwarding to http://127.0.0.1:{self.target_port}")
+            connected_msg = f"Connected! Forwarding to http://127.0.0.1:{self.target_port}"
+            if _should_use_color():
+                green = "\033[92m"
+                white = "\033[97m"
+                reset = "\033[0m"
+                print(f"{green}✓{reset} {white}{connected_msg}{reset}")
             else:
-                green = '\033[92m'
-                white = '\033[97m'
-                reset = '\033[0m'
-                print(f"{green}✓{reset} {white}Connected!{reset} Forwarding to http://127.0.0.1:{self.target_port}")
+                print(f"✓ {connected_msg}")
             # Optionally re-print countdown immediately after connect
             try:
                 if self.keepalive_manager is not None and hasattr(self.keepalive_manager, "_print_countdown"):
@@ -4809,6 +4839,11 @@ def main():
             print(f"No log file found at: {log_path}")
             print("Start Cyberdriver with `cyberdriver join` first, then retry.")
             sys.exit(0)
+        # Ensure Ctrl+C behaves like users expect for tailing (KeyboardInterrupt).
+        try:
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+        except Exception:
+            pass
         _follow_log_file(log_path)
         sys.exit(0)
 
@@ -4854,6 +4889,7 @@ def main():
             # Show the nice banner in the *current* terminal (this is not the detached child).
             print_banner(mode="connecting")
             print("Cyberdriver is now running in the background.")
+            print("You can close PowerShell.")
             print(f"Logs: {stdio_log_path}")
             _print_prominent_stop_hint()
             print("(You can also end cyberdriver.exe in Task Manager.)")
@@ -4863,6 +4899,11 @@ def main():
             # Default UX: return immediately. If the user wants logs in this terminal,
             # they can opt-in with --tail.
             if bool(getattr(args, "tail", False)):
+                # Make Ctrl+C stop tailing (not print the join shutdown message).
+                try:
+                    signal.signal(signal.SIGINT, signal.default_int_handler)
+                except Exception:
+                    pass
                 _follow_log_file(stdio_log_path)
             return
         except Exception as e:
@@ -4902,12 +4943,12 @@ def main():
         else:
             # Running as admin - show confirmation
             try:
-                import ctypes
-                kernel32 = ctypes.windll.kernel32
-                kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
-                green = '\033[92m'
-                reset = '\033[0m'
-                print(f"{green}✓{reset} Running with administrator privileges\n")
+                if _should_use_color():
+                    green = "\033[92m"
+                    reset = "\033[0m"
+                    print(f"{green}✓{reset} Running with administrator privileges\n")
+                else:
+                    print("✓ Running with administrator privileges\n")
             except:
                 print("✓ Running with administrator privileges\n")
     
