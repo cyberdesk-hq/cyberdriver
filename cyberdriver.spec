@@ -10,7 +10,8 @@ datas = []
 binaries = []
 hiddenimports = []
 
-for package in ['fastapi', 'uvicorn', 'mss']:
+# Include certifi's CA bundle so TLS works on Windows machines missing root certs
+for package in ['fastapi', 'uvicorn', 'mss', 'certifi']:
     tmp_datas, tmp_binaries, tmp_hiddens = collect_all(package)
     datas += tmp_datas
     binaries += tmp_binaries

@@ -63,6 +63,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from contextlib import asynccontextmanager
 
+import certifi
 import httpx
 import mss
 import numpy as np
@@ -734,6 +735,12 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
     CREATE_NO_WINDOW = 0x08000000
 
     cmd = _build_relaunch_command(child_argv)
+    
+    # Debug: show what we're about to run
+    print(f"[DEBUG] Spawning background process...")
+    print(f"[DEBUG] Command: {' '.join(cmd)}")
+    print(f"[DEBUG] Log file: {stdio_log_path}")
+    
     env = os.environ.copy()
     env["CYBERDRIVER_DETACHED"] = "1"
     env["CYBERDRIVER_STDIO_LOG"] = str(stdio_log_path)
@@ -742,7 +749,7 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
     env["CYBERDRIVER_NO_COLOR"] = "1"
     env["PYTHONUNBUFFERED"] = "1"
 
-    subprocess.Popen(
+    proc = subprocess.Popen(
         cmd,
         creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
         close_fds=True,
@@ -751,6 +758,15 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
         stderr=subprocess.DEVNULL,
         env=env,
     )
+    
+    print(f"[DEBUG] Background process started with PID: {proc.pid}")
+    
+    # Brief sanity check: if the child exits immediately, something is wrong.
+    import time as _time
+    _time.sleep(0.5)
+    exit_code = proc.poll()
+    if exit_code is not None:
+        raise RuntimeError(f"Background process exited immediately with code {exit_code}")
 
 
 def _windows_try_enable_ansi() -> bool:
@@ -846,7 +862,10 @@ async def connect_with_headers(uri, headers_dict):
     # This is critical - the default context caches SSL sessions, and if a session
     # gets into a bad state (e.g., server closed unexpectedly), it can poison
     # future connections. Creating a fresh context ensures we start clean.
-    ssl_context = ssl.create_default_context()
+    #
+    # We use certifi's CA bundle to ensure we have up-to-date root certificates,
+    # which fixes TLS errors on Windows machines missing Let's Encrypt's ISRG Root X1.
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
     
     # Common kwargs for robustness across proxies
     ws_kwargs = {
@@ -4585,7 +4604,8 @@ def main():
                 _follow_log_file(stdio_log_path)
             return
         except Exception as e:
-            print(f"Warning: Failed to relaunch detached; continuing in foreground. ({e})")
+            print(f"\nWarning: Failed to start background process: {e}")
+            print("Continuing in foreground mode instead.\n")
     
     # Show banner for join command
     if args.command == "join":
