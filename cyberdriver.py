@@ -982,14 +982,24 @@ def _pid_is_running(pid: int) -> bool:
 
     if platform.system() == "Windows":
         try:
+            # Use CSV output so we can reliably detect "not found".
+            # When no match exists, tasklist prints:
+            #   INFO: No tasks are running which match the specified criteria.
+            CREATE_NO_WINDOW = 0x08000000
             r = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}"],
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
                 capture_output=True,
                 text=True,
                 timeout=5,
+                creationflags=CREATE_NO_WINDOW,
             )
-            out = (r.stdout or "") + (r.stderr or "")
-            return str(pid) in out
+            out = ((r.stdout or "") + (r.stderr or "")).strip()
+            if not out:
+                return False
+            if "No tasks are running" in out:
+                return False
+            # If a row exists, it's running.
+            return True
         except Exception:
             return False
     else:
@@ -1002,18 +1012,8 @@ def _pid_is_running(pid: int) -> bool:
 
 def _get_process_cmdline(pid: int) -> Optional[str]:
     if platform.system() == "Windows":
-        try:
-            cmd = f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine"
-            r = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", cmd],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            s = (r.stdout or "").strip()
-            return s or None
-        except Exception:
-            return None
+        # Avoid spawning PowerShell windows; prefer tasklist parsing elsewhere.
+        return None
     else:
         try:
             proc_cmdline = pathlib.Path(f"/proc/{pid}/cmdline")
@@ -1033,6 +1033,43 @@ def _cmdline_looks_like_cyberdriver(cmdline: str) -> bool:
         or "cyberdriver.py" in s
         or "cyberdriver.exe" in s
     )
+
+
+def _windows_tasklist_image_name(pid: int) -> Optional[str]:
+    """Return the image name for PID, or None if not found."""
+    if platform.system() != "Windows":
+        return None
+    try:
+        import csv
+        from io import StringIO
+
+        CREATE_NO_WINDOW = 0x08000000
+        r = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
+        if not out or "No tasks are running" in out:
+            return None
+        row = next(csv.reader(StringIO(out)))
+        # CSV format: "Image Name","PID","Session Name","Session#","Mem Usage"
+        if not row:
+            return None
+        return (row[0] or "").strip().strip('"') or None
+    except Exception:
+        return None
+
+
+def _pidfile_looks_like_cyberdriver(info: Dict[str, Any]) -> bool:
+    try:
+        argv = info.get("argv") or []
+        s = " ".join(str(a) for a in argv).lower()
+        return "cyberdriver" in s
+    except Exception:
+        return False
 
 
 def stop_running_instance(force: bool = False, timeout_seconds: float = 10.0) -> int:
@@ -1060,22 +1097,34 @@ def stop_running_instance(force: bool = False, timeout_seconds: float = 10.0) ->
         _remove_pid_file_safely()
         return 0
 
-    cmdline = _get_process_cmdline(pid_int)
-    if cmdline and not _cmdline_looks_like_cyberdriver(cmdline) and not force:
-        print("Refusing to stop: PID does not look like Cyberdriver.")
-        print("Use `cyberdriver stop --force` if you're sure.")
-        return 2
+    if platform.system() == "Windows" and not force:
+        image = _windows_tasklist_image_name(pid_int)
+        # In release builds we expect cyberdriver.exe; in source/dev we may see python.exe.
+        if image:
+            image_l = image.lower()
+            if image_l not in ("cyberdriver.exe", "python.exe", "pythonw.exe") and not _pidfile_looks_like_cyberdriver(info):
+                print("Refusing to stop: PID does not look like Cyberdriver.")
+                print("Use `cyberdriver stop --force` if you're sure.")
+                return 2
+        else:
+            # If we can't determine the image name, fall back to pidfile argv heuristic.
+            if not _pidfile_looks_like_cyberdriver(info):
+                print("Refusing to stop: PID does not look like Cyberdriver.")
+                print("Use `cyberdriver stop --force` if you're sure.")
+                return 2
 
     print(f"Stopping Cyberdriver (PID {pid_int})...")
     deadline = time.time() + max(0.0, float(timeout_seconds))
 
     if platform.system() == "Windows":
         try:
+            CREATE_NO_WINDOW = 0x08000000
             subprocess.run(
                 ["taskkill", "/PID", str(pid_int), "/T"],
                 capture_output=True,
                 text=True,
                 timeout=10,
+                creationflags=CREATE_NO_WINDOW,
             )
         except Exception:
             pass
@@ -1088,11 +1137,13 @@ def stop_running_instance(force: bool = False, timeout_seconds: float = 10.0) ->
             time.sleep(0.2)
 
         try:
+            CREATE_NO_WINDOW = 0x08000000
             subprocess.run(
                 ["taskkill", "/PID", str(pid_int), "/T", "/F"],
                 capture_output=True,
                 text=True,
                 timeout=10,
+                creationflags=CREATE_NO_WINDOW,
             )
         except Exception:
             pass

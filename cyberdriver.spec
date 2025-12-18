@@ -64,10 +64,12 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 # EXE
 _console = True
 if sys.platform == "win32":
-    # Default Windows builds to "windowed" (no console) to avoid an AI agent
-    # accidentally terminating Cyberdriver by closing/Alt+F4'ing the console.
-    # Set CYBERDRIVER_CONSOLE=1 to build a console binary for debugging.
-    _console = os.environ.get("CYBERDRIVER_CONSOLE", "").lower() in ("1", "true", "yes")
+    # IMPORTANT:
+    # The default Windows artifact should be a console app so running `cyberdriver join`
+    # from PowerShell can show logs (we tail the detached background instance's log file).
+    # To build a windowed/no-console variant, set CYBERDRIVER_WINDOWED=1.
+    _windowed = os.environ.get("CYBERDRIVER_WINDOWED", "").lower() in ("1", "true", "yes")
+    _console = not _windowed
 
 exe = EXE(
     pyz,
