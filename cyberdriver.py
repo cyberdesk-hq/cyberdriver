@@ -108,7 +108,7 @@ class DebugLogger:
     
     @classmethod
     def initialize(cls, enabled: bool = False, log_dir: Optional[str] = None) -> "DebugLogger":
-        """Initialize the global debug logger."""
+        """Initialize the global debug logger. """
         cls._instance = cls(enabled=enabled, log_dir=log_dir)
         return cls._instance
     
