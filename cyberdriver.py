@@ -732,14 +732,11 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
 
     DETACHED_PROCESS = 0x00000008
     CREATE_NEW_PROCESS_GROUP = 0x00000200
-    CREATE_NO_WINDOW = 0x08000000
+    # Note: CREATE_NO_WINDOW (0x08000000) can cause PyInstaller frozen exes to crash
+    # during bootloader. We use DETACHED_PROCESS instead which still detaches from
+    # the parent console but allows the child to have its own (hidden) console.
 
     cmd = _build_relaunch_command(child_argv)
-    
-    # Debug: show what we're about to run
-    print(f"[DEBUG] Spawning background process...")
-    print(f"[DEBUG] Command: {' '.join(cmd)}")
-    print(f"[DEBUG] Log file: {stdio_log_path}")
     
     env = os.environ.copy()
     env["CYBERDRIVER_DETACHED"] = "1"
@@ -751,7 +748,7 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
 
     proc = subprocess.Popen(
         cmd,
-        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
         close_fds=True,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
@@ -759,11 +756,9 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
         env=env,
     )
     
-    print(f"[DEBUG] Background process started with PID: {proc.pid}")
-    
     # Brief sanity check: if the child exits immediately, something is wrong.
     import time as _time
-    _time.sleep(0.5)
+    _time.sleep(0.3)
     exit_code = proc.poll()
     if exit_code is not None:
         raise RuntimeError(f"Background process exited immediately with code {exit_code}")
