@@ -123,7 +123,7 @@ When running cyberdriver on Windows, the console window is visible and can be ac
 
 When you run `cyberdriver join` on Windows, protection is automatically enabled:
 - **Close button disabled** - The X button is grayed out and non-functional
-- **Window minimized** - Console minimizes to taskbar, staying out of the agent's way
+- **Invisible background mode (default)** - Cyberdriver relaunches itself detached with **no visible console window**. Closing/Alt+F4'ing the original PowerShell window will **not** kill Cyberdriver.
 - **QuickEdit disabled** - Prevents console hanging if clicked
 
 No extra setup needed! Just run:
@@ -131,7 +131,30 @@ No extra setup needed! Just run:
 cyberdriver join --secret YOUR_API_KEY
 ```
 
-**To stop:** Use `Ctrl+C` in the console or Task Manager
+**Windows UX (recommended):**
+
+- `cyberdriver join ...` runs Cyberdriver in the background (no window) and **tails logs into your current PowerShell**.
+- Pressing **Ctrl+C only stops log tailing** (Cyberdriver keeps running).
+- To stop Cyberdriver, run: `cyberdriver stop`
+
+**Want Cyberdriver to return immediately (no log tail)?**
+
+```bash
+cyberdriver join --secret YOUR_API_KEY --detach
+```
+
+**Want a visible console for debugging?**
+
+Run in the foreground:
+
+```bash
+cyberdriver join --secret YOUR_API_KEY --foreground
+```
+
+**To stop:**
+
+- Foreground mode: `Ctrl+C`
+- Background mode: `cyberdriver stop` (or Task Manager)
 
 ## Self-Update (Windows)
 

@@ -62,6 +62,13 @@ a = Analysis(
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 # EXE
+_console = True
+if sys.platform == "win32":
+    # Default Windows builds to "windowed" (no console) to avoid an AI agent
+    # accidentally terminating Cyberdriver by closing/Alt+F4'ing the console.
+    # Set CYBERDRIVER_CONSOLE=1 to build a console binary for debugging.
+    _console = os.environ.get("CYBERDRIVER_CONSOLE", "").lower() in ("1", "true", "yes")
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -76,7 +83,7 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,
+    console=_console,
     disable_windowed_traceback=False,
     target_arch=(os.environ.get('TARGET_ARCH') if sys.platform == 'darwin' else None),
     codesign_identity=(os.environ.get('CODESIGN_IDENTITY') if sys.platform == 'darwin' else None),

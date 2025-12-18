@@ -56,6 +56,7 @@ import threading
 import random
 import tempfile
 import shutil
+import atexit
 from typing import Dict, List, Optional, Tuple, Union, Any
 from enum import Enum
 from dataclasses import dataclass
@@ -690,6 +691,107 @@ def disable_windows_console_quickedit():
         print("If output appears stuck, click elsewhere or press Escape in the console")
 
 
+def _setup_detached_stdio_if_configured():
+    """If CYBERDRIVER_STDIO_LOG is set, redirect stdout/stderr to that file.
+
+    This is primarily used for Windows "invisible/background" mode, where there is
+    no console window to show output.
+    """
+    log_path = os.environ.get("CYBERDRIVER_STDIO_LOG")
+    if not log_path:
+        return
+
+    try:
+        log_file = open(log_path, "a", encoding="utf-8", buffering=1)
+        atexit.register(lambda: log_file.close())
+        sys.stdout = log_file  # type: ignore[assignment]
+        sys.stderr = log_file  # type: ignore[assignment]
+        print(f"\n[{datetime.now().isoformat()}] Cyberdriver detached logging started")
+        sys.stdout.flush()
+    except Exception:
+        # If we can't redirect logs, just continue silently.
+        return
+
+
+def _build_relaunch_command(child_argv: List[str]) -> List[str]:
+    """Build a relaunch command that works for both source + PyInstaller."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable] + child_argv
+    return [sys.executable, os.path.abspath(__file__)] + child_argv
+
+
+def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Path) -> None:
+    """Relaunch Cyberdriver as a detached/background process on Windows.
+
+    This ensures Cyberdriver keeps running even if the launching terminal window
+    (PowerShell/cmd/etc.) is closed (e.g., by an automation agent hitting Alt+F4).
+    """
+    if platform.system() != "Windows":
+        raise RuntimeError("_windows_relaunch_detached called on non-Windows")
+
+    DETACHED_PROCESS = 0x00000008
+    CREATE_NEW_PROCESS_GROUP = 0x00000200
+    CREATE_NO_WINDOW = 0x08000000
+
+    cmd = _build_relaunch_command(child_argv)
+    env = os.environ.copy()
+    env["CYBERDRIVER_DETACHED"] = "1"
+    env["CYBERDRIVER_STDIO_LOG"] = str(stdio_log_path)
+    env["PYTHONUNBUFFERED"] = "1"
+
+    subprocess.Popen(
+        cmd,
+        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+        close_fds=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+    )
+
+
+def _follow_log_file(path: pathlib.Path) -> None:
+    """Tail a log file to stdout until Ctrl+C."""
+    print("\n--- Cyberdriver logs (tail) ---")
+    print("(Press Ctrl+C to stop watching logs. Cyberdriver will continue running.)\n")
+
+    # Wait briefly for the child to create the log file.
+    start = time.time()
+    while not path.exists() and (time.time() - start) < 5.0:
+        time.sleep(0.1)
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            # Show a bit of recent history so the user sees startup context.
+            try:
+                f.seek(0, os.SEEK_END)
+                end = f.tell()
+                # Read up to last ~16KB
+                start_pos = max(0, end - 16 * 1024)
+                f.seek(start_pos, os.SEEK_SET)
+                if start_pos > 0:
+                    # Discard partial first line
+                    f.readline()
+                history = f.read()
+                if history:
+                    print(history, end="" if history.endswith("\n") else "\n")
+            except Exception:
+                pass
+
+            # Now follow new lines.
+            f.seek(0, os.SEEK_END)
+            while True:
+                line = f.readline()
+                if line:
+                    print(line, end="")
+                else:
+                    time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("\n\nStopped watching logs.")
+    except Exception as e:
+        print(f"\n\nLog tail stopped: {e}")
+
+
 # Define websocket compatibility helper inline
 async def connect_with_headers(uri, headers_dict):
     """Compatibility wrapper for websocket connections with headers and keepalive settings.
@@ -753,6 +855,7 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
+PID_FILE = "cyberdriver.pid.json"
 VERSION = "0.0.35"
 
 @dataclass
@@ -820,6 +923,211 @@ def get_config() -> Config:
     with open(config_path, 'w') as f:
         json.dump(config.to_dict(), f, indent=2)
     return config
+
+
+def get_pid_file_path() -> pathlib.Path:
+    return get_config_dir() / PID_FILE
+
+
+def _remove_pid_file_safely() -> None:
+    try:
+        # Python 3.8+
+        get_pid_file_path().unlink(missing_ok=True)  # type: ignore[arg-type]
+        return
+    except TypeError:
+        # Python <3.8 compatibility
+        pass
+    except Exception:
+        return
+
+    try:
+        p = get_pid_file_path()
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+
+def write_pid_info(info: Dict[str, Any]) -> None:
+    """Write a PID file so `cyberdriver stop` can find the running instance."""
+    try:
+        pid_path = get_pid_file_path()
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+
+        payload = dict(info)
+        payload.setdefault("pid", os.getpid())
+        payload.setdefault("version", VERSION)
+        payload.setdefault("started_at", datetime.now().isoformat())
+        payload.setdefault("frozen", bool(getattr(sys, "frozen", False)))
+        payload.setdefault("argv", sys.argv[:])
+
+        tmp = pid_path.with_suffix(pid_path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp, pid_path)
+
+        atexit.register(_remove_pid_file_safely)
+    except Exception:
+        # Best-effort only
+        pass
+
+
+def _pid_is_running(pid: int) -> bool:
+    try:
+        pid = int(pid)
+        if pid <= 0:
+            return False
+    except Exception:
+        return False
+
+    if platform.system() == "Windows":
+        try:
+            r = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            out = (r.stdout or "") + (r.stderr or "")
+            return str(pid) in out
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except Exception:
+            return False
+
+
+def _get_process_cmdline(pid: int) -> Optional[str]:
+    if platform.system() == "Windows":
+        try:
+            cmd = f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine"
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", cmd],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            s = (r.stdout or "").strip()
+            return s or None
+        except Exception:
+            return None
+    else:
+        try:
+            proc_cmdline = pathlib.Path(f"/proc/{pid}/cmdline")
+            if proc_cmdline.exists():
+                raw = proc_cmdline.read_bytes()
+                parts = [p.decode(errors="ignore") for p in raw.split(b"\x00") if p]
+                return " ".join(parts) if parts else None
+        except Exception:
+            pass
+        return None
+
+
+def _cmdline_looks_like_cyberdriver(cmdline: str) -> bool:
+    s = (cmdline or "").lower()
+    return (
+        "cyberdriver" in s
+        or "cyberdriver.py" in s
+        or "cyberdriver.exe" in s
+    )
+
+
+def stop_running_instance(force: bool = False, timeout_seconds: float = 10.0) -> int:
+    """Stop the running Cyberdriver instance found via PID file."""
+    pid_path = get_pid_file_path()
+    if not pid_path.exists():
+        print("No running Cyberdriver found (no pid file).")
+        return 0
+
+    try:
+        info = json.loads(pid_path.read_text(encoding="utf-8"))
+    except Exception:
+        info = {}
+
+    pid = info.get("pid")
+    try:
+        pid_int = int(pid)
+    except Exception:
+        print("PID file exists but is invalid. Removing it.")
+        _remove_pid_file_safely()
+        return 0
+
+    if not _pid_is_running(pid_int):
+        print("Cyberdriver is not running (stale pid file). Removing it.")
+        _remove_pid_file_safely()
+        return 0
+
+    cmdline = _get_process_cmdline(pid_int)
+    if cmdline and not _cmdline_looks_like_cyberdriver(cmdline) and not force:
+        print("Refusing to stop: PID does not look like Cyberdriver.")
+        print("Use `cyberdriver stop --force` if you're sure.")
+        return 2
+
+    print(f"Stopping Cyberdriver (PID {pid_int})...")
+    deadline = time.time() + max(0.0, float(timeout_seconds))
+
+    if platform.system() == "Windows":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid_int), "/T"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except Exception:
+            pass
+
+        while time.time() < deadline:
+            if not _pid_is_running(pid_int):
+                _remove_pid_file_safely()
+                print("Cyberdriver stopped.")
+                return 0
+            time.sleep(0.2)
+
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid_int), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except Exception:
+            pass
+
+        time.sleep(0.3)
+        if not _pid_is_running(pid_int):
+            _remove_pid_file_safely()
+            print("Cyberdriver stopped (forced).")
+            return 0
+        print("Failed to stop Cyberdriver.")
+        return 1
+
+    try:
+        os.kill(pid_int, signal.SIGTERM)
+    except Exception:
+        pass
+
+    while time.time() < deadline:
+        if not _pid_is_running(pid_int):
+            _remove_pid_file_safely()
+            print("Cyberdriver stopped.")
+            return 0
+        time.sleep(0.2)
+
+    try:
+        os.kill(pid_int, signal.SIGKILL)
+    except Exception:
+        pass
+    time.sleep(0.3)
+    if not _pid_is_running(pid_int):
+        _remove_pid_file_safely()
+        print("Cyberdriver stopped (killed).")
+        return 0
+    print("Failed to stop Cyberdriver.")
+    return 1
 
 
 # -----------------------------------------------------------------------------
@@ -3632,6 +3940,15 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
     if actual_target_port != target_port:
         print(f"Using available port {actual_target_port} for local server.")
 
+    write_pid_info(
+        {
+            "command": "join",
+            "local_port": actual_target_port,
+            "cloud_host": host,
+            "cloud_port": port,
+        }
+    )
+
     # Start API server asynchronously in the same event loop
     server_task = asyncio.create_task(run_server_async(actual_target_port))
     
@@ -4001,6 +4318,9 @@ def main():
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+    # If we were launched in "detached/invisible" mode, redirect stdout/stderr to a log file.
+    _setup_detached_stdio_if_configured()
     
     # Print banner if no arguments or help requested
     if len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] in ['-h', '--help']):
@@ -4046,6 +4366,24 @@ def main():
         help="Capture screen coordinates by clicking",
         description="Interactive utility to capture X,Y coordinates for keepalive configuration"
     )
+
+    # stop command
+    stop_parser = subparsers.add_parser(
+        "stop",
+        help="Stop running Cyberdriver",
+        description="Stop the running Cyberdriver instance (foreground or background) using the PID file.",
+    )
+    stop_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="Seconds to wait before forcing termination (default: 10).",
+    )
+    stop_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force stop even if the PID can't be verified as Cyberdriver.",
+    )
     join_parser.add_argument("--secret", required=True, help="Your API key from Cyberdesk")
     join_parser.add_argument("--host", default="api.cyberdesk.io", help="Control server (default: api.cyberdesk.io)")
     join_parser.add_argument("--port", type=int, default=443, help="Control server port (default: 443)")
@@ -4060,6 +4398,22 @@ def main():
     join_parser.add_argument("--interactive", action="store_true", help="Interactive CLI to Disable/Re-enable without exiting")
     join_parser.add_argument("--register-as-keepalive-for", type=str, default=None, help="Register this instance as the remote keepalive (host) for MAIN_MACHINE_ID")
     join_parser.add_argument("--debug", action="store_true", help="Enable debug logging to ~/.cyberdriver/logs/ (daily log files)")
+    join_parser.add_argument(
+        "--foreground",
+        action="store_true",
+        help="Run in the foreground with a visible console window (Windows).",
+    )
+    join_parser.add_argument(
+        "--detach",
+        action="store_true",
+        help="On Windows, start in background and return immediately (do not tail logs).",
+    )
+    join_parser.add_argument(
+        "--_detached-child",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
     
     # Parse arguments with error handling
     try:
@@ -4081,9 +4435,49 @@ def main():
         print("  join --secret KEY --add-persistent-display Install virtual display driver (Windows)")
         print("  join --secret KEY --debug                 Enable debug logging to ~/.cyberdriver/logs/")
         print("  coords                                    Capture screen coordinates (for keepalive)")
+        print("  stop                                     Stop running Cyberdriver")
         print()
         print("For more info: cyberdriver join -h")
         sys.exit(0)
+
+    if args.command == "stop":
+        sys.exit(stop_running_instance(force=bool(getattr(args, "force", False)),
+                                       timeout_seconds=float(getattr(args, "timeout", 10.0))))
+
+    # On Windows, default to running `join` invisibly in a detached process so closing the
+    # launching terminal (or an agent hitting Alt+F4) cannot kill Cyberdriver.
+    #
+    # Use `--foreground` to disable this behavior.
+    if (
+        platform.system() == "Windows"
+        and args.command == "join"
+        and not getattr(args, "foreground", False)
+        and os.environ.get("CYBERDRIVER_DETACHED") != "1"
+        and not getattr(args, "_detached_child", False)
+    ):
+        try:
+            logs_dir = get_config_dir() / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            stdio_log_path = logs_dir / "cyberdriver-stdio.log"
+
+            child_argv = sys.argv[1:]
+            # Remove --foreground if present (shouldn't be, but be safe).
+            child_argv = [a for a in child_argv if a != "--foreground"]
+            # Mark child so argparse doesn't try to re-detach via sys.argv alone.
+            child_argv.append("--_detached-child")
+
+            print(f"Launching Cyberdriver in background (Windows invisible mode).")
+            print(f"Stdout/stderr log: {stdio_log_path}")
+            print(f"To stop Cyberdriver: cyberdriver stop")
+            _windows_relaunch_detached(child_argv, stdio_log_path)
+
+            # Default UX: keep printing logs in this PowerShell window, but make Ctrl+C
+            # only stop the log tail (not Cyberdriver). Use --detach to return immediately.
+            if not bool(getattr(args, "detach", False)):
+                _follow_log_file(stdio_log_path)
+            return
+        except Exception as e:
+            print(f"Warning: Failed to relaunch detached; continuing in foreground. ({e})")
     
     # Show banner for join command
     if args.command == "join":
@@ -4153,6 +4547,8 @@ def main():
             if actual_port is None:
                 print(f"Error: Could not find an available port starting from {args.port}.")
                 sys.exit(1)
+
+            write_pid_info({"command": "start", "local_port": actual_port})
             
             # Try to print with checkmark
             if platform.system() == "Windows":
