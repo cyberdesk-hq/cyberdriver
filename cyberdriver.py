@@ -693,12 +693,22 @@ def disable_windows_console_quickedit():
 
 
 def _setup_detached_stdio_if_configured():
-    """If CYBERDRIVER_STDIO_LOG is set, redirect stdout/stderr to that file.
+    """If --_stdio-log or CYBERDRIVER_STDIO_LOG is set, redirect stdout/stderr to that file.
 
     This is primarily used for Windows "invisible/background" mode, where there is
     no console window to show output.
     """
-    log_path = os.environ.get("CYBERDRIVER_STDIO_LOG")
+    # Check command line first (VBScript launcher can't pass env vars to children)
+    log_path = None
+    for arg in sys.argv:
+        if arg.startswith("--_stdio-log="):
+            log_path = arg.split("=", 1)[1]
+            break
+    
+    # Fall back to env var
+    if not log_path:
+        log_path = os.environ.get("CYBERDRIVER_STDIO_LOG")
+    
     if not log_path:
         return
 
@@ -766,18 +776,12 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
     # Now escape for VBScript string: double all quotes
     vbs_cmd_line = raw_cmd_line.replace('"', '""')
     
-    # Also escape the log path for VBScript
-    vbs_log_path = str(stdio_log_path).replace('"', '""')
-    
-    # Create VBScript that sets env vars and launches cyberdriver hidden
+    # Create VBScript that launches cyberdriver hidden
     # The "0" parameter to Run means: hidden window
     # The "False" parameter means: don't wait for the process to finish
+    # NOTE: We pass all config via command-line args, not env vars, because
+    # WshShell.Environment("Process") does NOT inherit to child processes.
     vbs_content = f'''Set WshShell = CreateObject("WScript.Shell")
-Set objEnv = WshShell.Environment("Process")
-objEnv("CYBERDRIVER_DETACHED") = "1"
-objEnv("CYBERDRIVER_STDIO_LOG") = "{vbs_log_path}"
-objEnv("CYBERDRIVER_NO_COLOR") = "1"
-objEnv("PYTHONUNBUFFERED") = "1"
 WshShell.Run "{vbs_cmd_line}", 0, False
 '''
     
@@ -4581,6 +4585,12 @@ def main():
         default=False,
         help=argparse.SUPPRESS,
     )
+    join_parser.add_argument(
+        "--_stdio-log",
+        type=str,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     
     # Parse arguments with error handling
     try:
@@ -4634,6 +4644,8 @@ def main():
             child_argv = [a for a in child_argv if a not in ("--detach", "--tail")]
             # Mark child so argparse doesn't try to re-detach via sys.argv alone.
             child_argv.append("--_detached-child")
+            # Pass log file path to child (env vars don't work with VBScript launcher)
+            child_argv.append(f"--_stdio-log={stdio_log_path}")
 
             # Show the nice banner in the *current* terminal (this is not the detached child).
             print_banner(mode="connecting")
