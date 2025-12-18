@@ -133,14 +133,14 @@ cyberdriver join --secret YOUR_API_KEY
 
 **Windows UX (recommended):**
 
-- `cyberdriver join ...` runs Cyberdriver in the background (no window) and **tails logs into your current PowerShell**.
-- Pressing **Ctrl+C only stops log tailing** (Cyberdriver keeps running).
-- To stop Cyberdriver, run: `cyberdriver stop`
+- `cyberdriver join ...` starts Cyberdriver **in the background (no window)** and returns you to the prompt.
+- To stop Cyberdriver, run: `cyberdriver stop` (or end `cyberdriver.exe` in Task Manager).
+- Logs are written to: `%LOCALAPPDATA%\.cyberdriver\logs\cyberdriver-stdio.log`
 
-**Want Cyberdriver to return immediately (no log tail)?**
+**Want to tail logs in your current PowerShell?**
 
 ```bash
-cyberdriver join --secret YOUR_API_KEY --detach
+cyberdriver join --secret YOUR_API_KEY --tail
 ```
 
 **Want a visible console for debugging?**

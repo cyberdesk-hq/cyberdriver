@@ -737,6 +737,9 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
     env = os.environ.copy()
     env["CYBERDRIVER_DETACHED"] = "1"
     env["CYBERDRIVER_STDIO_LOG"] = str(stdio_log_path)
+    # When writing logs to a file (and then tailing them), ANSI color codes often
+    # render as garbage in some Windows console hosts. Prefer clean text logs.
+    env["CYBERDRIVER_NO_COLOR"] = "1"
     env["PYTHONUNBUFFERED"] = "1"
 
     subprocess.Popen(
@@ -748,6 +751,43 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
         stderr=subprocess.DEVNULL,
         env=env,
     )
+
+
+def _windows_try_enable_ansi() -> bool:
+    """Best-effort enable ANSI escape processing on Windows consoles.
+
+    If this fails, we should avoid printing ANSI sequences (they render as garbage).
+    """
+    if platform.system() != "Windows":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        STD_OUTPUT_HANDLE = -11
+        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        if not handle:
+            return False
+
+        mode = wintypes.DWORD()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)) == 0:
+            return False
+
+        ENABLE_PROCESSED_OUTPUT = 0x0001
+        ENABLE_WRAP_AT_EOL_OUTPUT = 0x0002
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        new_mode = (
+            mode.value
+            | ENABLE_PROCESSED_OUTPUT
+            | ENABLE_WRAP_AT_EOL_OUTPUT
+            | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        )
+        if kernel32.SetConsoleMode(handle, new_mode) == 0:
+            return False
+        return True
+    except Exception:
+        return False
 
 
 def _follow_log_file(path: pathlib.Path) -> None:
@@ -1076,7 +1116,7 @@ def stop_running_instance(force: bool = False, timeout_seconds: float = 10.0) ->
     """Stop the running Cyberdriver instance found via PID file."""
     pid_path = get_pid_file_path()
     if not pid_path.exists():
-        print("No running Cyberdriver found (no pid file).")
+        print(f"No running Cyberdriver found (no pid file at {pid_path}).")
         return 0
 
     try:
@@ -1119,13 +1159,16 @@ def stop_running_instance(force: bool = False, timeout_seconds: float = 10.0) ->
     if platform.system() == "Windows":
         try:
             CREATE_NO_WINDOW = 0x08000000
-            subprocess.run(
+            r = subprocess.run(
                 ["taskkill", "/PID", str(pid_int), "/T"],
                 capture_output=True,
                 text=True,
                 timeout=10,
                 creationflags=CREATE_NO_WINDOW,
             )
+            out = ((r.stdout or "") + (r.stderr or "")).strip()
+            if r.returncode != 0 and "Access is denied" in out:
+                print("Access denied. If Cyberdriver was started from an Administrator shell, run `cyberdriver stop` as Administrator.")
         except Exception:
             pass
 
@@ -1136,15 +1179,19 @@ def stop_running_instance(force: bool = False, timeout_seconds: float = 10.0) ->
                 return 0
             time.sleep(0.2)
 
+        print("Cyberdriver still running; forcing stop...")
         try:
             CREATE_NO_WINDOW = 0x08000000
-            subprocess.run(
+            r = subprocess.run(
                 ["taskkill", "/PID", str(pid_int), "/T", "/F"],
                 capture_output=True,
                 text=True,
                 timeout=10,
                 creationflags=CREATE_NO_WINDOW,
             )
+            out = ((r.stdout or "") + (r.stderr or "")).strip()
+            if r.returncode != 0 and "Access is denied" in out:
+                print("Access denied. If Cyberdriver was started from an Administrator shell, run `cyberdriver stop` as Administrator.")
         except Exception:
             pass
 
@@ -4301,15 +4348,15 @@ def print_banner(mode="default"):
     Args:
         mode: "default" for normal banner, "connecting" for join command
     """
+    # If we're in detached/background mode (logging to a file) or the user requested it,
+    # avoid ANSI codes so logs remain readable in files.
+    if os.environ.get("CYBERDRIVER_NO_COLOR") or os.environ.get("CYBERDRIVER_STDIO_LOG"):
+        print_banner_no_color(mode)
+        return
+
     # Enable Windows terminal colors if needed
     if platform.system() == "Windows":
-        try:
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            # Enable ANSI escape sequences
-            kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
-        except:
-            # If we can't enable ANSI, disable colors
+        if not _windows_try_enable_ansi():
             print_banner_no_color(mode)
             return
     
@@ -4460,6 +4507,11 @@ def main():
         help="On Windows, start in background and return immediately (do not tail logs).",
     )
     join_parser.add_argument(
+        "--tail",
+        action="store_true",
+        help="(Windows) After starting in background, tail the log file in this terminal.",
+    )
+    join_parser.add_argument(
         "--_detached-child",
         action="store_true",
         default=False,
@@ -4514,17 +4566,22 @@ def main():
             child_argv = sys.argv[1:]
             # Remove --foreground if present (shouldn't be, but be safe).
             child_argv = [a for a in child_argv if a != "--foreground"]
+            # Remove legacy flags so they don't propagate to child.
+            child_argv = [a for a in child_argv if a not in ("--detach", "--tail")]
             # Mark child so argparse doesn't try to re-detach via sys.argv alone.
             child_argv.append("--_detached-child")
 
-            print(f"Launching Cyberdriver in background (Windows invisible mode).")
-            print(f"Stdout/stderr log: {stdio_log_path}")
-            print(f"To stop Cyberdriver: cyberdriver stop")
+            # Show the nice banner in the *current* terminal (this is not the detached child).
+            print_banner(mode="connecting")
+            print("Cyberdriver is now running in the background (no window).")
+            print(f"Logs: {stdio_log_path}")
+            print("To stop: cyberdriver stop  (or end cyberdriver.exe in Task Manager)")
+            print()
             _windows_relaunch_detached(child_argv, stdio_log_path)
 
-            # Default UX: keep printing logs in this PowerShell window, but make Ctrl+C
-            # only stop the log tail (not Cyberdriver). Use --detach to return immediately.
-            if not bool(getattr(args, "detach", False)):
+            # Default UX: return immediately. If the user wants logs in this terminal,
+            # they can opt-in with --tail.
+            if bool(getattr(args, "tail", False)):
                 _follow_log_file(stdio_log_path)
             return
         except Exception as e:
