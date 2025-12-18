@@ -790,32 +790,72 @@ WshShell.Run "{vbs_cmd_line}", 0, False
     config_dir.mkdir(parents=True, exist_ok=True)
     vbs_path = config_dir / "launch-hidden.vbs"
     
+    # Also write the command we're trying to run for debugging
+    debug_path = config_dir / "launch-hidden-cmd.txt"
+    try:
+        with open(debug_path, "w", encoding="utf-8") as f:
+            f.write(f"Raw command: {raw_cmd_line}\n")
+            f.write(f"VBS command: {vbs_cmd_line}\n")
+    except Exception:
+        pass
+    
     try:
         with open(vbs_path, "w", encoding="utf-8") as f:
             f.write(vbs_content)
         
         # Run the VBS with wscript (silent VBS executor)
         # wscript runs VBScript without showing any console window
+        CREATE_NO_WINDOW = 0x08000000
         result = subprocess.run(
             ["wscript", "//NoLogo", str(vbs_path)],
             capture_output=True,
             text=True,
             timeout=10,
+            creationflags=CREATE_NO_WINDOW,
         )
         
         if result.returncode != 0:
-            raise RuntimeError(f"VBScript launcher failed: {result.stderr or result.stdout}")
+            raise RuntimeError(f"VBScript launcher failed (exit {result.returncode}): {result.stderr or result.stdout}")
         
-        # Give the child a moment to start
+        # Give the child a moment to start and verify it's running
         import time as _time
-        _time.sleep(0.5)
+        _time.sleep(1.0)
         
-    finally:
-        # Clean up VBS file
+        # Check if cyberdriver.exe is running
         try:
-            vbs_path.unlink(missing_ok=True)
+            check = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq cyberdriver.exe", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            if "cyberdriver.exe" not in check.stdout.lower():
+                # Child didn't start - check if log file has any errors
+                if stdio_log_path.exists():
+                    try:
+                        log_content = stdio_log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+                        if log_content.strip():
+                            raise RuntimeError(f"Child process failed to stay running. Log:\n{log_content}")
+                    except Exception:
+                        pass
+                raise RuntimeError("Child process did not start (not found in tasklist)")
+        except subprocess.TimeoutExpired:
+            pass  # tasklist timed out, assume it's fine
+        except RuntimeError:
+            raise
         except Exception:
-            pass
+            pass  # Other errors checking, assume it's fine
+        
+    except Exception as e:
+        # Don't delete VBS on error so user can debug
+        raise RuntimeError(f"Failed to launch background process: {e}")
+    
+    # Clean up VBS file on success
+    try:
+        vbs_path.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _windows_try_enable_ansi() -> bool:
