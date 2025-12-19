@@ -940,28 +940,12 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
     #   WshShell.Run "command line here", 0, False
     # If the command line itself needs quotes (for paths with spaces), we double them.
     
-    exe_path = cmd[0]
-    args = cmd[1:] if len(cmd) > 1 else []
-    
-    # Build Windows command line with proper quoting
-    def quote_arg_for_cmdline(arg: str) -> str:
-        """Quote an argument for Windows command line if needed."""
-        if ' ' in arg or '"' in arg or not arg:
-            # Escape quotes by doubling, then wrap in quotes
-            escaped = arg.replace('"', '\\"')
-            return f'"{escaped}"'
-        return arg
-    
-    # Build the raw command line (as you'd type it in cmd.exe)
-    quoted_exe = f'"{exe_path}"'
-    quoted_args = [quote_arg_for_cmdline(a) for a in args]
-    
-    if quoted_args:
-        raw_cmd_line = f'{quoted_exe} {" ".join(quoted_args)}'
-    else:
-        raw_cmd_line = quoted_exe
-    
-    # Now escape for VBScript string: double all quotes
+    # Build the command line using Windows' canonical quoting rules.
+    # This avoids subtle bugs around backslashes/quotes when embedding the command
+    # inside a VBScript string literal.
+    raw_cmd_line = subprocess.list2cmdline(cmd)
+
+    # Escape for VBScript string literals: double all quotes.
     vbs_cmd_line = raw_cmd_line.replace('"', '""')
     
     # Create VBScript that launches cyberdriver hidden
