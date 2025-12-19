@@ -721,11 +721,164 @@ def _setup_detached_stdio_if_configured():
     except Exception:
         pass
 
+    # Hard cap for stdio log size to avoid filling disk on long-lived VMs.
+    # Requirement: keep this file at or under 10MB total.
+    STDIO_LOG_MAX_BYTES = 10 * 1024 * 1024
+
+    class _SizeCappedTextWriter:
+        """A minimal file-like wrapper that caps a log file's size.
+
+        When a write would push the file over the limit, the file is truncated and
+        a short header line is written, then logging continues. This keeps total
+        disk usage bounded to <= STDIO_LOG_MAX_BYTES.
+        """
+
+        def __init__(self, path_str: str, max_bytes: int):
+            self._path = pathlib.Path(path_str)
+            self._max_bytes = int(max_bytes)
+            self._encoding = "utf-8"
+            self._lock = threading.Lock()
+            self._file = None
+            self._size_bytes = 0
+            self._open_append()
+
+        @property
+        def encoding(self):  # type: ignore[override]
+            return self._encoding
+
+        def isatty(self) -> bool:  # type: ignore[override]
+            return False
+
+        def writable(self) -> bool:  # type: ignore[override]
+            return True
+
+        def _open_append(self) -> None:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            # Ensure file exists; open in append mode.
+            self._file = open(self._path, "a", encoding=self._encoding, buffering=1)
+            try:
+                self._size_bytes = int(self._path.stat().st_size)
+            except Exception:
+                self._size_bytes = 0
+
+        def _truncate_and_reopen(self) -> None:
+            # Close current handle (best-effort) before truncating.
+            try:
+                if self._file is not None:
+                    self._file.flush()
+                    self._file.close()
+            except Exception:
+                pass
+
+            # Truncate in place and write a small marker.
+            try:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                with open(self._path, "w", encoding=self._encoding) as f:
+                    f.write(f"[{datetime.now().isoformat()}] Log truncated (max 10MB)\n")
+                    f.flush()
+            except Exception:
+                # If truncation fails, fall back to append to whatever exists.
+                pass
+
+            self._open_append()
+
+        def write(self, s):  # type: ignore[override]
+            if s is None:
+                return 0
+            text = str(s)
+            # Estimate bytes written for UTF-8. This is fast enough for our logs.
+            encoded: Optional[bytes] = None
+            try:
+                encoded = text.encode(self._encoding, errors="replace")
+                bytes_len = len(encoded)
+            except Exception:
+                bytes_len = len(text)
+
+            with self._lock:
+                if self._file is None:
+                    self._open_append()
+                # Enforce cap *before* writing so the file never exceeds max size.
+                if (self._size_bytes + bytes_len) > self._max_bytes:
+                    self._truncate_and_reopen()
+
+                # If the next write is still too large (e.g. a massive message), trim it
+                # so we never exceed the cap.
+                try:
+                    remaining = max(0, int(self._max_bytes - self._size_bytes))
+                except Exception:
+                    remaining = 0
+                if remaining <= 0:
+                    self._truncate_and_reopen()
+                    try:
+                        remaining = max(0, int(self._max_bytes - self._size_bytes))
+                    except Exception:
+                        remaining = 0
+
+                if remaining and bytes_len > remaining:
+                    # Best-effort: keep the tail of the message so the most recent context
+                    # is preserved, and prepend a small marker.
+                    try:
+                        if encoded is None:
+                            encoded = text.encode(self._encoding, errors="replace")
+                        marker_str = f"\n[{datetime.now().isoformat()}] Log chunk truncated to fit 10MB cap\n"
+                        marker_b = marker_str.encode(self._encoding, errors="replace")
+                        if len(marker_b) >= remaining:
+                            tail_b = encoded[-remaining:]
+                            text = tail_b.decode(self._encoding, errors="ignore")
+                        else:
+                            tail_b = encoded[-(remaining - len(marker_b)):]
+                            text = marker_str + tail_b.decode(self._encoding, errors="ignore")
+                        encoded = text.encode(self._encoding, errors="replace")
+                        bytes_len = len(encoded)
+                        # Absolute final guard: if we still don't fit, drop to last `remaining` bytes.
+                        if bytes_len > remaining:
+                            tail_b2 = encoded[-remaining:]
+                            text = tail_b2.decode(self._encoding, errors="ignore")
+                            encoded = text.encode(self._encoding, errors="replace")
+                            bytes_len = len(encoded)
+                    except Exception:
+                        # Fall back to writing whatever fits by truncating characters.
+                        text = text[-min(len(text), 4096):]
+                        try:
+                            bytes_len = len(text.encode(self._encoding, errors="replace"))
+                        except Exception:
+                            bytes_len = len(text)
+
+                try:
+                    n_chars = self._file.write(text)  # type: ignore[union-attr]
+                    try:
+                        self._file.flush()  # type: ignore[union-attr]
+                    except Exception:
+                        pass
+                    # Update size using our bytes estimate
+                    self._size_bytes = min(self._max_bytes, self._size_bytes + bytes_len)
+                    return n_chars
+                except Exception:
+                    return 0
+
+        def flush(self):  # type: ignore[override]
+            with self._lock:
+                try:
+                    if self._file is not None:
+                        self._file.flush()
+                except Exception:
+                    pass
+
+        def close(self):  # type: ignore[override]
+            with self._lock:
+                try:
+                    if self._file is not None:
+                        self._file.flush()
+                        self._file.close()
+                except Exception:
+                    pass
+                self._file = None
+
     try:
-        log_file = open(log_path, "a", encoding="utf-8", buffering=1)
-        atexit.register(lambda: log_file.close())
-        sys.stdout = log_file  # type: ignore[assignment]
-        sys.stderr = log_file  # type: ignore[assignment]
+        writer = _SizeCappedTextWriter(str(log_path), STDIO_LOG_MAX_BYTES)
+        atexit.register(lambda: writer.close())
+        sys.stdout = writer  # type: ignore[assignment]
+        sys.stderr = writer  # type: ignore[assignment]
         print(f"\n[{datetime.now().isoformat()}] Cyberdriver detached logging started")
         sys.stdout.flush()
     except Exception:
@@ -945,6 +1098,12 @@ def _windows_try_enable_ansi() -> bool:
 
 def _follow_log_file(path: pathlib.Path) -> None:
     """Tail a log file to stdout until Ctrl+C or Enter."""
+    # On Windows, prevent the console from freezing when clicked (QuickEdit selection mode).
+    try:
+        disable_windows_console_quickedit()
+    except Exception:
+        pass
+
     print("\n--- Cyberdriver logs (tail) ---")
     print("(Press Ctrl+C or Enter to stop watching logs. Cyberdriver will continue running.)\n")
 
@@ -1007,6 +1166,14 @@ def _follow_log_file(path: pathlib.Path) -> None:
                     if stop_event is not None and stop_event.is_set():  # type: ignore[union-attr]
                         print("\n\nStopped watching logs.")
                         return
+                except Exception:
+                    pass
+                # If the writer truncated the file (size cap), reset our read position.
+                try:
+                    if path.exists():
+                        cur_size = path.stat().st_size
+                        if f.tell() > cur_size:
+                            f.seek(0, os.SEEK_SET)
                 except Exception:
                     pass
                 line = f.readline()
@@ -2070,13 +2237,55 @@ async def post_update(payload: UpdateRequest = UpdateRequest()):
         
         # Build restart command with original arguments (only if restart_after is True)
         # Preserve all command-line arguments so the new instance runs with the same config
+        restart_args: Optional[List[str]] = None
         if restart_after:
             # Get original arguments (skip argv[0] which is the executable path)
-            original_args = sys.argv[1:] if len(sys.argv) > 1 else []
+            raw_args = sys.argv[1:] if len(sys.argv) > 1 else []
+
+            # IMPORTANT (Stealth Mode): background instances include internal flags like
+            # --_detached-child and --_stdio-log=... that should NOT be persisted across a
+            # self-update restart. If we keep them, the restarted process may skip the
+            # normal background-launch flow, or attempt to tail logs in a non-interactive
+            # context.
+            restart_args = []
+            skip_next = False
+            for arg in raw_args:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if arg in ("--_detached-child", "--detach", "--tail"):
+                    continue
+                if arg == "--_stdio-log":
+                    skip_next = True
+                    continue
+                if arg.startswith("--_stdio-log="):
+                    continue
+                restart_args.append(arg)
+
+            def _obfuscate_sensitive_args(args_list: List[str]) -> List[str]:
+                obfuscated: List[str] = []
+                skip = False
+                for a in args_list:
+                    if skip:
+                        obfuscated.append("***")
+                        skip = False
+                        continue
+                    if a in ("--secret", "-s"):
+                        obfuscated.append(a)
+                        skip = True
+                        continue
+                    if a.startswith("--secret="):
+                        obfuscated.append("--secret=***")
+                        continue
+                    if a.startswith("-s="):
+                        obfuscated.append("-s=***")
+                        continue
+                    obfuscated.append(a)
+                return obfuscated
             
             # Escape arguments that contain spaces or special characters for batch file
             escaped_args = []
-            for arg in original_args:
+            for arg in restart_args:
                 # If arg contains spaces, quotes, or special chars, wrap in quotes
                 if ' ' in arg or '"' in arg or '&' in arg or '|' in arg or '<' in arg or '>' in arg or '^' in arg:
                     # Escape any existing quotes by doubling them
@@ -2087,8 +2296,8 @@ async def post_update(payload: UpdateRequest = UpdateRequest()):
             
             args_str = ' '.join(escaped_args)
             
-            print(f"Original arguments: {original_args}")
-            print(f"Escaped arguments for restart: {args_str}")
+            print(f"Restart arguments: {_obfuscate_sensitive_args(restart_args)}")
+            print(f"Escaped arguments for restart: {_obfuscate_sensitive_args(escaped_args)}")
         
         # Create updater PowerShell script (more reliable than batch on modern Windows)
         # Log file for update process
@@ -2292,24 +2501,8 @@ objShell.Run "powershell -NoProfile -ExecutionPolicy Bypass -File ""{updater_ps1
         
         # Include preserved arguments in response if restarting (obfuscate secrets)
         if restart_after:
-            original_args = sys.argv[1:] if len(sys.argv) > 1 else []
-            # Obfuscate sensitive values (--secret, -s, etc.)
-            obfuscated_args = []
-            skip_next = False
-            for i, arg in enumerate(original_args):
-                if skip_next:
-                    obfuscated_args.append("***")
-                    skip_next = False
-                elif arg in ("--secret", "-s"):
-                    obfuscated_args.append(arg)
-                    skip_next = True
-                elif arg.startswith("--secret="):
-                    obfuscated_args.append("--secret=***")
-                elif arg.startswith("-s="):
-                    obfuscated_args.append("-s=***")
-                else:
-                    obfuscated_args.append(arg)
-            response_content["preserved_arguments"] = obfuscated_args
+            # Use sanitized restart args (no internal stealth-mode flags).
+            response_content["preserved_arguments"] = _obfuscate_sensitive_args(restart_args or [])
         
         return JSONResponse(status_code=200, content=response_content)
         
