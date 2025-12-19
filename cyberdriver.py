@@ -56,12 +56,14 @@ import threading
 import random
 import tempfile
 import shutil
+import atexit
 from typing import Dict, List, Optional, Tuple, Union, Any
 from enum import Enum
 from dataclasses import dataclass
 from io import BytesIO
 from contextlib import asynccontextmanager
 
+import certifi
 import httpx
 import mss
 import numpy as np
@@ -106,7 +108,7 @@ class DebugLogger:
     
     @classmethod
     def initialize(cls, enabled: bool = False, log_dir: Optional[str] = None) -> "DebugLogger":
-        """Initialize the global debug logger."""
+        """Initialize the global debug logger. """
         cls._instance = cls(enabled=enabled, log_dir=log_dir)
         return cls._instance
     
@@ -690,6 +692,556 @@ def disable_windows_console_quickedit():
         print("If output appears stuck, click elsewhere or press Escape in the console")
 
 
+def _setup_detached_stdio_if_configured():
+    """If --_stdio-log or CYBERDRIVER_STDIO_LOG is set, redirect stdout/stderr to that file.
+
+    This is primarily used for Windows "invisible/background" mode, where there is
+    no console window to show output.
+    """
+    # Check command line first (VBScript launcher can't pass env vars to children)
+    log_path = None
+    for arg in sys.argv:
+        if arg.startswith("--_stdio-log="):
+            log_path = arg.split("=", 1)[1]
+            break
+    
+    # Fall back to env var
+    if not log_path:
+        log_path = os.environ.get("CYBERDRIVER_STDIO_LOG")
+    
+    if not log_path:
+        return
+
+    # Ensure downstream code knows logging is redirected to a file and should avoid
+    # ANSI color sequences. We set these in-process because the VBScript launcher
+    # does not reliably propagate env vars from the parent process.
+    try:
+        os.environ["CYBERDRIVER_STDIO_LOG"] = str(log_path)
+        os.environ["CYBERDRIVER_NO_COLOR"] = "1"
+    except Exception:
+        pass
+
+    # Hard cap for stdio log size to avoid filling disk on long-lived VMs.
+    # Requirement: keep this file at or under 10MB total.
+    STDIO_LOG_MAX_BYTES = 10 * 1024 * 1024
+
+    class _SizeCappedTextWriter:
+        """A minimal file-like wrapper that caps a log file's size.
+
+        When a write would push the file over the limit, the file is truncated and
+        a short header line is written, then logging continues. This keeps total
+        disk usage bounded to <= STDIO_LOG_MAX_BYTES.
+        """
+
+        def __init__(self, path_str: str, max_bytes: int):
+            self._path = pathlib.Path(path_str)
+            self._max_bytes = int(max_bytes)
+            self._encoding = "utf-8"
+            self._lock = threading.Lock()
+            self._file = None
+            self._size_bytes = 0
+            self._open_append()
+
+        @property
+        def encoding(self):  # type: ignore[override]
+            return self._encoding
+
+        def isatty(self) -> bool:  # type: ignore[override]
+            return False
+
+        def writable(self) -> bool:  # type: ignore[override]
+            return True
+
+        def _open_append(self) -> None:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            # Ensure file exists; open in append mode.
+            self._file = open(self._path, "a", encoding=self._encoding, buffering=1)
+            try:
+                self._size_bytes = int(self._path.stat().st_size)
+            except Exception:
+                self._size_bytes = 0
+
+        def _truncate_and_reopen(self) -> None:
+            # Close current handle (best-effort) before truncating.
+            try:
+                if self._file is not None:
+                    self._file.flush()
+                    self._file.close()
+            except Exception:
+                pass
+
+            # Truncate in place and write a small marker.
+            try:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                with open(self._path, "w", encoding=self._encoding) as f:
+                    f.write(f"[{datetime.now().isoformat()}] Log truncated (max 10MB)\n")
+                    f.flush()
+            except Exception:
+                # If truncation fails, fall back to append to whatever exists.
+                pass
+
+            self._open_append()
+
+        def write(self, s):  # type: ignore[override]
+            if s is None:
+                return 0
+            text = str(s)
+            # Estimate bytes written for UTF-8. This is fast enough for our logs.
+            encoded: Optional[bytes] = None
+            try:
+                encoded = text.encode(self._encoding, errors="replace")
+                bytes_len = len(encoded)
+            except Exception:
+                bytes_len = len(text)
+
+            with self._lock:
+                if self._file is None:
+                    self._open_append()
+                # Enforce cap *before* writing so the file never exceeds max size.
+                if (self._size_bytes + bytes_len) > self._max_bytes:
+                    self._truncate_and_reopen()
+
+                # If the next write is still too large (e.g. a massive message), trim it
+                # so we never exceed the cap.
+                try:
+                    remaining = max(0, int(self._max_bytes - self._size_bytes))
+                except Exception:
+                    remaining = 0
+                if remaining <= 0:
+                    self._truncate_and_reopen()
+                    try:
+                        remaining = max(0, int(self._max_bytes - self._size_bytes))
+                    except Exception:
+                        remaining = 0
+
+                if remaining and bytes_len > remaining:
+                    # Best-effort: keep the tail of the message so the most recent context
+                    # is preserved, and prepend a small marker.
+                    try:
+                        if encoded is None:
+                            encoded = text.encode(self._encoding, errors="replace")
+                        marker_str = f"\n[{datetime.now().isoformat()}] Log chunk truncated to fit 10MB cap\n"
+                        marker_b = marker_str.encode(self._encoding, errors="replace")
+                        if len(marker_b) >= remaining:
+                            tail_b = encoded[-remaining:]
+                            text = tail_b.decode(self._encoding, errors="ignore")
+                        else:
+                            tail_b = encoded[-(remaining - len(marker_b)):]
+                            text = marker_str + tail_b.decode(self._encoding, errors="ignore")
+                        encoded = text.encode(self._encoding, errors="replace")
+                        bytes_len = len(encoded)
+                        # Absolute final guard: if we still don't fit, drop to last `remaining` bytes.
+                        if bytes_len > remaining:
+                            tail_b2 = encoded[-remaining:]
+                            text = tail_b2.decode(self._encoding, errors="ignore")
+                            encoded = text.encode(self._encoding, errors="replace")
+                            bytes_len = len(encoded)
+                    except Exception:
+                        # Fall back to writing whatever fits by truncating characters.
+                        text = text[-min(len(text), 4096):]
+                        try:
+                            bytes_len = len(text.encode(self._encoding, errors="replace"))
+                        except Exception:
+                            bytes_len = len(text)
+
+                try:
+                    n_chars = self._file.write(text)  # type: ignore[union-attr]
+                    try:
+                        self._file.flush()  # type: ignore[union-attr]
+                    except Exception:
+                        pass
+                    # Update size using our bytes estimate
+                    self._size_bytes = min(self._max_bytes, self._size_bytes + bytes_len)
+                    return n_chars
+                except Exception:
+                    return 0
+
+        def flush(self):  # type: ignore[override]
+            with self._lock:
+                try:
+                    if self._file is not None:
+                        self._file.flush()
+                except Exception:
+                    pass
+
+        def close(self):  # type: ignore[override]
+            with self._lock:
+                try:
+                    if self._file is not None:
+                        self._file.flush()
+                        self._file.close()
+                except Exception:
+                    pass
+                self._file = None
+
+    try:
+        writer = _SizeCappedTextWriter(str(log_path), STDIO_LOG_MAX_BYTES)
+        atexit.register(lambda: writer.close())
+        sys.stdout = writer  # type: ignore[assignment]
+        sys.stderr = writer  # type: ignore[assignment]
+        print(f"\n[{datetime.now().isoformat()}] Cyberdriver detached logging started")
+        sys.stdout.flush()
+    except Exception:
+        # If we can't redirect logs, just continue silently.
+        return
+
+
+def _build_relaunch_command(child_argv: List[str]) -> List[str]:
+    """Build a relaunch command that works for both source + PyInstaller."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable] + child_argv
+    return [sys.executable, os.path.abspath(__file__)] + child_argv
+
+
+def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Path) -> None:
+    """Relaunch Cyberdriver as a detached/background process on Windows.
+
+    This ensures Cyberdriver keeps running even if the launching terminal window
+    (PowerShell/cmd/etc.) is closed (e.g., by an automation agent hitting Alt+F4).
+    
+    We use a VBScript wrapper because it's the most reliable way to launch a console
+    application truly hidden on Windows. Direct subprocess flags (DETACHED_PROCESS,
+    CREATE_NO_WINDOW) have compatibility issues with PyInstaller frozen executables.
+    """
+    if platform.system() != "Windows":
+        raise RuntimeError("_windows_relaunch_detached called on non-Windows")
+
+    cmd = _build_relaunch_command(child_argv)
+
+    # PyInstaller onefile spawns a "child" process that can inherit special env vars
+    # from the parent process. If those env vars leak into our hidden launcher (wscript)
+    # and then into the detached Cyberdriver process, the child may incorrectly reuse
+    # the parent's extraction directory. When the parent exits, PyInstaller attempts to
+    # delete that directory and you'll see:
+    #   [PYI-xxxx:WARNING] Failed to remove temporary directory: ...\_MEI...
+    # and the detached process may crash with FileNotFoundError for base_library.zip.
+    #
+    # Historically this was `_MEIPASS2`; in newer PyInstaller versions it is
+    # `_PYI_APPLICATION_HOME_DIR` (and there are other `_PYI_*` vars).
+    #
+    # Make sure wscript starts with a clean environment so the detached process
+    # creates its *own* extraction directory.
+    wscript_env = os.environ.copy()
+    for k in list(wscript_env.keys()):
+        if k == "_MEIPASS2" or k.startswith("_PYI_"):
+            wscript_env.pop(k, None)
+
+    # PyInstaller also adjusts the process DLL search path in onefile mode, which can
+    # leak into child processes on Windows. Reset it before launching `wscript`.
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetDllDirectoryW(None)
+    except Exception:
+        pass
+    
+    # Build the command string for VBScript.
+    # VBScript string escaping: double-quotes inside a string become ""
+    # The WshShell.Run method takes a string, so we need:
+    #   WshShell.Run "command line here", 0, False
+    # If the command line itself needs quotes (for paths with spaces), we double them.
+    
+    # Build the command line using Windows' canonical quoting rules.
+    # This avoids subtle bugs around backslashes/quotes when embedding the command
+    # inside a VBScript string literal.
+    raw_cmd_line = subprocess.list2cmdline(cmd)
+
+    # Escape for VBScript string literals: double all quotes.
+    vbs_cmd_line = raw_cmd_line.replace('"', '""')
+    
+    # Create VBScript that launches cyberdriver hidden
+    # The "0" parameter to Run means: hidden window
+    # The "False" parameter means: don't wait for the process to finish
+    #
+    # Belt-and-suspenders: also attempt to clear the env vars from within the VBScript
+    # process, in case the user's environment is unusual.
+    
+    vbs_content = f'''Set WshShell = CreateObject("WScript.Shell")
+Set objEnv = WshShell.Environment("Process")
+On Error Resume Next
+objEnv.Remove "_MEIPASS2"
+objEnv.Remove "_PYI_APPLICATION_HOME_DIR"
+On Error Goto 0
+WshShell.Run "{vbs_cmd_line}", 0, False
+'''
+    
+    # Write VBS to temp file
+    config_dir = get_config_dir()
+    config_dir.mkdir(parents=True, exist_ok=True)
+    vbs_path = config_dir / "launch-hidden.vbs"
+    
+    # Also write the command we're trying to run for debugging
+    debug_path = config_dir / "launch-hidden-cmd.txt"
+    try:
+        with open(debug_path, "w", encoding="utf-8") as f:
+            f.write(f"Raw command: {raw_cmd_line}\n")
+            f.write(f"VBS command: {vbs_cmd_line}\n")
+            f.write(f"\nVBS script:\n{vbs_content}\n")
+    except Exception:
+        pass
+    
+    try:
+        with open(vbs_path, "w", encoding="utf-8") as f:
+            f.write(vbs_content)
+        
+        # Run the VBS with wscript (silent VBS executor)
+        # wscript runs VBScript without showing any console window
+        CREATE_NO_WINDOW = 0x08000000
+        result = subprocess.run(
+            ["wscript", "//NoLogo", str(vbs_path)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=CREATE_NO_WINDOW,
+            env=wscript_env,
+        )
+        
+        if result.returncode != 0:
+            raise RuntimeError(f"VBScript launcher failed (exit {result.returncode}): {result.stderr or result.stdout}")
+        
+        # Give the child a moment to start and verify it's running
+        import time as _time
+        _time.sleep(1.0)
+        
+        # Check if the child process is running
+        # When frozen (PyInstaller), it's cyberdriver.exe; when running from source, it's python.exe
+        is_frozen = getattr(sys, "frozen", False)
+        expected_image = "cyberdriver.exe" if is_frozen else "python.exe"
+        
+        try:
+            check = subprocess.run(
+                ["tasklist", "/FI", f"IMAGENAME eq {expected_image}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            if expected_image.lower() not in check.stdout.lower():
+                # Child didn't start - check if log file has any errors
+                if stdio_log_path.exists():
+                    try:
+                        log_content = stdio_log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+                        if log_content.strip():
+                            raise RuntimeError(f"Child process failed to stay running. Log:\n{log_content}")
+                    except Exception:
+                        pass
+                raise RuntimeError(f"Child process did not start ({expected_image} not found in tasklist)")
+        except subprocess.TimeoutExpired:
+            pass  # tasklist timed out, assume it's fine
+        except RuntimeError:
+            raise
+        except Exception:
+            pass  # Other errors checking, assume it's fine
+        
+    except Exception as e:
+        # Don't delete VBS on error so user can debug
+        raise RuntimeError(f"Failed to launch background process: {e}")
+    
+    # Clean up VBS file on success
+    try:
+        vbs_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _windows_try_enable_ansi() -> bool:
+    """Best-effort enable ANSI escape processing on Windows consoles.
+
+    If this fails, we should avoid printing ANSI sequences (they render as garbage).
+    """
+    if platform.system() != "Windows":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        STD_OUTPUT_HANDLE = -11
+        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        if not handle:
+            return False
+
+        mode = wintypes.DWORD()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)) == 0:
+            return False
+
+        ENABLE_PROCESSED_OUTPUT = 0x0001
+        ENABLE_WRAP_AT_EOL_OUTPUT = 0x0002
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        new_mode = (
+            mode.value
+            | ENABLE_PROCESSED_OUTPUT
+            | ENABLE_WRAP_AT_EOL_OUTPUT
+            | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        )
+        if kernel32.SetConsoleMode(handle, new_mode) == 0:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _follow_log_file(path: pathlib.Path) -> None:
+    """Tail a log file to stdout until Ctrl+C or Enter."""
+    # On Windows, prevent the console from freezing when clicked (QuickEdit selection mode).
+    try:
+        disable_windows_console_quickedit()
+    except Exception:
+        pass
+
+    print("\n--- Cyberdriver logs (tail) ---")
+    print("(Press Ctrl+C or Enter to stop watching logs. Cyberdriver will continue running.)\n")
+
+    # Allow "press Enter to stop" without breaking Ctrl+C behavior.
+    # We only enable this when stdin is interactive (tty).
+    stop_event = None
+    try:
+        import threading
+
+        if hasattr(sys.stdin, "isatty") and sys.stdin.isatty():
+            stop_event = threading.Event()
+
+            def _wait_for_enter() -> None:
+                try:
+                    sys.stdin.readline()
+                except Exception:
+                    return
+                try:
+                    stop_event.set()  # type: ignore[union-attr]
+                except Exception:
+                    pass
+
+            threading.Thread(target=_wait_for_enter, daemon=True).start()
+    except Exception:
+        stop_event = None
+
+    # Wait briefly for the child to create the log file.
+    start = time.time()
+    while not path.exists() and (time.time() - start) < 5.0:
+        try:
+            if stop_event is not None and stop_event.is_set():  # type: ignore[union-attr]
+                print("\n\nStopped watching logs.")
+                return
+        except Exception:
+            pass
+        time.sleep(0.1)
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            # Show a bit of recent history so the user sees startup context.
+            try:
+                f.seek(0, os.SEEK_END)
+                end = f.tell()
+                # Read up to last ~16KB
+                start_pos = max(0, end - 16 * 1024)
+                f.seek(start_pos, os.SEEK_SET)
+                if start_pos > 0:
+                    # Discard partial first line
+                    f.readline()
+                history = f.read()
+                if history:
+                    print(history, end="" if history.endswith("\n") else "\n")
+            except Exception:
+                pass
+
+            # Now follow new lines.
+            f.seek(0, os.SEEK_END)
+            while True:
+                try:
+                    if stop_event is not None and stop_event.is_set():  # type: ignore[union-attr]
+                        print("\n\nStopped watching logs.")
+                        return
+                except Exception:
+                    pass
+                # If the writer truncated the file (size cap), reset our read position.
+                try:
+                    if path.exists():
+                        cur_size = path.stat().st_size
+                        if f.tell() > cur_size:
+                            f.seek(0, os.SEEK_SET)
+                except Exception:
+                    pass
+                line = f.readline()
+                if line:
+                    print(line, end="")
+                else:
+                    time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("\n\nStopped watching logs.")
+    except Exception as e:
+        print(f"\n\nLog tail stopped: {e}")
+
+
+def _default_stdio_log_path() -> pathlib.Path:
+    return get_config_dir() / "logs" / "cyberdriver-stdio.log"
+
+
+def _should_use_color() -> bool:
+    """Return True if we should emit ANSI color sequences to stdout."""
+    try:
+        if os.environ.get("CYBERDRIVER_NO_COLOR") or os.environ.get("NO_COLOR"):
+            return False
+        # If logging is redirected to a file, avoid ANSI escapes.
+        if os.environ.get("CYBERDRIVER_STDIO_LOG"):
+            return False
+        if any(str(a).startswith("--_stdio-log=") for a in sys.argv):
+            return False
+        if hasattr(sys.stdout, "isatty") and not sys.stdout.isatty():
+            return False
+        if platform.system() == "Windows":
+            return _windows_try_enable_ansi()
+        return True
+    except Exception:
+        return False
+
+
+def _print_prominent_stop_hint() -> None:
+    """Print a prominent 'how to stop' hint for background mode."""
+    if _should_use_color():
+        bold = "\033[1m"
+        red = "\033[91m"
+        reset = "\033[0m"
+        print(f"{bold}{red}To stop Cyberdriver:{reset} {bold}cyberdriver stop{reset}")
+        print(f"(Optional): view logs with {bold}cyberdriver logs{reset}")
+    else:
+        print("To stop Cyberdriver: cyberdriver stop")
+        print("(Optional): view logs with cyberdriver logs")
+
+
+def _get_running_instance_pid_info() -> Optional[Dict[str, Any]]:
+    """Return pidfile info if a running Cyberdriver instance is detected."""
+    pid_path = get_pid_file_path()
+    if not pid_path.exists():
+        return None
+    try:
+        info = json.loads(pid_path.read_text(encoding="utf-8"))
+    except Exception:
+        info = {}
+    pid = info.get("pid")
+    try:
+        pid_int = int(pid)
+    except Exception:
+        pid_int = -1
+    if pid_int <= 0:
+        return None
+    if not _pid_is_running(pid_int):
+        return None
+
+    # Safety: On Windows, verify the image name (or fall back to argv heuristic) so
+    # we don't treat a recycled PID as a running Cyberdriver instance.
+    if platform.system() == "Windows":
+        image = _windows_tasklist_image_name(pid_int)
+        if image:
+            image_l = image.lower()
+            if image_l == "cyberdriver.exe":
+                return info
+            if image_l in ("python.exe", "pythonw.exe"):
+                return info if _pidfile_looks_like_cyberdriver(info) else None
+            return None
+        return info if _pidfile_looks_like_cyberdriver(info) else None
+
+    return info
+
+
 # Define websocket compatibility helper inline
 async def connect_with_headers(uri, headers_dict):
     """Compatibility wrapper for websocket connections with headers and keepalive settings.
@@ -704,7 +1256,28 @@ async def connect_with_headers(uri, headers_dict):
     # This is critical - the default context caches SSL sessions, and if a session
     # gets into a bad state (e.g., server closed unexpectedly), it can poison
     # future connections. Creating a fresh context ensures we start clean.
-    ssl_context = ssl.create_default_context()
+    #
+    # We use certifi's CA bundle to ensure we have up-to-date root certificates,
+    # which fixes TLS errors on Windows machines missing Let's Encrypt's ISRG Root X1.
+    try:
+        ca_file = certifi.where()
+        if os.path.exists(ca_file):
+            ssl_context = ssl.create_default_context(cafile=ca_file)
+            # Best-effort debug signal (no-op unless debug logger is enabled).
+            try:
+                debug_logger.debug("SSL", f"Using certifi CA bundle: {ca_file}")
+            except Exception:
+                pass
+        else:
+            # Certifi bundle not found (PyInstaller bundling issue?) - fall back to system
+            print(f"[WARNING] Certifi CA bundle not found at: {ca_file}")
+            print("[WARNING] Falling back to system CA store")
+            ssl_context = ssl.create_default_context()
+    except Exception as e:
+        # Any error with certifi - fall back to system defaults
+        print(f"[WARNING] Certifi error: {e}")
+        print("[WARNING] Falling back to system CA store")
+        ssl_context = ssl.create_default_context()
     
     # Common kwargs for robustness across proxies
     ws_kwargs = {
@@ -753,7 +1326,8 @@ async def connect_with_headers(uri, headers_dict):
 
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
-VERSION = "0.0.35"
+PID_FILE = "cyberdriver.pid.json"
+VERSION = "0.0.36"
 
 @dataclass
 class Config:
@@ -820,6 +1394,262 @@ def get_config() -> Config:
     with open(config_path, 'w') as f:
         json.dump(config.to_dict(), f, indent=2)
     return config
+
+
+def get_pid_file_path() -> pathlib.Path:
+    return get_config_dir() / PID_FILE
+
+
+def _remove_pid_file_safely() -> None:
+    try:
+        # Python 3.8+
+        get_pid_file_path().unlink(missing_ok=True)  # type: ignore[arg-type]
+        return
+    except TypeError:
+        # Python <3.8 compatibility
+        pass
+    except Exception:
+        return
+
+    try:
+        p = get_pid_file_path()
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+
+def write_pid_info(info: Dict[str, Any]) -> None:
+    """Write a PID file so `cyberdriver stop` can find the running instance."""
+    try:
+        pid_path = get_pid_file_path()
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+
+        payload = dict(info)
+        payload.setdefault("pid", os.getpid())
+        payload.setdefault("version", VERSION)
+        payload.setdefault("started_at", datetime.now().isoformat())
+        payload.setdefault("frozen", bool(getattr(sys, "frozen", False)))
+        payload.setdefault("argv", sys.argv[:])
+
+        tmp = pid_path.with_suffix(pid_path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp, pid_path)
+
+        atexit.register(_remove_pid_file_safely)
+    except Exception:
+        # Best-effort only
+        pass
+
+
+def _pid_is_running(pid: int) -> bool:
+    try:
+        pid = int(pid)
+        if pid <= 0:
+            return False
+    except Exception:
+        return False
+
+    if platform.system() == "Windows":
+        try:
+            # Use CSV output so we can reliably detect "not found".
+            # When no match exists, tasklist prints:
+            #   INFO: No tasks are running which match the specified criteria.
+            CREATE_NO_WINDOW = 0x08000000
+            r = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            out = ((r.stdout or "") + (r.stderr or "")).strip()
+            if not out:
+                return False
+            if "No tasks are running" in out:
+                return False
+            # If a row exists, it's running.
+            return True
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except Exception:
+            return False
+
+
+def _get_process_cmdline(pid: int) -> Optional[str]:
+    if platform.system() == "Windows":
+        # Avoid spawning PowerShell windows; prefer tasklist parsing elsewhere.
+        return None
+    else:
+        try:
+            proc_cmdline = pathlib.Path(f"/proc/{pid}/cmdline")
+            if proc_cmdline.exists():
+                raw = proc_cmdline.read_bytes()
+                parts = [p.decode(errors="ignore") for p in raw.split(b"\x00") if p]
+                return " ".join(parts) if parts else None
+        except Exception:
+            pass
+        return None
+
+
+def _cmdline_looks_like_cyberdriver(cmdline: str) -> bool:
+    s = (cmdline or "").lower()
+    return (
+        "cyberdriver" in s
+        or "cyberdriver.py" in s
+        or "cyberdriver.exe" in s
+    )
+
+
+def _windows_tasklist_image_name(pid: int) -> Optional[str]:
+    """Return the image name for PID, or None if not found."""
+    if platform.system() != "Windows":
+        return None
+    try:
+        import csv
+        from io import StringIO
+
+        CREATE_NO_WINDOW = 0x08000000
+        r = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
+        if not out or "No tasks are running" in out:
+            return None
+        row = next(csv.reader(StringIO(out)))
+        # CSV format: "Image Name","PID","Session Name","Session#","Mem Usage"
+        if not row:
+            return None
+        return (row[0] or "").strip().strip('"') or None
+    except Exception:
+        return None
+
+
+def _pidfile_looks_like_cyberdriver(info: Dict[str, Any]) -> bool:
+    try:
+        argv = info.get("argv") or []
+        s = " ".join(str(a) for a in argv).lower()
+        return "cyberdriver" in s
+    except Exception:
+        return False
+
+
+def stop_running_instance(force: bool = False, timeout_seconds: float = 10.0) -> int:
+    """Stop the running Cyberdriver instance found via PID file."""
+    pid_path = get_pid_file_path()
+    if not pid_path.exists():
+        print("Cyberdriver is already stopped.")
+        return 0
+
+    try:
+        info = json.loads(pid_path.read_text(encoding="utf-8"))
+    except Exception:
+        info = {}
+
+    pid = info.get("pid")
+    try:
+        pid_int = int(pid)
+    except Exception:
+        print("PID file exists but is invalid. Removing it.")
+        _remove_pid_file_safely()
+        return 0
+
+    if not _pid_is_running(pid_int):
+        print("Cyberdriver is already stopped (removing stale pid file).")
+        _remove_pid_file_safely()
+        return 0
+
+    if platform.system() == "Windows" and not force:
+        image = _windows_tasklist_image_name(pid_int)
+        # In release builds we expect cyberdriver.exe; in source/dev we may see python.exe.
+        if image:
+            image_l = image.lower()
+            if image_l == "cyberdriver.exe":
+                # Definitely ours - proceed
+                pass
+            elif image_l in ("python.exe", "pythonw.exe"):
+                # Could be cyberdriver running from source, or a completely different Python script.
+                # Verify via PID file argv to avoid killing the wrong process if PID was recycled.
+                if not _pidfile_looks_like_cyberdriver(info):
+                    print("Refusing to stop: python.exe PID does not look like Cyberdriver.")
+                    print("Use `cyberdriver stop --force` if you're sure.")
+                    return 2
+            else:
+                # Unexpected image name - refuse unless force
+                print(f"Refusing to stop: PID {pid_int} is {image}, not cyberdriver.exe.")
+                print("Use `cyberdriver stop --force` if you're sure.")
+                return 2
+        else:
+            # If we can't determine the image name, fall back to pidfile argv heuristic.
+            if not _pidfile_looks_like_cyberdriver(info):
+                print("Refusing to stop: PID does not look like Cyberdriver.")
+                print("Use `cyberdriver stop --force` if you're sure.")
+                return 2
+
+    print(f"Stopping Cyberdriver (PID {pid_int})...")
+
+    if platform.system() == "Windows":
+        # For Windows, go straight to force kill (/F). A hidden background process
+        # can't receive graceful termination signals, so there's no point trying.
+        try:
+            CREATE_NO_WINDOW = 0x08000000
+            r = subprocess.run(
+                ["taskkill", "/PID", str(pid_int), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            out = ((r.stdout or "") + (r.stderr or "")).strip()
+            if r.returncode != 0 and "Access is denied" in out:
+                print("Access denied. If Cyberdriver was started from an Administrator shell, run `cyberdriver stop` as Administrator.")
+                return 1
+        except Exception:
+            pass
+
+        time.sleep(0.3)
+        if not _pid_is_running(pid_int):
+            _remove_pid_file_safely()
+            print("Cyberdriver stopped.")
+            return 0
+        print("Failed to stop Cyberdriver.")
+        return 1
+    
+    # For non-Windows, try graceful SIGTERM first
+    deadline = time.time() + max(0.0, float(timeout_seconds))
+
+    try:
+        os.kill(pid_int, signal.SIGTERM)
+    except Exception:
+        pass
+
+    while time.time() < deadline:
+        if not _pid_is_running(pid_int):
+            _remove_pid_file_safely()
+            print("Cyberdriver stopped.")
+            return 0
+        time.sleep(0.2)
+
+    try:
+        os.kill(pid_int, signal.SIGKILL)
+    except Exception:
+        pass
+    time.sleep(0.3)
+    if not _pid_is_running(pid_int):
+        _remove_pid_file_safely()
+        print("Cyberdriver stopped (killed).")
+        return 0
+    print("Failed to stop Cyberdriver.")
+    return 1
 
 
 # -----------------------------------------------------------------------------
@@ -1391,13 +2221,55 @@ async def post_update(payload: UpdateRequest = UpdateRequest()):
         
         # Build restart command with original arguments (only if restart_after is True)
         # Preserve all command-line arguments so the new instance runs with the same config
+        restart_args: Optional[List[str]] = None
         if restart_after:
             # Get original arguments (skip argv[0] which is the executable path)
-            original_args = sys.argv[1:] if len(sys.argv) > 1 else []
+            raw_args = sys.argv[1:] if len(sys.argv) > 1 else []
+
+            # IMPORTANT (Stealth Mode): background instances include internal flags like
+            # --_detached-child and --_stdio-log=... that should NOT be persisted across a
+            # self-update restart. If we keep them, the restarted process may skip the
+            # normal background-launch flow, or attempt to tail logs in a non-interactive
+            # context.
+            restart_args = []
+            skip_next = False
+            for arg in raw_args:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if arg in ("--_detached-child", "--detach", "--tail"):
+                    continue
+                if arg == "--_stdio-log":
+                    skip_next = True
+                    continue
+                if arg.startswith("--_stdio-log="):
+                    continue
+                restart_args.append(arg)
+
+            def _obfuscate_sensitive_args(args_list: List[str]) -> List[str]:
+                obfuscated: List[str] = []
+                skip = False
+                for a in args_list:
+                    if skip:
+                        obfuscated.append("***")
+                        skip = False
+                        continue
+                    if a in ("--secret", "-s"):
+                        obfuscated.append(a)
+                        skip = True
+                        continue
+                    if a.startswith("--secret="):
+                        obfuscated.append("--secret=***")
+                        continue
+                    if a.startswith("-s="):
+                        obfuscated.append("-s=***")
+                        continue
+                    obfuscated.append(a)
+                return obfuscated
             
             # Escape arguments that contain spaces or special characters for batch file
             escaped_args = []
-            for arg in original_args:
+            for arg in restart_args:
                 # If arg contains spaces, quotes, or special chars, wrap in quotes
                 if ' ' in arg or '"' in arg or '&' in arg or '|' in arg or '<' in arg or '>' in arg or '^' in arg:
                     # Escape any existing quotes by doubling them
@@ -1408,8 +2280,8 @@ async def post_update(payload: UpdateRequest = UpdateRequest()):
             
             args_str = ' '.join(escaped_args)
             
-            print(f"Original arguments: {original_args}")
-            print(f"Escaped arguments for restart: {args_str}")
+            print(f"Restart arguments: {_obfuscate_sensitive_args(restart_args)}")
+            print(f"Escaped arguments for restart: {_obfuscate_sensitive_args(escaped_args)}")
         
         # Create updater PowerShell script (more reliable than batch on modern Windows)
         # Log file for update process
@@ -1613,24 +2485,8 @@ objShell.Run "powershell -NoProfile -ExecutionPolicy Bypass -File ""{updater_ps1
         
         # Include preserved arguments in response if restarting (obfuscate secrets)
         if restart_after:
-            original_args = sys.argv[1:] if len(sys.argv) > 1 else []
-            # Obfuscate sensitive values (--secret, -s, etc.)
-            obfuscated_args = []
-            skip_next = False
-            for i, arg in enumerate(original_args):
-                if skip_next:
-                    obfuscated_args.append("***")
-                    skip_next = False
-                elif arg in ("--secret", "-s"):
-                    obfuscated_args.append(arg)
-                    skip_next = True
-                elif arg.startswith("--secret="):
-                    obfuscated_args.append("--secret=***")
-                elif arg.startswith("-s="):
-                    obfuscated_args.append("-s=***")
-                else:
-                    obfuscated_args.append(arg)
-            response_content["preserved_arguments"] = obfuscated_args
+            # Use sanitized restart args (no internal stealth-mode flags).
+            response_content["preserved_arguments"] = _obfuscate_sensitive_args(restart_args or [])
         
         return JSONResponse(status_code=200, content=response_content)
         
@@ -2869,30 +3725,22 @@ class TunnelClient:
         debug_logger.connection_established(uri)
         
         async with websocket:
-            # Print success message with green checkmark
-            # Ensure countdown line (if any) is cleared before printing
+            # Print a success message. If we're logging to a file (detached/background mode),
+            # avoid ANSI escape sequences so logs stay readable.
+            # Ensure countdown line (if any) is cleared before printing.
             try:
                 if self.keepalive_manager is not None and hasattr(self.keepalive_manager, "_clear_countdown_line"):
                     self.keepalive_manager._clear_countdown_line()
             except Exception:
                 pass
-            if platform.system() == "Windows":
-                # Check if colors are supported
-                try:
-                    import ctypes
-                    kernel32 = ctypes.windll.kernel32
-                    kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
-                    green = '\033[92m'
-                    white = '\033[97m'
-                    reset = '\033[0m'
-                    print(f"{green}✓{reset} {white}Connected!{reset} Forwarding to http://127.0.0.1:{self.target_port}")
-                except:
-                    print(f"√ Connected! Forwarding to http://127.0.0.1:{self.target_port}")
+            connected_msg = f"Connected! Forwarding to http://127.0.0.1:{self.target_port}"
+            if _should_use_color():
+                green = "\033[92m"
+                white = "\033[97m"
+                reset = "\033[0m"
+                print(f"{green}✓{reset} {white}{connected_msg}{reset}")
             else:
-                green = '\033[92m'
-                white = '\033[97m'
-                reset = '\033[0m'
-                print(f"{green}✓{reset} {white}Connected!{reset} Forwarding to http://127.0.0.1:{self.target_port}")
+                print(f"✓ {connected_msg}")
             # Optionally re-print countdown immediately after connect
             try:
                 if self.keepalive_manager is not None and hasattr(self.keepalive_manager, "_print_countdown"):
@@ -3632,6 +4480,15 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
     if actual_target_port != target_port:
         print(f"Using available port {actual_target_port} for local server.")
 
+    write_pid_info(
+        {
+            "command": "join",
+            "local_port": actual_target_port,
+            "cloud_host": host,
+            "cloud_port": port,
+        }
+    )
+
     # Start API server asynchronously in the same event loop
     server_task = asyncio.create_task(run_server_async(actual_target_port))
     
@@ -3933,15 +4790,15 @@ def print_banner(mode="default"):
     Args:
         mode: "default" for normal banner, "connecting" for join command
     """
+    # If we're in detached/background mode (logging to a file) or the user requested it,
+    # avoid ANSI codes so logs remain readable in files.
+    if os.environ.get("CYBERDRIVER_NO_COLOR") or os.environ.get("CYBERDRIVER_STDIO_LOG"):
+        print_banner_no_color(mode)
+        return
+
     # Enable Windows terminal colors if needed
     if platform.system() == "Windows":
-        try:
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            # Enable ANSI escape sequences
-            kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
-        except:
-            # If we can't enable ANSI, disable colors
+        if not _windows_try_enable_ansi():
             print_banner_no_color(mode)
             return
     
@@ -4001,6 +4858,9 @@ def main():
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+    # If we were launched in "detached/invisible" mode, redirect stdout/stderr to a log file.
+    _setup_detached_stdio_if_configured()
     
     # Print banner if no arguments or help requested
     if len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] in ['-h', '--help']):
@@ -4046,6 +4906,37 @@ def main():
         help="Capture screen coordinates by clicking",
         description="Interactive utility to capture X,Y coordinates for keepalive configuration"
     )
+
+    # stop command
+    stop_parser = subparsers.add_parser(
+        "stop",
+        help="Stop running Cyberdriver",
+        description="Stop the running Cyberdriver instance (foreground or background) using the PID file.",
+    )
+    stop_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="Seconds to wait before forcing termination (default: 10).",
+    )
+    stop_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force stop even if the PID can't be verified as Cyberdriver.",
+    )
+
+    # logs command
+    logs_parser = subparsers.add_parser(
+        "logs",
+        help="Tail Cyberdriver logs (realtime)",
+        description="Tail the Cyberdriver stdio log file in realtime (Ctrl+C stops tailing).",
+    )
+    logs_parser.add_argument(
+        "--path",
+        type=str,
+        default=None,
+        help="Path to log file (default: ~/.cyberdriver/logs/cyberdriver-stdio.log)",
+    )
     join_parser.add_argument("--secret", required=True, help="Your API key from Cyberdesk")
     join_parser.add_argument("--host", default="api.cyberdesk.io", help="Control server (default: api.cyberdesk.io)")
     join_parser.add_argument("--port", type=int, default=443, help="Control server port (default: 443)")
@@ -4060,6 +4951,33 @@ def main():
     join_parser.add_argument("--interactive", action="store_true", help="Interactive CLI to Disable/Re-enable without exiting")
     join_parser.add_argument("--register-as-keepalive-for", type=str, default=None, help="Register this instance as the remote keepalive (host) for MAIN_MACHINE_ID")
     join_parser.add_argument("--debug", action="store_true", help="Enable debug logging to ~/.cyberdriver/logs/ (daily log files)")
+    join_parser.add_argument(
+        "--foreground",
+        action="store_true",
+        help="Run in the foreground with a visible console window (Windows).",
+    )
+    join_parser.add_argument(
+        "--detach",
+        action="store_true",
+        help="On Windows, start in background and return immediately (do not tail logs).",
+    )
+    join_parser.add_argument(
+        "--tail",
+        action="store_true",
+        help="(Windows) After starting in background, tail the log file in this terminal.",
+    )
+    join_parser.add_argument(
+        "--_detached-child",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
+    join_parser.add_argument(
+        "--_stdio-log",
+        type=str,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     
     # Parse arguments with error handling
     try:
@@ -4081,9 +4999,93 @@ def main():
         print("  join --secret KEY --add-persistent-display Install virtual display driver (Windows)")
         print("  join --secret KEY --debug                 Enable debug logging to ~/.cyberdriver/logs/")
         print("  coords                                    Capture screen coordinates (for keepalive)")
+        print("  stop                                     Stop running Cyberdriver")
+        print("  logs                                     Tail Cyberdriver logs (realtime)")
         print()
         print("For more info: cyberdriver join -h")
         sys.exit(0)
+
+    if args.command == "stop":
+        sys.exit(stop_running_instance(force=bool(getattr(args, "force", False)),
+                                       timeout_seconds=float(getattr(args, "timeout", 10.0))))
+
+    if args.command == "logs":
+        default_path = _default_stdio_log_path()
+        log_path = pathlib.Path(getattr(args, "path", None) or default_path)
+        if not log_path.exists():
+            print(f"No log file found at: {log_path}")
+            print("Start Cyberdriver with `cyberdriver join` first, then retry.")
+            sys.exit(0)
+        # Ensure Ctrl+C behaves like users expect for tailing (KeyboardInterrupt).
+        try:
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+        except Exception:
+            pass
+        _follow_log_file(log_path)
+        sys.exit(0)
+
+    # Idempotency: if join is invoked while Cyberdriver is already running, do not
+    # start another instance. This applies to both background (default) and --foreground.
+    if args.command == "join" and not getattr(args, "_detached_child", False):
+        info = _get_running_instance_pid_info()
+        if info:
+            pid_int = int(info.get("pid", -1))
+            print_banner(mode="connecting")
+            print(f"Cyberdriver is already running (PID {pid_int}).")
+            print(f"Logs: {_default_stdio_log_path()}")
+            _print_prominent_stop_hint()
+            print("\nIf you want to restart with different flags, run `cyberdriver stop` first.")
+            sys.exit(0)
+
+    # On Windows, default to running `join` invisibly in a detached process so closing the
+    # launching terminal (or an agent hitting Alt+F4) cannot kill Cyberdriver.
+    #
+    # Use `--foreground` to disable this behavior.
+    if (
+        platform.system() == "Windows"
+        and args.command == "join"
+        and not getattr(args, "foreground", False)
+        and os.environ.get("CYBERDRIVER_DETACHED") != "1"
+        and not getattr(args, "_detached_child", False)
+    ):
+        try:
+            logs_dir = get_config_dir() / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            stdio_log_path = logs_dir / "cyberdriver-stdio.log"
+
+            child_argv = sys.argv[1:]
+            # Remove --foreground if present (shouldn't be, but be safe).
+            child_argv = [a for a in child_argv if a != "--foreground"]
+            # Remove legacy flags so they don't propagate to child.
+            child_argv = [a for a in child_argv if a not in ("--detach", "--tail")]
+            # Mark child so argparse doesn't try to re-detach via sys.argv alone.
+            child_argv.append("--_detached-child")
+            # Pass log file path to child (env vars don't work with VBScript launcher)
+            child_argv.append(f"--_stdio-log={stdio_log_path}")
+
+            # Show the nice banner in the *current* terminal (this is not the detached child).
+            print_banner(mode="connecting")
+            print("Cyberdriver is now running in the background.")
+            print("You can close PowerShell.")
+            print(f"Logs: {stdio_log_path}")
+            _print_prominent_stop_hint()
+            print("(You can also end cyberdriver.exe in Task Manager.)")
+            print()
+            _windows_relaunch_detached(child_argv, stdio_log_path)
+
+            # Default UX: return immediately. If the user wants logs in this terminal,
+            # they can opt-in with --tail.
+            if bool(getattr(args, "tail", False)):
+                # Make Ctrl+C stop tailing (not print the join shutdown message).
+                try:
+                    signal.signal(signal.SIGINT, signal.default_int_handler)
+                except Exception:
+                    pass
+                _follow_log_file(stdio_log_path)
+            return
+        except Exception as e:
+            print(f"\nWarning: Failed to start background process: {e}")
+            print("Continuing in foreground mode instead.\n")
     
     # Show banner for join command
     if args.command == "join":
@@ -4118,12 +5120,12 @@ def main():
         else:
             # Running as admin - show confirmation
             try:
-                import ctypes
-                kernel32 = ctypes.windll.kernel32
-                kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
-                green = '\033[92m'
-                reset = '\033[0m'
-                print(f"{green}✓{reset} Running with administrator privileges\n")
+                if _should_use_color():
+                    green = "\033[92m"
+                    reset = "\033[0m"
+                    print(f"{green}✓{reset} Running with administrator privileges\n")
+                else:
+                    print("✓ Running with administrator privileges\n")
             except:
                 print("✓ Running with administrator privileges\n")
     
@@ -4153,6 +5155,8 @@ def main():
             if actual_port is None:
                 print(f"Error: Could not find an available port starting from {args.port}.")
                 sys.exit(1)
+
+            write_pid_info({"command": "start", "local_port": actual_port})
             
             # Try to print with checkmark
             if platform.system() == "Windows":

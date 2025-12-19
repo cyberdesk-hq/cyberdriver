@@ -10,7 +10,8 @@ datas = []
 binaries = []
 hiddenimports = []
 
-for package in ['fastapi', 'uvicorn', 'mss']:
+# Include certifi's CA bundle so TLS works on Windows machines missing root certs
+for package in ['fastapi', 'uvicorn', 'mss', 'certifi']:
     tmp_datas, tmp_binaries, tmp_hiddens = collect_all(package)
     datas += tmp_datas
     binaries += tmp_binaries
@@ -62,6 +63,15 @@ a = Analysis(
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 # EXE
+_console = True
+if sys.platform == "win32":
+    # IMPORTANT:
+    # The default Windows artifact should be a console app so running `cyberdriver join`
+    # from PowerShell can show logs (we tail the detached background instance's log file).
+    # To build a windowed/no-console variant, set CYBERDRIVER_WINDOWED=1.
+    _windowed = os.environ.get("CYBERDRIVER_WINDOWED", "").lower() in ("1", "true", "yes")
+    _console = not _windowed
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -76,7 +86,7 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,
+    console=_console,
     disable_windowed_traceback=False,
     target_arch=(os.environ.get('TARGET_ARCH') if sys.platform == 'darwin' else None),
     codesign_identity=(os.environ.get('CODESIGN_IDENTITY') if sys.platform == 'darwin' else None),

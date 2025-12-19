@@ -48,7 +48,7 @@ $toolDir = "$env:USERPROFILE\.cyberdriver"
 New-Item -ItemType Directory -Force -Path $toolDir
 
 # Download cyberdriver
-Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.35/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe"
+Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.36/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe"
 
 # Add to PATH if not already there
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -63,7 +63,7 @@ Write-Host "Cyberdriver installed! You may need to restart your terminal for PAT
 
 ```bash
 # Choose version and target directory
-VERSION=0.0.35
+VERSION=0.0.36
 TOOL_DIR="$HOME/.cyberdriver"
 mkdir -p "$TOOL_DIR"
 
@@ -123,7 +123,7 @@ When running cyberdriver on Windows, the console window is visible and can be ac
 
 When you run `cyberdriver join` on Windows, protection is automatically enabled:
 - **Close button disabled** - The X button is grayed out and non-functional
-- **Window minimized** - Console minimizes to taskbar, staying out of the agent's way
+- **Invisible background mode (default)** - Cyberdriver relaunches itself detached with **no visible console window**. Closing/Alt+F4'ing the original PowerShell window will **not** kill Cyberdriver.
 - **QuickEdit disabled** - Prevents console hanging if clicked
 
 No extra setup needed! Just run:
@@ -131,7 +131,30 @@ No extra setup needed! Just run:
 cyberdriver join --secret YOUR_API_KEY
 ```
 
-**To stop:** Use `Ctrl+C` in the console or Task Manager
+**Windows UX (recommended):**
+
+- `cyberdriver join ...` starts Cyberdriver **in the background (no window)** and returns you to the prompt.
+- To stop Cyberdriver, run: `cyberdriver stop` (or end `cyberdriver.exe` in Task Manager).
+- Logs are written to: `%LOCALAPPDATA%\.cyberdriver\logs\cyberdriver-stdio.log`
+
+**Want to tail logs in your current PowerShell?**
+
+```bash
+cyberdriver join --secret YOUR_API_KEY --tail
+```
+
+**Want a visible console for debugging?**
+
+Run in the foreground:
+
+```bash
+cyberdriver join --secret YOUR_API_KEY --foreground
+```
+
+**To stop:**
+
+- Foreground mode: `Ctrl+C`
+- Background mode: `cyberdriver stop` (or Task Manager)
 
 ## Self-Update (Windows)
 
@@ -186,47 +209,13 @@ After the update, Cyberdriver will restart with those exact same flags.
 
 ### TLS Certificate Errors
 
-If you get an error regarding TLS Certificates, CTRL+C and then run the following:
+**v0.0.36+**: Cyberdriver now bundles its own CA certificates, so TLS errors on Windows machines missing root certs should be fixed automatically.
+
+If you're on an older version and encounter TLS certificate errors, update to the latest version:
 
 ```powershell
-# Check if running as admin
-$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
-if ($isAdmin) {
-    $store = "Cert:\LocalMachine\Root"
-    Write-Host "Running as Administrator - installing system-wide" -ForegroundColor Green
-} else {
-    $store = "Cert:\CurrentUser\Root"
-    Write-Host "Running as user - installing for current user only" -ForegroundColor Yellow
-}
-
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-# Only the working certificate URLs
-$certs = @(
-    @{
-        Name = "ISRG Root X1"
-        Url = "https://letsencrypt.org/certs/isrgrootx1.der"
-    }
-)
-
-foreach ($cert in $certs) {
-    try {
-        Write-Host "Downloading $($cert.Name)..." -ForegroundColor Cyan
-        $tempFile = "$env:TEMP\$($cert.Name -replace ' ','_').der"
-        Invoke-WebRequest -Uri $cert.Url -OutFile $tempFile -UseBasicParsing
-        
-        $certObj = Import-Certificate -FilePath $tempFile -CertStoreLocation $store
-        Write-Host "✓ Installed $($cert.Name)" -ForegroundColor Green
-        
-        Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
-    } catch {
-        Write-Host "✗ Failed to install $($cert.Name): $_" -ForegroundColor Red
-    }
-}
+Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.36/cyberdriver.exe" -OutFile "$env:USERPROFILE\.cyberdriver\cyberdriver.exe"
 ```
-
-Then retry `cyberdriver join`!
 
 > If you have any other issues, reach out to the team! We'll get on it asap.
 
@@ -349,7 +338,7 @@ Configuration is stored in:
 The config file contains:
 ```json
 {
-  "version": "0.0.34",
+  "version": "0.0.36",
   "fingerprint": "uuid-v4-string"
 }
 ```
