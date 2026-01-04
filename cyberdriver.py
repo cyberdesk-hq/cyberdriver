@@ -1327,7 +1327,7 @@ async def connect_with_headers(uri, headers_dict):
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
 PID_FILE = "cyberdriver.pid.json"
-VERSION = "0.0.36"
+VERSION = "0.0.37"
 
 @dataclass
 class Config:
@@ -3886,7 +3886,6 @@ class TunnelClient:
         request_timeout = 30.0
         if path == "/computer/shell/powershell/exec" and body:
             try:
-                import json
                 payload = json.loads(body.decode('utf-8'))
                 if "timeout" in payload:
                     # Add buffer to prevent race condition with subprocess timeout
@@ -3960,6 +3959,30 @@ class TunnelClient:
                 "body": error_msg.encode(),
             }
         
+        # If the local API (or tunnel forwarding layer) returns an error status with an empty body,
+        # synthesize a small JSON error so the cloud proxy has something actionable to display/log.
+        try:
+            if result and isinstance(result.get("status"), int) and result["status"] >= 400:
+                body_bytes = result.get("body") or b""
+                if isinstance(body_bytes, str):
+                    body_bytes = body_bytes.encode("utf-8", errors="replace")
+                elif not isinstance(body_bytes, (bytes, bytearray)):
+                    body_bytes = str(body_bytes).encode("utf-8", errors="replace")
+
+                if len(body_bytes) == 0:
+                    placeholder = {
+                        "detail": "Cyberdriver local API returned an error with an empty body",
+                        "status": result["status"],
+                        "method": method,
+                        "path": path,
+                    }
+                    result["headers"] = dict(result.get("headers") or {})
+                    result["headers"]["content-type"] = "application/json"
+                    result["body"] = json.dumps(placeholder).encode("utf-8")
+        except Exception:
+            # Never fail the tunnel due to diagnostics enrichment.
+            pass
+
         # Cache the response if idempotency key was provided and request was successful
         # We cache even 500 errors to prevent retries from re-executing a failed action
         if idempotency_key and result:
@@ -4854,10 +4877,60 @@ def print_banner(mode="default"):
     print()
 
 
+def cleanup_old_mei_folders() -> None:
+    """
+    Clean up old PyInstaller _MEI extraction folders on startup.
+    
+    When running as a frozen PyInstaller onefile executable with runtime_tmpdir set,
+    each run extracts to a new _MEIxxxxxx folder. If the user kills cyberdriver from
+    Task Manager (or it crashes), these folders accumulate. This function removes
+    stale _MEI folders from previous runs.
+    
+    Only runs on Windows when frozen. Silently does nothing otherwise.
+    """
+    if platform.system() != "Windows":
+        return
+    
+    if not getattr(sys, 'frozen', False):
+        return  # Not running as frozen exe
+    
+    current_mei = getattr(sys, '_MEIPASS', None)
+    if not current_mei:
+        return
+    
+    # Get the parent directory where all _MEI folders live
+    mei_parent = os.path.dirname(current_mei)
+    current_mei_name = os.path.basename(current_mei)
+    
+    cleaned_count = 0
+    for folder_name in os.listdir(mei_parent):
+        if not folder_name.startswith('_MEI'):
+            continue
+        if folder_name == current_mei_name:
+            continue  # Don't delete current folder!
+        
+        folder_path = os.path.join(mei_parent, folder_name)
+        if not os.path.isdir(folder_path):
+            continue
+        
+        try:
+            shutil.rmtree(folder_path)
+            cleaned_count += 1
+        except Exception:
+            # Folder might be in use by another running instance, or permission denied
+            pass
+    
+    if cleaned_count > 0:
+        print(f"[INFO] Cleaned up {cleaned_count} old temporary folder(s)")
+
+
 def main():
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+    # Clean up old _MEI folders from previous runs (Windows only, PyInstaller frozen only)
+    cleanup_old_mei_folders()
 
     # If we were launched in "detached/invisible" mode, redirect stdout/stderr to a log file.
     _setup_detached_stdio_if_configured()

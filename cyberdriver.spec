@@ -85,7 +85,10 @@ exe = EXE(
     strip=False,
     upx=True,
     upx_exclude=[],
-    runtime_tmpdir=None,
+    # Use a persistent directory for PyInstaller extraction to avoid Windows temp cleanup issues.
+    # %LOCALAPPDATA% is expanded by the bootloader at runtime on Windows.
+    # On macOS/Linux, None means use system temp (which is fine since they don't aggressively clean).
+    runtime_tmpdir=r'%LOCALAPPDATA%\Cyberdriver\_pyinstaller' if sys.platform == 'win32' else None,
     console=_console,
     disable_windowed_traceback=False,
     target_arch=(os.environ.get('TARGET_ARCH') if sys.platform == 'darwin' else None),
