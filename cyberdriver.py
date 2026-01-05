@@ -957,40 +957,28 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
     # Escape for VBScript string literals: double all quotes.
     vbs_cmd_line = raw_cmd_line.replace('"', '""')
     
-    # Create a batch file wrapper that sets the environment variable and launches cyberdriver.
-    # WshShell.Environment("Process") doesn't properly propagate to child processes via WshShell.Run,
-    # so we use a .cmd wrapper to ensure PYINSTALLER_RESET_ENVIRONMENT=1 is set for the child.
+    # CRITICAL FIX (PyInstaller 6.9+): We need to set PYINSTALLER_RESET_ENVIRONMENT=1
+    # so the child process creates its own _MEI extraction directory instead of reusing
+    # the parent's. When the parent exits, it would otherwise delete files the child needs.
     #
-    # The VBScript then runs this .cmd file hidden.
+    # We use "cmd /c set VAR=value & command" to set the env var inline before running
+    # cyberdriver.exe. This is more reliable than batch files or VBScript environment methods.
     
     config_dir = get_config_dir()
     config_dir.mkdir(parents=True, exist_ok=True)
     
-    # Create batch file that sets env var and launches cyberdriver
-    cmd_path = config_dir / "launch-hidden.cmd"
-    cmd_content = f'''@echo off
-rem Clear PyInstaller environment variables to prevent folder sharing
-set "_MEIPASS2="
-set "_PYI_APPLICATION_HOME_DIR="
-set "_PYI_PARENT_PROCESS_LEVEL="
-rem CRITICAL: Force child to create its own _MEI extraction directory (PyInstaller 6.9+)
-set "PYINSTALLER_RESET_ENVIRONMENT=1"
-rem Launch cyberdriver
-{raw_cmd_line}
-'''
+    # Build command that sets env vars and runs cyberdriver
+    # Using & (not &&) so cyberdriver runs even if set "fails" (it won't, but safer)
+    # We clear the PyInstaller vars and set PYINSTALLER_RESET_ENVIRONMENT=1
+    env_setup = 'set "_MEIPASS2=" & set "_PYI_APPLICATION_HOME_DIR=" & set "_PYI_PARENT_PROCESS_LEVEL=" & set "PYINSTALLER_RESET_ENVIRONMENT=1"'
+    full_cmd = f'cmd /c {env_setup} & {raw_cmd_line}'
     
-    try:
-        with open(cmd_path, "w", encoding="utf-8") as f:
-            f.write(cmd_content)
-    except Exception as e:
-        raise RuntimeError(f"Failed to write launcher batch file: {e}")
+    # Escape for VBScript string literals: double all quotes
+    vbs_cmd_line = full_cmd.replace('"', '""')
     
-    # Escape the .cmd path for VBScript
-    cmd_path_escaped = str(cmd_path).replace('"', '""')
-    
-    # VBScript runs the .cmd file hidden
+    # VBScript runs the command hidden
     vbs_content = f'''Set WshShell = CreateObject("WScript.Shell")
-WshShell.Run """{cmd_path_escaped}""", 0, False
+WshShell.Run "{vbs_cmd_line}", 0, False
 '''
     
     vbs_path = config_dir / "launch-hidden.vbs"
@@ -1000,7 +988,7 @@ WshShell.Run """{cmd_path_escaped}""", 0, False
     try:
         with open(debug_path, "w", encoding="utf-8") as f:
             f.write(f"Raw command: {raw_cmd_line}\n")
-            f.write(f"\nBatch file ({cmd_path}):\n{cmd_content}\n")
+            f.write(f"Full command with env setup: {full_cmd}\n")
             f.write(f"\nVBS script ({vbs_path}):\n{vbs_content}\n")
     except Exception:
         pass
