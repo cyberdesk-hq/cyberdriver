@@ -919,12 +919,21 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
     # Historically this was `_MEIPASS2`; in newer PyInstaller versions it is
     # `_PYI_APPLICATION_HOME_DIR` (and there are other `_PYI_*` vars).
     #
+    # CRITICAL FIX (PyInstaller 6.9+): Setting PYINSTALLER_RESET_ENVIRONMENT=1 tells
+    # the bootloader to ignore inherited _PYI_* variables and create a fresh _MEI
+    # extraction directory. This prevents the parent's cleanup from deleting files
+    # that the long-lived child process needs.
+    # See: https://pyinstaller.org/en/stable/common-issues-and-pitfalls.html
+    #
     # Make sure wscript starts with a clean environment so the detached process
     # creates its *own* extraction directory.
     wscript_env = os.environ.copy()
     for k in list(wscript_env.keys()):
         if k == "_MEIPASS2" or k.startswith("_PYI_"):
             wscript_env.pop(k, None)
+    
+    # Force child to create its own extraction directory (PyInstaller 6.9+)
+    wscript_env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
 
     # PyInstaller also adjusts the process DLL search path in onefile mode, which can
     # leak into child processes on Windows. Reset it before launching `wscript`.
@@ -960,6 +969,9 @@ Set objEnv = WshShell.Environment("Process")
 On Error Resume Next
 objEnv.Remove "_MEIPASS2"
 objEnv.Remove "_PYI_APPLICATION_HOME_DIR"
+objEnv.Remove "_PYI_PARENT_PROCESS_LEVEL"
+' CRITICAL: Force child to create its own _MEI extraction directory (PyInstaller 6.9+)
+objEnv("PYINSTALLER_RESET_ENVIRONMENT") = "1"
 On Error Goto 0
 WshShell.Run "{vbs_cmd_line}", 0, False
 '''
@@ -1622,6 +1634,7 @@ def stop_running_instance(force: bool = False, timeout_seconds: float = 10.0) ->
             print("Cyberdriver stopped.")
             return 0
         print("Failed to stop Cyberdriver.")
+        print("Please check Windows Task Manager for cyberdriver.exe. You can kill the task there.")
         return 1
     
     # For non-Windows, try graceful SIGTERM first
@@ -1649,6 +1662,7 @@ def stop_running_instance(force: bool = False, timeout_seconds: float = 10.0) ->
         print("Cyberdriver stopped (killed).")
         return 0
     print("Failed to stop Cyberdriver.")
+    print("Please check your system's process manager to manually kill the cyberdriver process.")
     return 1
 
 
@@ -4935,6 +4949,17 @@ def main():
     # If we were launched in "detached/invisible" mode, redirect stdout/stderr to a log file.
     _setup_detached_stdio_if_configured()
     
+    # Log PyInstaller environment for diagnostics (helps debug _MEI folder issues)
+    if getattr(sys, 'frozen', False) and platform.system() == "Windows":
+        meipass = getattr(sys, '_MEIPASS', 'N/A')
+        pyi_reset = os.environ.get('PYINSTALLER_RESET_ENVIRONMENT', 'not set')
+        pyi_home = os.environ.get('_PYI_APPLICATION_HOME_DIR', 'not set')
+        pyi_level = os.environ.get('_PYI_PARENT_PROCESS_LEVEL', 'not set')
+        print(f"[PYINSTALLER] _MEIPASS={meipass}")
+        print(f"[PYINSTALLER] PYINSTALLER_RESET_ENVIRONMENT={pyi_reset}")
+        print(f"[PYINSTALLER] _PYI_APPLICATION_HOME_DIR={pyi_home}")
+        print(f"[PYINSTALLER] _PYI_PARENT_PROCESS_LEVEL={pyi_level}")
+    
     # Print banner if no arguments or help requested
     if len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] in ['-h', '--help']):
         print_banner()
@@ -5079,10 +5104,12 @@ def main():
         sys.exit(0)
 
     if args.command == "stop":
+        print("Stopping Cyberdriver...")
         sys.exit(stop_running_instance(force=bool(getattr(args, "force", False)),
                                        timeout_seconds=float(getattr(args, "timeout", 10.0))))
 
     if args.command == "logs":
+        print("Loading Cyberdriver logs...")
         default_path = _default_stdio_log_path()
         log_path = pathlib.Path(getattr(args, "path", None) or default_path)
         if not log_path.exists():
