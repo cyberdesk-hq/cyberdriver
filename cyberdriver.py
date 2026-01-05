@@ -957,37 +957,51 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
     # Escape for VBScript string literals: double all quotes.
     vbs_cmd_line = raw_cmd_line.replace('"', '""')
     
-    # Create VBScript that launches cyberdriver hidden
-    # The "0" parameter to Run means: hidden window
-    # The "False" parameter means: don't wait for the process to finish
+    # Create a batch file wrapper that sets the environment variable and launches cyberdriver.
+    # WshShell.Environment("Process") doesn't properly propagate to child processes via WshShell.Run,
+    # so we use a .cmd wrapper to ensure PYINSTALLER_RESET_ENVIRONMENT=1 is set for the child.
     #
-    # Belt-and-suspenders: also attempt to clear the env vars from within the VBScript
-    # process, in case the user's environment is unusual.
+    # The VBScript then runs this .cmd file hidden.
     
-    vbs_content = f'''Set WshShell = CreateObject("WScript.Shell")
-Set objEnv = WshShell.Environment("Process")
-On Error Resume Next
-objEnv.Remove "_MEIPASS2"
-objEnv.Remove "_PYI_APPLICATION_HOME_DIR"
-objEnv.Remove "_PYI_PARENT_PROCESS_LEVEL"
-' CRITICAL: Force child to create its own _MEI extraction directory (PyInstaller 6.9+)
-objEnv("PYINSTALLER_RESET_ENVIRONMENT") = "1"
-On Error Goto 0
-WshShell.Run "{vbs_cmd_line}", 0, False
-'''
-    
-    # Write VBS to temp file
     config_dir = get_config_dir()
     config_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create batch file that sets env var and launches cyberdriver
+    cmd_path = config_dir / "launch-hidden.cmd"
+    cmd_content = f'''@echo off
+rem Clear PyInstaller environment variables to prevent folder sharing
+set "_MEIPASS2="
+set "_PYI_APPLICATION_HOME_DIR="
+set "_PYI_PARENT_PROCESS_LEVEL="
+rem CRITICAL: Force child to create its own _MEI extraction directory (PyInstaller 6.9+)
+set "PYINSTALLER_RESET_ENVIRONMENT=1"
+rem Launch cyberdriver
+{raw_cmd_line}
+'''
+    
+    try:
+        with open(cmd_path, "w", encoding="utf-8") as f:
+            f.write(cmd_content)
+    except Exception as e:
+        raise RuntimeError(f"Failed to write launcher batch file: {e}")
+    
+    # Escape the .cmd path for VBScript
+    cmd_path_escaped = str(cmd_path).replace('"', '""')
+    
+    # VBScript runs the .cmd file hidden
+    vbs_content = f'''Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run """{cmd_path_escaped}""", 0, False
+'''
+    
     vbs_path = config_dir / "launch-hidden.vbs"
     
     # Also write the command we're trying to run for debugging
-    debug_path = config_dir / "launch-hidden-cmd.txt"
+    debug_path = config_dir / "launch-hidden-debug.txt"
     try:
         with open(debug_path, "w", encoding="utf-8") as f:
             f.write(f"Raw command: {raw_cmd_line}\n")
-            f.write(f"VBS command: {vbs_cmd_line}\n")
-            f.write(f"\nVBS script:\n{vbs_content}\n")
+            f.write(f"\nBatch file ({cmd_path}):\n{cmd_content}\n")
+            f.write(f"\nVBS script ({vbs_path}):\n{vbs_content}\n")
     except Exception:
         pass
     
@@ -4950,7 +4964,8 @@ def main():
     _setup_detached_stdio_if_configured()
     
     # Log PyInstaller environment for diagnostics (helps debug _MEI folder issues)
-    if getattr(sys, 'frozen', False) and platform.system() == "Windows":
+    # Only log in detached/background mode (logging to file) to avoid cluttering terminal output
+    if getattr(sys, 'frozen', False) and platform.system() == "Windows" and os.environ.get("CYBERDRIVER_STDIO_LOG"):
         meipass = getattr(sys, '_MEIPASS', 'N/A')
         pyi_reset = os.environ.get('PYINSTALLER_RESET_ENVIRONMENT', 'not set')
         pyi_home = os.environ.get('_PYI_APPLICATION_HOME_DIR', 'not set')
