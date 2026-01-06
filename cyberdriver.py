@@ -3536,6 +3536,10 @@ class TunnelClient:
         if total_collected > 0:
             debug_logger.debug("CLEANUP", f"GC collected {total_collected} objects")
         
+        # 4. Health check - detect if _MEI files have been deleted
+        # This helps diagnose the mysterious file deletion bug
+        check_mei_health(f"before_retry (attempt #{self._connection_attempt + 1})")
+        
     async def run(self):
         """Run the tunnel with exponential backoff reconnection.
         
@@ -3785,6 +3789,10 @@ class TunnelClient:
                 print(f"{green}✓{reset} {white}{connected_msg}{reset}")
             else:
                 print(f"✓ {connected_msg}")
+            
+            # Health check on successful connection (baseline for later comparison)
+            check_mei_health(f"after_connect (attempt #{self._connection_attempt})")
+            
             # Optionally re-print countdown immediately after connect
             try:
                 if self.keepalive_manager is not None and hasattr(self.keepalive_manager, "_print_countdown"):
@@ -3848,6 +3856,11 @@ class TunnelClient:
                     
                     # Also log resource stats on failure to help diagnose
                     debug_logger.resource_stats()
+                    
+                    # CRITICAL: Check if _MEI files were deleted (errno 2 = ENOENT)
+                    # This diagnostic helps catch the mysterious file deletion bug
+                    if error_code == 2:  # ENOENT - No such file or directory
+                        check_mei_health(f"OSError ENOENT during websocket message loop")
                     
                     # Always print duration for immediate failures (< 5 seconds)
                     if connection_duration < 5.0:
@@ -4968,6 +4981,57 @@ def cleanup_old_mei_folders() -> None:
         print(f"[INFO] Cleaned up {cleaned_count} old temporary folder(s)")
 
 
+def check_mei_health(context: str = "") -> bool:
+    """
+    Check if critical files in _MEI folder still exist.
+    
+    This diagnostic function helps catch when files are mysteriously deleted
+    from PyInstaller's extraction folder during runtime.
+    
+    Args:
+        context: Description of when/why this check is being called
+        
+    Returns:
+        True if healthy, False if files are missing
+    """
+    if not getattr(sys, 'frozen', False) or platform.system() != "Windows":
+        return True
+    
+    meipass = getattr(sys, '_MEIPASS', None)
+    if not meipass:
+        return True
+    
+    # Critical directories that should always exist
+    critical_dirs = ['certifi', 'fastapi', 'starlette', 'httpx', 'websockets', 'pydantic']
+    
+    missing = []
+    for d in critical_dirs:
+        dir_path = os.path.join(meipass, d)
+        if not os.path.exists(dir_path):
+            missing.append(d)
+    
+    if missing:
+        from datetime import datetime
+        timestamp = datetime.now().isoformat()
+        print(f"\n{'='*70}")
+        print(f"[CRITICAL] _MEI HEALTH CHECK FAILED at {timestamp}")
+        print(f"[CRITICAL] Context: {context}")
+        print(f"[CRITICAL] _MEIPASS: {meipass}")
+        print(f"[CRITICAL] Missing directories: {missing}")
+        
+        # List what DOES exist for debugging
+        try:
+            existing = [f for f in os.listdir(meipass) if os.path.isdir(os.path.join(meipass, f))]
+            print(f"[CRITICAL] Existing directories ({len(existing)}): {existing[:20]}{'...' if len(existing) > 20 else ''}")
+        except Exception as e:
+            print(f"[CRITICAL] Could not list directory: {e}")
+        
+        print(f"{'='*70}\n")
+        return False
+    
+    return True
+
+
 def main():
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
@@ -4990,6 +5054,9 @@ def main():
         print(f"[PYINSTALLER] PYINSTALLER_RESET_ENVIRONMENT={pyi_reset}")
         print(f"[PYINSTALLER] _PYI_APPLICATION_HOME_DIR={pyi_home}")
         print(f"[PYINSTALLER] _PYI_PARENT_PROCESS_LEVEL={pyi_level}")
+        
+        # Initial health check at startup
+        check_mei_health("startup")
     
     # Print banner if no arguments or help requested
     if len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] in ['-h', '--help']):
@@ -5194,11 +5261,6 @@ def main():
             # Pass log file path to child (env vars don't work with VBScript launcher)
             child_argv.append(f"--_stdio-log={stdio_log_path}")
 
-            # Log parent's _MEIPASS for debugging (helps verify child has different folder)
-            if getattr(sys, 'frozen', False):
-                parent_mei = getattr(sys, '_MEIPASS', 'N/A')
-                print(f"[DEBUG] Parent _MEIPASS: {parent_mei}")
-            
             # Show the nice banner in the *current* terminal (this is not the detached child).
             print_banner(mode="connecting")
             print("Cyberdriver is now running in the background.")
