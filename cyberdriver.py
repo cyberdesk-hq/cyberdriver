@@ -978,14 +978,23 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
     # Build argument string for Start-Process
     args_for_ps = subprocess.list2cmdline(exe_args)
     
-    ps_content = f'''# Clear PyInstaller environment variables
-$env:_MEIPASS2 = $null
-$env:_PYI_APPLICATION_HOME_DIR = $null
-$env:_PYI_PARENT_PROCESS_LEVEL = $null
+    ps_content = f'''# Use .NET ProcessStartInfo for explicit control over environment variables
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = "{exe_path}"
+$psi.Arguments = '{args_for_ps}'
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
+
+# Clear PyInstaller environment variables from the child's environment
+$psi.EnvironmentVariables.Remove("_MEIPASS2")
+$psi.EnvironmentVariables.Remove("_PYI_APPLICATION_HOME_DIR") 
+$psi.EnvironmentVariables.Remove("_PYI_PARENT_PROCESS_LEVEL")
+
 # CRITICAL: Force child to create its own _MEI extraction directory (PyInstaller 6.9+)
-$env:PYINSTALLER_RESET_ENVIRONMENT = "1"
-# Launch cyberdriver hidden
-Start-Process -FilePath "{exe_path}" -ArgumentList '{args_for_ps}' -WindowStyle Hidden
+$psi.EnvironmentVariables["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+
+# Start the process
+[System.Diagnostics.Process]::Start($psi) | Out-Null
 '''
     
     try:
