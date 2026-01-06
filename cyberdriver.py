@@ -961,37 +961,56 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
     # so the child process creates its own _MEI extraction directory instead of reusing
     # the parent's. When the parent exits, it would otherwise delete files the child needs.
     #
-    # We use "cmd /c set VAR=value & command" to set the env var inline before running
-    # cyberdriver.exe. This is more reliable than batch files or VBScript environment methods.
+    # We use PowerShell's Start-Process with explicit environment variable setup.
+    # This is more reliable than VBScript/cmd.exe for environment variable propagation.
     
     config_dir = get_config_dir()
     config_dir.mkdir(parents=True, exist_ok=True)
     
-    # Build command that sets env vars and runs cyberdriver
-    # Using & (not &&) so cyberdriver runs even if set "fails" (it won't, but safer)
-    # We clear the PyInstaller vars and set PYINSTALLER_RESET_ENVIRONMENT=1
-    env_setup = 'set "_MEIPASS2=" & set "_PYI_APPLICATION_HOME_DIR=" & set "_PYI_PARENT_PROCESS_LEVEL=" & set "PYINSTALLER_RESET_ENVIRONMENT=1"'
-    full_cmd = f'cmd /c {env_setup} & {raw_cmd_line}'
+    # Build PowerShell script that sets env vars and launches cyberdriver hidden
+    # We use Start-Process -WindowStyle Hidden for a truly hidden window
+    ps_script_path = config_dir / "launch-hidden.ps1"
     
-    # Escape for VBScript string literals: double all quotes
-    vbs_cmd_line = full_cmd.replace('"', '""')
+    # Escape the exe path and args for PowerShell
+    exe_path = cmd[0] if cmd else sys.executable
+    exe_args = cmd[1:] if len(cmd) > 1 else []
     
-    # VBScript runs the command hidden
-    vbs_content = f'''Set WshShell = CreateObject("WScript.Shell")
-WshShell.Run "{vbs_cmd_line}", 0, False
+    # Build argument string for Start-Process
+    args_for_ps = subprocess.list2cmdline(exe_args)
+    
+    ps_content = f'''# Clear PyInstaller environment variables
+$env:_MEIPASS2 = $null
+$env:_PYI_APPLICATION_HOME_DIR = $null
+$env:_PYI_PARENT_PROCESS_LEVEL = $null
+# CRITICAL: Force child to create its own _MEI extraction directory (PyInstaller 6.9+)
+$env:PYINSTALLER_RESET_ENVIRONMENT = "1"
+# Launch cyberdriver hidden
+Start-Process -FilePath "{exe_path}" -ArgumentList '{args_for_ps}' -WindowStyle Hidden
 '''
     
-    vbs_path = config_dir / "launch-hidden.vbs"
+    try:
+        with open(ps_script_path, "w", encoding="utf-8") as f:
+            f.write(ps_content)
+    except Exception as e:
+        raise RuntimeError(f"Failed to write PowerShell launcher: {e}")
     
-    # Also write the command we're trying to run for debugging
+    # Also write debug info
     debug_path = config_dir / "launch-hidden-debug.txt"
     try:
         with open(debug_path, "w", encoding="utf-8") as f:
             f.write(f"Raw command: {raw_cmd_line}\n")
-            f.write(f"Full command with env setup: {full_cmd}\n")
-            f.write(f"\nVBS script ({vbs_path}):\n{vbs_content}\n")
+            f.write(f"Exe path: {exe_path}\n")
+            f.write(f"Args: {args_for_ps}\n")
+            f.write(f"\nPowerShell script ({ps_script_path}):\n{ps_content}\n")
     except Exception:
         pass
+    
+    # Use VBScript to run PowerShell hidden (PowerShell itself might show a window briefly)
+    vbs_path = config_dir / "launch-hidden.vbs"
+    ps_path_escaped = str(ps_script_path).replace('"', '""')
+    vbs_content = f'''Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run "powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{ps_path_escaped}""", 0, False
+'''
     
     try:
         with open(vbs_path, "w", encoding="utf-8") as f:

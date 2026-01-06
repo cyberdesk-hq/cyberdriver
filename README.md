@@ -48,15 +48,29 @@ $toolDir = "$env:USERPROFILE\.cyberdriver"
 New-Item -ItemType Directory -Force -Path $toolDir
 
 # Download cyberdriver
-Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.37/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe"
-
-# Add to PATH if not already there
-$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if ($userPath -notlike "*$toolDir*") {
-    [Environment]::SetEnvironmentVariable("Path", $userPath + ";" + $toolDir, "User")
+try {
+    Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.37/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe" -ErrorAction Stop
+} catch {
+    Write-Host "ERROR: Failed to download Cyberdriver. Please check your internet connection and try again." -ForegroundColor Red
+    return
 }
 
-Write-Host "Cyberdriver installed! You may need to restart your terminal for PATH changes to take effect."
+# Verify installation
+if (Test-Path "$toolDir\cyberdriver.exe") {
+    $fileSize = (Get-Item "$toolDir\cyberdriver.exe").Length
+    if ($fileSize -gt 34MB) {
+        # Add to PATH if not already there
+        $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+        if ($userPath -notlike "*$toolDir*") {
+            [Environment]::SetEnvironmentVariable("Path", $userPath + ";" + $toolDir, "User")
+        }
+        Write-Host "Cyberdriver installed successfully! You may need to restart your terminal for PATH changes to take effect."
+    } else {
+        Write-Host "ERROR: Download appears incomplete (file too small). Please try again." -ForegroundColor Red
+    }
+} else {
+    Write-Host "ERROR: Download failed. Please try again." -ForegroundColor Red
+}
 ```
 
 ### macOS Installation (Bash/Zsh)
