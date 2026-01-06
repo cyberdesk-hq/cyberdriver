@@ -5194,6 +5194,11 @@ def main():
             # Pass log file path to child (env vars don't work with VBScript launcher)
             child_argv.append(f"--_stdio-log={stdio_log_path}")
 
+            # Log parent's _MEIPASS for debugging (helps verify child has different folder)
+            if getattr(sys, 'frozen', False):
+                parent_mei = getattr(sys, '_MEIPASS', 'N/A')
+                print(f"[DEBUG] Parent _MEIPASS: {parent_mei}")
+            
             # Show the nice banner in the *current* terminal (this is not the detached child).
             print_banner(mode="connecting")
             print("Cyberdriver is now running in the background.")
