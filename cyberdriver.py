@@ -1194,12 +1194,15 @@ def _follow_log_file(path: pathlib.Path) -> None:
                         return
                 except Exception:
                     pass
-                # If the writer truncated the file (size cap), reset our read position.
+                # If the writer truncated/rotated the file, our position is now past EOF.
+                # Seek to the END of the new file to continue following new content,
+                # not the beginning (which would re-print all old logs).
                 try:
                     if path.exists():
                         cur_size = path.stat().st_size
                         if f.tell() > cur_size:
-                            f.seek(0, os.SEEK_SET)
+                            print("\n[Log file was rotated, continuing from current position...]\n")
+                            f.seek(0, os.SEEK_END)  # Seek to END, not beginning
                 except Exception:
                     pass
                 line = f.readline()
@@ -1875,6 +1878,108 @@ async def lifespan(app: FastAPI):
     print("Cleanup complete")
 
 app = FastAPI(title="Cyberdriver", version=VERSION, lifespan=lifespan)
+
+
+def _log_error_and_check_mei(error: Exception, context: str = "") -> bool:
+    """
+    Log an error and check if it indicates _MEI folder corruption.
+    
+    Args:
+        error: The exception that occurred
+        context: Description of where/when the error occurred
+        
+    Returns:
+        True if MEI appears corrupted and restart was triggered,
+        False otherwise (caller should continue normal error handling)
+    """
+    error_str = str(error).lower()
+    error_type = type(error).__name__
+    
+    # Always log the error
+    timestamp = datetime.now().isoformat()
+    print(f"\n[ERROR] {timestamp} - {context}")
+    print(f"[ERROR] Type: {error_type}")
+    print(f"[ERROR] Message: {error}")
+    
+    # Check if this looks like a file-not-found error that could indicate _MEI corruption
+    is_file_error = (
+        isinstance(error, FileNotFoundError) or
+        isinstance(error, OSError) and getattr(error, 'errno', None) == 2 or
+        "errno 2" in error_str or
+        "no such file or directory" in error_str or
+        "filenotfounderror" in error_str or
+        "cannot find the file" in error_str or
+        "system cannot find" in error_str
+    )
+    
+    if is_file_error:
+        print(f"[ERROR] Detected file-not-found error - checking _MEI health...")
+        
+        # Import check_mei_health (defined later in file, but available at runtime)
+        # We do a quick inline check here to avoid circular dependency
+        if getattr(sys, 'frozen', False) and platform.system() == "Windows":
+            meipass = getattr(sys, '_MEIPASS', None)
+            if meipass:
+                critical_dirs = ['certifi', 'fastapi', 'websockets', 'pydantic_core', 'uvicorn']
+                missing = [d for d in critical_dirs if not os.path.exists(os.path.join(meipass, d))]
+                
+                if missing:
+                    print(f"[CRITICAL] _MEI health check FAILED!")
+                    print(f"[CRITICAL] Missing directories: {missing}")
+                    print(f"[CRITICAL] Triggering hard restart to recover...")
+                    
+                    # Log to persistent file
+                    try:
+                        log_path = get_config_dir() / "mei-corruption-detected.log"
+                        with open(log_path, "a", encoding="utf-8") as f:
+                            f.write(f"\n[{timestamp}] MEI corruption detected during: {context}\n")
+                            f.write(f"Error: {error}\n")
+                            f.write(f"Missing: {missing}\n")
+                    except Exception:
+                        pass
+                    
+                    # Schedule restart (can't do it synchronously from exception handler)
+                    # Set a flag that the main loop can check
+                    os.environ["CYBERDRIVER_MEI_CORRUPTED"] = "1"
+                    return True
+                else:
+                    print(f"[INFO] _MEI health check passed - error is not due to folder corruption")
+    
+    return False
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    """Global exception handler that logs errors and checks for _MEI corruption."""
+    from fastapi.responses import JSONResponse
+    
+    # Get request path for context
+    path = str(request.url.path) if hasattr(request, 'url') else "unknown"
+    context = f"Request to {path}"
+    
+    # Log and check MEI health
+    mei_corrupted = _log_error_and_check_mei(exc, context)
+    
+    # If MEI is corrupted, add a hint to the error response
+    error_msg = str(exc)
+    if mei_corrupted:
+        error_msg = f"{error_msg} [MEI corruption detected - cyberdriver will restart]"
+    
+    # Return appropriate error response
+    if isinstance(exc, HTTPException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": exc.detail}
+        )
+    
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": type(exc).__name__,
+            "message": error_msg,
+            "timestamp": datetime.now().isoformat()
+        }
+    )
 
 
 @app.middleware("http")
@@ -3474,23 +3579,20 @@ async def post_powershell_exec(payload: Dict[str, Any]):
     if not command:
         raise HTTPException(status_code=400, detail="Missing 'command' field")
     
-    try:
-        # Run in thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            executor,
-            execute_powershell_command,
-            command,
-            session_id,
-            working_directory,
-            same_session,
-            timeout
-        )
-        
-        return result
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to execute command: {e}")
+    # Run in thread pool to avoid blocking
+    # Let exceptions bubble up to global handler which checks for MEI corruption
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        executor,
+        execute_powershell_command,
+        command,
+        session_id,
+        working_directory,
+        same_session,
+        timeout
+    )
+    
+    return result
 
 @app.post("/computer/shell/powershell/session")
 async def post_powershell_session(payload: Dict[str, Any]):
@@ -3869,6 +3971,17 @@ class TunnelClient:
         
         while True:
             connection_start = time.time()
+            
+            # Check if MEI corruption was detected by the API error handler
+            # If so, trigger immediate restart
+            if os.environ.get("CYBERDRIVER_MEI_CORRUPTED") == "1":
+                print(f"\n{'='*60}")
+                print(f"[CRITICAL] MEI corruption detected by API - triggering restart")
+                print(f"{'='*60}")
+                os.environ.pop("CYBERDRIVER_MEI_CORRUPTED", None)
+                await asyncio.sleep(1.0)
+                if not _restart_cyberdriver_process():
+                    print("Restart failed - continuing with current process")
             
             # Full cleanup before EVERY connection attempt
             # This mimics what happens when you Ctrl+C and restart
