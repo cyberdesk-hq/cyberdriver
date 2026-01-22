@@ -2618,6 +2618,10 @@ async def get_dimensions() -> Dict[str, int]:
 # Windows SendInput Implementation (Native Windows keyboard input)
 # -----------------------------------------------------------------------------
 
+# Global flag for experimental space key handling
+# When enabled, space is sent via VK code instead of scan code
+EXPERIMENTAL_SPACE_ENABLED = False
+
 # Hardware scan code mappings (PS/2 Set 1 scan codes)
 # These work correctly with Citrix/VDI unlike virtual key codes
 LETTER_SCANCODES = {
@@ -2642,6 +2646,7 @@ SPECIAL_KEY_SCANCODES = {
     'backspace': 0x0E,
     'tab': 0x0F,
     'enter': 0x1C, 'return': 0x1C,
+    'space': 0x39,  # Also in SYMBOL_SCANCODES as ' ', adding here for named key access
     'capslock': 0x3A,
     'home': 0xE047, 'end': 0xE04F,
     'pageup': 0xE049, 'pagedown': 0xE051,
@@ -2709,6 +2714,44 @@ async def _ensure_capslock_off():
         await asyncio.to_thread(_ensure_capslock_off_linux_sync)
 
 
+def _win32_send_vk_space(key_up: bool = False):
+    """Send space key using VK code (virtual key) instead of scan code.
+    
+    This is an experimental alternative for apps that may respond better to VK-based input.
+    Uses SendInput with VK_SPACE (0x20) instead of hardware scan code 0x39.
+    """
+    import ctypes
+    from ctypes import wintypes
+    
+    # Windows constants
+    INPUT_KEYBOARD = 1
+    KEYEVENTF_KEYUP = 0x0002
+    VK_SPACE = 0x20
+    
+    # Structures
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD), 
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG))]
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
+                    ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG))]
+    class HARDWAREINPUT(ctypes.Structure):
+        _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD)]
+    class _InputUnion(ctypes.Union):
+        _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT), ("hi", HARDWAREINPUT)]
+    class INPUT(ctypes.Structure):
+        _anonymous_ = ("u",)
+        _fields_ = [("type", wintypes.DWORD), ("u", _InputUnion)]
+    
+    flags = KEYEVENTF_KEYUP if key_up else 0
+    
+    # Build and send input event using VK code (wVk set, wScan=0, no KEYEVENTF_SCANCODE flag)
+    input_event = INPUT()
+    input_event.type = INPUT_KEYBOARD
+    input_event.ki = KEYBDINPUT(wVk=VK_SPACE, wScan=0, dwFlags=flags, time=0, dwExtraInfo=None)
+    ctypes.windll.user32.SendInput(1, ctypes.byref(input_event), ctypes.sizeof(INPUT))
+
+
 def _win32_send_key(scan_code: int, key_up: bool = False):
     """Low-level helper to send a single key event using Windows SendInput with scan code."""
     import ctypes
@@ -2755,6 +2798,12 @@ def _type_with_win32_sendinput(text: str):
     LSHIFT_SCANCODE = 0x2A
     
     for char in text:
+        # Handle space specially when experimental mode is enabled
+        if char == ' ' and EXPERIMENTAL_SPACE_ENABLED:
+            _win32_send_vk_space(key_up=False)
+            _win32_send_vk_space(key_up=True)
+            continue
+        
         upper_char = char.upper()
         scan_code = None
         needs_shift = False
@@ -2797,6 +2846,11 @@ def _press_key_with_scancode(key: str, key_up: bool = False):
     # Normalize key name: lowercase and remove underscores
     # This allows both "Page_Down" and "pagedown" to work
     key_lower = key.lower().replace('_', '')
+    
+    # Handle space specially when experimental mode is enabled
+    if key_lower == 'space' and EXPERIMENTAL_SPACE_ENABLED:
+        _win32_send_vk_space(key_up=key_up)
+        return
     
     # Check all scan code maps
     scan_code = (MODIFIER_SCANCODES.get(key_lower) or 
@@ -5629,6 +5683,7 @@ def main():
     join_parser.add_argument("--interactive", action="store_true", help="Interactive CLI to Disable/Re-enable without exiting")
     join_parser.add_argument("--register-as-keepalive-for", type=str, default=None, help="Register this instance as the remote keepalive (host) for MAIN_MACHINE_ID")
     join_parser.add_argument("--debug", action="store_true", help="Enable debug logging to ~/.cyberdriver/logs/ (daily log files)")
+    join_parser.add_argument("--experimental-space", action="store_true", help="Send space key via VK code instead of scan code (may fix issues with some apps like Cerner)")
     join_parser.add_argument(
         "--foreground",
         action="store_true",
@@ -5837,6 +5892,12 @@ def main():
         # Disable close button
         if disable_windows_console_close_button():
             print("✓ Console close button disabled (use Ctrl+C to exit)")
+    
+    # Set experimental space flag if enabled
+    if args.command == "join" and getattr(args, "experimental_space", False):
+        global EXPERIMENTAL_SPACE_ENABLED
+        EXPERIMENTAL_SPACE_ENABLED = True
+        print("✓ Experimental space mode enabled (using VK code instead of scan code)")
     
     try:
         if args.command == "start":
