@@ -5243,8 +5243,11 @@ def check_mei_health(context: str = "") -> bool:
     if not meipass:
         return True
     
-    # Critical directories that should always exist
-    critical_dirs = ['certifi', 'fastapi', 'starlette', 'httpx', 'websockets', 'pydantic']
+    # Critical directories that should always exist in the _MEI extraction
+    # Note: We check for directories that PyInstaller ACTUALLY extracts as separate folders
+    # Some packages (like starlette, httpx) are bundled differently and don't appear as dirs
+    # pydantic v2 uses pydantic_core as the compiled core, not a pydantic directory
+    critical_dirs = ['certifi', 'fastapi', 'websockets', 'pydantic_core', 'uvicorn']
     
     missing = []
     for d in critical_dirs:
@@ -5284,28 +5287,40 @@ def check_mei_health(context: str = "") -> bool:
                 f.write(f"Existing directories ({len(existing)}): {existing}\n")
                 f.write(f"PID: {os.getpid()}\n")
                 
-                # Check for Windows Defender quarantine hints
+                # Check for Windows Defender quarantine hints (if Defender is available)
                 try:
-                    # Check if Defender service is running
                     CREATE_NO_WINDOW = 0x08000000
-                    result = subprocess.run(
+                    
+                    # First check if Defender cmdlets are available
+                    cmdlet_check = subprocess.run(
                         ["powershell", "-NoProfile", "-Command", 
-                         "Get-MpComputerStatus | Select-Object -Property RealTimeProtectionEnabled,AntivirusEnabled | ConvertTo-Json"],
+                         "Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue"],
                         capture_output=True, text=True, timeout=5,
                         creationflags=CREATE_NO_WINDOW
                     )
-                    if result.returncode == 0:
-                        f.write(f"Defender status: {result.stdout.strip()}\n")
                     
-                    # Check Defender threat history (last 24 hours)
-                    result = subprocess.run(
-                        ["powershell", "-NoProfile", "-Command",
-                         "Get-MpThreatDetection | Where-Object { $_.InitialDetectionTime -gt (Get-Date).AddHours(-24) } | Select-Object -Property ThreatID,ProcessName,Resources | ConvertTo-Json"],
-                        capture_output=True, text=True, timeout=10,
-                        creationflags=CREATE_NO_WINDOW
-                    )
-                    if result.returncode == 0 and result.stdout.strip():
-                        f.write(f"Recent Defender detections: {result.stdout.strip()}\n")
+                    if cmdlet_check.returncode == 0 and cmdlet_check.stdout.strip():
+                        # Defender cmdlets available - check status
+                        result = subprocess.run(
+                            ["powershell", "-NoProfile", "-Command", 
+                             "Get-MpComputerStatus | Select-Object -Property RealTimeProtectionEnabled,AntivirusEnabled | ConvertTo-Json"],
+                            capture_output=True, text=True, timeout=5,
+                            creationflags=CREATE_NO_WINDOW
+                        )
+                        if result.returncode == 0:
+                            f.write(f"Defender status: {result.stdout.strip()}\n")
+                        
+                        # Check Defender threat history (last 24 hours)
+                        result = subprocess.run(
+                            ["powershell", "-NoProfile", "-Command",
+                             "Get-MpThreatDetection | Where-Object { $_.InitialDetectionTime -gt (Get-Date).AddHours(-24) } | Select-Object -Property ThreatID,ProcessName,Resources | ConvertTo-Json"],
+                            capture_output=True, text=True, timeout=10,
+                            creationflags=CREATE_NO_WINDOW
+                        )
+                        if result.returncode == 0 and result.stdout.strip():
+                            f.write(f"Recent Defender detections: {result.stdout.strip()}\n")
+                    else:
+                        f.write("Windows Defender cmdlets not available (may have third-party AV)\n")
                 except Exception as defender_err:
                     f.write(f"Could not check Defender status: {defender_err}\n")
                 
@@ -5326,7 +5341,7 @@ def add_defender_exclusion() -> bool:
     during runtime, which is a known issue with PyInstaller executables.
     
     Returns:
-        True if exclusion was added (or already exists), False if failed (e.g., no admin)
+        True if exclusion was added (or already exists), False if failed (e.g., no admin, no Defender)
     """
     if platform.system() != "Windows" or not getattr(sys, 'frozen', False):
         return False
@@ -5337,14 +5352,29 @@ def add_defender_exclusion() -> bool:
     
     # The parent directory where all _MEI folders live (e.g., %LOCALAPPDATA%\.cyberdriver\_pyinstaller)
     mei_parent = os.path.dirname(meipass)
+    CREATE_NO_WINDOW = 0x08000000
     
     try:
-        # First check if exclusion already exists
+        # First check if Windows Defender cmdlets are available
+        # This can fail on Windows Server, or systems with third-party AV that replaced Defender
+        check_cmdlet = 'Get-Command Get-MpPreference -ErrorAction SilentlyContinue'
+        cmdlet_check = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", check_cmdlet],
+            capture_output=True, text=True, timeout=5,
+            creationflags=CREATE_NO_WINDOW
+        )
+        
+        if cmdlet_check.returncode != 0 or not cmdlet_check.stdout.strip():
+            # Defender cmdlets not available - this is normal on some Windows configurations
+            # Don't log as an error since it's not actionable
+            return False
+        
+        # Check if exclusion already exists
         check_cmd = f'(Get-MpPreference).ExclusionPath -contains "{mei_parent}"'
         check_result = subprocess.run(
             ["powershell", "-NoProfile", "-Command", check_cmd],
             capture_output=True, text=True, timeout=10,
-            creationflags=0x08000000  # CREATE_NO_WINDOW
+            creationflags=CREATE_NO_WINDOW
         )
         
         if check_result.returncode == 0 and "True" in check_result.stdout:
@@ -5356,7 +5386,7 @@ def add_defender_exclusion() -> bool:
         add_result = subprocess.run(
             ["powershell", "-NoProfile", "-Command", add_cmd],
             capture_output=True, text=True, timeout=10,
-            creationflags=0x08000000  # CREATE_NO_WINDOW
+            creationflags=CREATE_NO_WINDOW
         )
         
         if add_result.returncode == 0:
@@ -5364,15 +5394,17 @@ def add_defender_exclusion() -> bool:
             return True
         else:
             # Likely failed due to lack of admin privileges - this is expected
-            # Log for debugging but don't alarm the user
-            try:
-                log_path = get_config_dir() / "defender-exclusion.log"
-                with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(f"\n[{datetime.now().isoformat()}] Failed to add Defender exclusion\n")
-                    f.write(f"Path: {mei_parent}\n")
-                    f.write(f"Error: {add_result.stderr}\n")
-            except:
-                pass
+            # Only log if it's NOT a "cmdlet not found" error (we already checked for that)
+            error_text = add_result.stderr.lower()
+            if "not recognized" not in error_text and "commandnotfound" not in error_text:
+                try:
+                    log_path = get_config_dir() / "defender-exclusion.log"
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(f"\n[{datetime.now().isoformat()}] Failed to add Defender exclusion\n")
+                        f.write(f"Path: {mei_parent}\n")
+                        f.write(f"Error: {add_result.stderr}\n")
+                except:
+                    pass
             return False
             
     except subprocess.TimeoutExpired:
