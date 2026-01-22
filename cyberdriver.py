@@ -3558,10 +3558,13 @@ def _restart_cyberdriver_process() -> bool:
         # Pass restart count to child so we can detect infinite restart loops
         env["CYBERDRIVER_RESTART_COUNT"] = str(restart_count)
         
-        # Determine if we're in foreground or background mode
-        # If stdout is a file (background/detached), spawn hidden
-        # If stdout is a console (foreground), spawn with console
-        is_foreground = sys.stdout.isatty() if hasattr(sys.stdout, 'isatty') else False
+        # CRITICAL: Tell the child it's already "detached" so it doesn't try to spawn
+        # ANOTHER process and go through the detach dance again
+        env["CYBERDRIVER_DETACHED"] = "1"
+        
+        # Determine if user originally ran with --foreground
+        # If so, we should spawn with a visible console. Otherwise, spawn hidden.
+        is_foreground = "--foreground" in sys.argv or "-f" in sys.argv
         
         try:
             if is_foreground:
@@ -3577,7 +3580,7 @@ def _restart_cyberdriver_process() -> bool:
                     close_fds=True,
                 )
             else:
-                # Background/detached mode: spawn hidden
+                # Background/detached mode: spawn completely hidden
                 DETACHED_PROCESS = 0x00000008
                 CREATE_NEW_PROCESS_GROUP = 0x00000200
                 CREATE_NO_WINDOW = 0x08000000
@@ -3627,6 +3630,9 @@ def _restart_cyberdriver_process() -> bool:
         
         # Pass restart count to child so we can detect infinite restart loops
         os.environ["CYBERDRIVER_RESTART_COUNT"] = str(restart_count)
+        
+        # Tell the new process it's already "detached" so it doesn't try to fork again
+        os.environ["CYBERDRIVER_DETACHED"] = "1"
         
         # Replace current process with new one
         # This never returns - the current process is replaced
