@@ -3900,6 +3900,8 @@ def _restart_cyberdriver_process() -> bool:
                 for k in list(env.keys()):
                     if k == "_MEIPASS2" or k.startswith("_PYI_"):
                         env.pop(k, None)
+                # CRITICAL: Clear the MEI corruption flag so new process doesn't immediately restart again
+                env.pop("CYBERDRIVER_MEI_CORRUPTED", None)
                 env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
                 env["CYBERDRIVER_RESTART_COUNT"] = str(restart_count)
                 env["CYBERDRIVER_DETACHED"] = "1"
@@ -3939,6 +3941,9 @@ $psi.EnvironmentVariables.Remove("_MEIPASS2")
 $psi.EnvironmentVariables.Remove("_PYI_APPLICATION_HOME_DIR") 
 $psi.EnvironmentVariables.Remove("_PYI_PARENT_PROCESS_LEVEL")
 
+# CRITICAL: Clear MEI corruption flag so new process doesn't immediately restart again
+$psi.EnvironmentVariables.Remove("CYBERDRIVER_MEI_CORRUPTED")
+
 # CRITICAL: Force fresh _MEI extraction
 $psi.EnvironmentVariables["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
 
@@ -3970,6 +3975,8 @@ WshShell.Run "powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{ps
                 for k in list(wscript_env.keys()):
                     if k == "_MEIPASS2" or k.startswith("_PYI_"):
                         wscript_env.pop(k, None)
+                # Clear MEI corruption flag (the PS script handles this for the child, but be safe)
+                wscript_env.pop("CYBERDRIVER_MEI_CORRUPTED", None)
                 
                 # Reset DLL search path
                 try:
@@ -4017,6 +4024,8 @@ WshShell.Run "powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{ps
         for k in list(os.environ.keys()):
             if k == "_MEIPASS2" or k.startswith("_PYI_"):
                 del os.environ[k]
+        # CRITICAL: Clear MEI corruption flag so new process doesn't immediately restart again
+        os.environ.pop("CYBERDRIVER_MEI_CORRUPTED", None)
         os.environ["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
         
         # Pass restart count to child so we can detect infinite restart loops
