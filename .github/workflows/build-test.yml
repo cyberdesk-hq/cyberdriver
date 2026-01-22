@@ -23,19 +23,25 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
+          # Use a temporary file to safely build release notes without shell interpolation issues
+          {
+            echo "⚠️ **Test Build from dev branch**"
+            echo ""
+            echo "This is an automatically generated test build from the latest dev branch commit."
+            echo ""
+            printf "**Commit:** %s\n" "${{ github.sha }}"
+            printf "**Date:** %s\n" "$(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+            echo "**Commit Message:**"
+            printf -- "%s\n" "$COMMIT_MESSAGE"
+            echo ""
+            echo "This test release is always overwritten with the latest dev build."
+            echo ""
+            echo "Builds are currently being generated..."
+          } > notes.md
+
           gh release create test \
             --title "Test Build (Latest Dev)" \
-            --notes "⚠️ **Test Build from dev branch**
-            
-            This is an automatically generated test build from the latest dev branch commit.
-            
-            **Commit:** ${{ github.sha }}
-            **Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-            **Commit Message:** ${COMMIT_MESSAGE}
-            
-            This test release is always overwritten with the latest dev build.
-            
-            Builds are currently being generated..." \
+            --notes-file notes.md \
             --prerelease \
             --target ${{ github.sha }}
 
