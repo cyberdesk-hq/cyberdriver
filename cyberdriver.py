@@ -3458,6 +3458,194 @@ async def post_powershell_session(payload: Dict[str, Any]):
 
 
 # -----------------------------------------------------------------------------
+# Self-Restart for Recovery
+# -----------------------------------------------------------------------------
+
+def _get_restart_count() -> int:
+    """Get the current restart count from environment or return 0."""
+    try:
+        return int(os.environ.get("CYBERDRIVER_RESTART_COUNT", "0"))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _restart_cyberdriver_process() -> bool:
+    """
+    Restart cyberdriver by spawning a new process and exiting the current one.
+    
+    This is the equivalent of the user manually running:
+        cyberdriver stop
+        cyberdriver join [all original flags]
+    
+    This is used to recover from situations where _MEI files are deleted or corrupted,
+    as a fresh process will extract to a completely new _MEI directory.
+    
+    The function:
+    1. Removes the pid file (so new process doesn't think we're already running)
+    2. Spawns a new cyberdriver process with the exact same command-line arguments
+    3. Exits the current process
+    
+    Safety: After MAX_RESTARTS consecutive restarts without a successful long connection,
+    the process will exit rather than restart again to prevent infinite loops.
+    
+    Returns:
+        True if we're about to exit (new process spawned successfully)
+        False if spawn failed and we should continue in current process
+        
+    Note: If successful, this function exits the process and never returns.
+    """
+    MAX_RESTARTS = 5  # Maximum consecutive restarts before giving up
+    
+    restart_count = _get_restart_count() + 1
+    
+    # Check if we've exceeded max restarts
+    if restart_count > MAX_RESTARTS:
+        print(f"\n{'='*60}")
+        print(f"❌ RESTART LIMIT REACHED")
+        print(f"{'='*60}")
+        print(f"\nCyberdriver has restarted {restart_count - 1} times without establishing")
+        print(f"a stable connection. This may indicate:")
+        print(f"   1. The Cyberdesk API is down for extended maintenance")
+        print(f"   2. Network connectivity issues")
+        print(f"   3. Persistent _MEI folder corruption (try reinstalling)")
+        print(f"\nTo restart manually, run: cyberdriver join --secret YOUR_KEY")
+        print(f"{'='*60}\n")
+        sys.exit(1)
+    
+    print(f"\n{'='*60}")
+    print(f"🔄 RESTARTING CYBERDRIVER (attempt {restart_count}/{MAX_RESTARTS})")
+    print(f"{'='*60}")
+    print(f"Spawning fresh process to recover from potential _MEI issues...")
+    print(f"This is equivalent to: cyberdriver stop && cyberdriver join ...")
+    print(f"{'='*60}\n")
+    
+    # Build the command to restart with the exact same arguments
+    if getattr(sys, 'frozen', False):
+        # Running as frozen PyInstaller exe
+        cmd = [sys.executable] + sys.argv[1:]
+    else:
+        # Running as Python script
+        cmd = [sys.executable, os.path.abspath(__file__)] + sys.argv[1:]
+    
+    # Log the restart for debugging
+    try:
+        log_path = get_config_dir() / "restart-history.log"
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n[{datetime.now().isoformat()}] Restarting cyberdriver (attempt {restart_count}/{MAX_RESTARTS})\n")
+            f.write(f"Command: {' '.join(cmd)}\n")
+            f.write(f"PID (old): {os.getpid()}\n")
+            f.write(f"_MEIPASS: {getattr(sys, '_MEIPASS', 'N/A')}\n")
+    except Exception:
+        pass
+    
+    # Remove pid file so new process doesn't think we're still running
+    # This is equivalent to what "cyberdriver stop" does
+    _remove_pid_file_safely()
+    
+    if platform.system() == "Windows":
+        # On Windows, we need to spawn a detached process and exit
+        
+        # CRITICAL: Clear PyInstaller environment variables so child gets fresh _MEI
+        # This is the key to getting a new extraction directory
+        env = os.environ.copy()
+        for k in list(env.keys()):
+            if k == "_MEIPASS2" or k.startswith("_PYI_"):
+                env.pop(k, None)
+        
+        # Force child to create its own _MEI extraction directory
+        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        
+        # Pass restart count to child so we can detect infinite restart loops
+        env["CYBERDRIVER_RESTART_COUNT"] = str(restart_count)
+        
+        # Determine if we're in foreground or background mode
+        # If stdout is a file (background/detached), spawn hidden
+        # If stdout is a console (foreground), spawn with console
+        is_foreground = sys.stdout.isatty() if hasattr(sys.stdout, 'isatty') else False
+        
+        try:
+            if is_foreground:
+                # Foreground mode: spawn with visible console so user sees output
+                # Use CREATE_NEW_CONSOLE so the new process gets its own console
+                CREATE_NEW_CONSOLE = 0x00000010
+                CREATE_NEW_PROCESS_GROUP = 0x00000200
+                
+                proc = subprocess.Popen(
+                    cmd,
+                    creationflags=CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
+                    env=env,
+                    close_fds=True,
+                )
+            else:
+                # Background/detached mode: spawn hidden
+                DETACHED_PROCESS = 0x00000008
+                CREATE_NEW_PROCESS_GROUP = 0x00000200
+                CREATE_NO_WINDOW = 0x08000000
+                
+                proc = subprocess.Popen(
+                    cmd,
+                    creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+                    env=env,
+                    close_fds=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            
+            # Give the new process a moment to start and verify it's running
+            time.sleep(0.5)
+            
+            # Check if child process is still running (poll() returns None if running)
+            if proc.poll() is not None:
+                print(f"⚠️  Warning: New process exited immediately with code {proc.returncode}")
+                print("Continuing to exit current process anyway...")
+            
+            # Exit the current process
+            # Use os._exit() to avoid running atexit handlers which might interfere
+            print("New process spawned. Exiting current process...")
+            os._exit(0)
+            
+        except Exception as e:
+            print(f"\n{'='*60}")
+            print(f"❌ FAILED TO SPAWN NEW PROCESS")
+            print(f"{'='*60}")
+            print(f"Error: {e}")
+            print(f"\nCyberdriver will continue running in current process.")
+            print(f"You may need to manually restart with: cyberdriver stop && cyberdriver join ...")
+            print(f"{'='*60}\n")
+            # Don't exit - let the current process continue
+            return
+    else:
+        # On Unix, we can use execv to replace the current process entirely
+        # This is cleaner as it reuses the same PID and console
+        
+        # Clear PyInstaller environment variables
+        for k in list(os.environ.keys()):
+            if k == "_MEIPASS2" or k.startswith("_PYI_"):
+                del os.environ[k]
+        os.environ["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        
+        # Pass restart count to child so we can detect infinite restart loops
+        os.environ["CYBERDRIVER_RESTART_COUNT"] = str(restart_count)
+        
+        # Replace current process with new one
+        # This never returns - the current process is replaced
+        try:
+            print("Replacing current process with fresh instance...")
+            os.execv(cmd[0], cmd)
+        except Exception as e:
+            print(f"\n{'='*60}")
+            print(f"❌ FAILED TO EXEC NEW PROCESS")
+            print(f"{'='*60}")
+            print(f"Error: {e}")
+            print(f"\nCyberdriver will continue running in current process.")
+            print(f"You may need to manually restart with: cyberdriver stop && cyberdriver join ...")
+            print(f"{'='*60}\n")
+            # Don't exit - let the current process continue
+            return
+
+
+# -----------------------------------------------------------------------------
 # WebSocket Tunnel with Proper Protocol
 # -----------------------------------------------------------------------------
 
@@ -3543,15 +3731,28 @@ class TunnelClient:
     async def run(self):
         """Run the tunnel with exponential backoff reconnection.
         
-        IMPORTANT: Each retry does full cleanup to mimic Ctrl+C + restart:
-        - Fresh SSL context (in connect_with_headers)
-        - Reset ThreadPoolExecutor
-        - Clear caches
-        - Garbage collection
+        On connection failure:
+        1. First, try exponential backoff (1s → 2s → 4s → 8s → 16s)
+        2. If we hit max backoff 3 times in a row, do a full process restart
+        
+        The full restart is equivalent to the user manually running:
+            cyberdriver stop && cyberdriver join [same flags]
+        
+        This heals from situations where _MEI files are deleted or corrupted,
+        as a fresh process will extract to a completely new _MEI directory.
+        
+        Exceptions that don't retry:
+        - Authentication errors (4001/403): Exit immediately
+        - Task cancellation: Propagate immediately
+        
+        Special handling:
+        - Rate limit (4008): Wait specified duration, then continue backoff
         """
         import random
         
         sleep_time = self.min_sleep
+        failures_at_max_sleep = 0  # Track consecutive failures at max backoff
+        MAX_FAILURES_BEFORE_RESTART = 3  # After 3 failures at max backoff, do hard restart
         
         while True:
             connection_start = time.time()
@@ -3565,6 +3766,7 @@ class TunnelClient:
                 # This line is never reached - _connect_and_run always raises
                 sleep_time = self.min_sleep
                 self._consecutive_failures = 0
+                failures_at_max_sleep = 0
             except asyncio.CancelledError:
                 # Allow task cancellation to stop the tunnel immediately
                 raise
@@ -3593,6 +3795,11 @@ class TunnelClient:
                 # Short-lived connections indicate an ongoing problem
                 if connection_duration > 10:
                     self._consecutive_failures = 0
+                    failures_at_max_sleep = 0
+                    # Reset restart count since we had a successful long connection
+                    # This clears the CYBERDRIVER_RESTART_COUNT env var
+                    if "CYBERDRIVER_RESTART_COUNT" in os.environ:
+                        del os.environ["CYBERDRIVER_RESTART_COUNT"]
                 else:
                     self._consecutive_failures += 1
                     debug_logger.warning("CONNECTION", f"Connection only lasted {connection_duration:.1f}s",
@@ -3642,6 +3849,7 @@ class TunnelClient:
                     await asyncio.sleep(wait_seconds)
                     # Reset sleep time after rate limit wait
                     sleep_time = self.min_sleep
+                    failures_at_max_sleep = 0
                     continue
                 
                 # For other close codes, continue with exponential backoff
@@ -3664,15 +3872,30 @@ class TunnelClient:
                     print("   1. Check your internet connection")
                     print("   2. Verify the server is accessible")
                 
-                # Add random jitter (0-30%) to avoid thundering herd and give network stack time to clean up
+                # Check if we've exhausted backoff and should do a hard restart
+                if sleep_time >= self.max_sleep:
+                    failures_at_max_sleep += 1
+                    if failures_at_max_sleep >= MAX_FAILURES_BEFORE_RESTART:
+                        print(f"\n{'='*60}")
+                        print(f"⚠️  Exponential backoff exhausted ({failures_at_max_sleep} failures at max backoff)")
+                        print(f"{'='*60}")
+                        print(f"\nPerforming full process restart to recover...")
+                        await asyncio.sleep(1.0)  # Brief pause before restart
+                        if not _restart_cyberdriver_process():
+                            # Spawn failed - reset counters and continue retrying in this process
+                            failures_at_max_sleep = 0
+                            sleep_time = self.min_sleep
+                            continue
+                
+                # Add random jitter (0-30%) to avoid thundering herd
                 jittered_sleep = sleep_time * (1 + random.uniform(0, 0.3))
                 
                 print(f"\n{'='*60}")
-                print(f"Retrying in {jittered_sleep:.1f} seconds...")
+                print(f"Retrying in {jittered_sleep:.1f} seconds... (attempt {self._consecutive_failures + 1})")
+                if sleep_time >= self.max_sleep:
+                    print(f"(Hard restart after {MAX_FAILURES_BEFORE_RESTART - failures_at_max_sleep} more failures at max backoff)")
                 print(f"{'='*60}\n")
                 
-                # Note: _consecutive_failures is already handled above based on connection duration
-                # (reset to 0 if >10s, incremented if <10s)
                 await asyncio.sleep(jittered_sleep)
                 sleep_time = min(sleep_time * 2, self.max_sleep)
                 
@@ -3697,17 +3920,18 @@ class TunnelClient:
                     print("\nPlease check:")
                     print("   1. Your API key is correct (from Cyberdesk dashboard)")
                     print("   2. The API key hasn't been regenerated recently")
+                    # Exit for auth errors - don't retry
+                    sys.exit(1)
                 
                 elif "errno 2" in error_msg or "no such file or directory" in error_msg:
-                    # This is a Windows-specific error that occurs when the server closes
-                    # the connection immediately after the handshake completes
-                    print("\n⚠️  Connection Closed by Server")
-                    print("\nThe server accepted the connection but then closed it.")
-                    print("\nPossible causes:")
-                    print("   1. Server is temporarily overloaded or restarting")
-                    print("   2. Network proxy/firewall interference")
-                    print("   3. Rapid reconnection attempts triggered rate limiting")
-                    print("\nThis usually resolves after a few retries.")
+                    # This could be _MEI folder corruption - do immediate restart
+                    print("\n⚠️  File Not Found Error (possibly _MEI folder issue)")
+                    print("\nThis may indicate the PyInstaller extraction folder was corrupted.")
+                    print("Performing immediate restart to recover...")
+                    await asyncio.sleep(1.0)
+                    if not _restart_cyberdriver_process():
+                        # Spawn failed - continue retrying in this process
+                        print("Restart failed. Continuing with exponential backoff...")
                     
                 else:
                     print("\n⚠️  Unknown Connection Error")
@@ -3716,22 +3940,40 @@ class TunnelClient:
                     print("   2. Install TLS certificates: https://github.com/cyberdesk-hq/cyberdriver#tls-certificate-errors")
                     print("   3. Check your internet connection")
                 
-                # Add random jitter (0-30%) to avoid thundering herd and give network stack time to clean up
-                jittered_sleep = sleep_time * (1 + random.uniform(0, 0.3))
-                
-                print(f"\n{'='*60}")
-                print(f"Retrying in {jittered_sleep:.1f} seconds...")
-                print(f"{'='*60}\n")
-                
-                # Apply same connection duration logic as ConnectionClosed handler
-                # Only count as failure if connection was short-lived
+                # Track failures for backoff exhaustion
                 connection_duration = time.time() - connection_start
                 if connection_duration > 10:
                     self._consecutive_failures = 0
+                    failures_at_max_sleep = 0
+                    # Reset restart count since we had a successful long connection
+                    if "CYBERDRIVER_RESTART_COUNT" in os.environ:
+                        del os.environ["CYBERDRIVER_RESTART_COUNT"]
                 else:
                     self._consecutive_failures += 1
-                    debug_logger.warning("CONNECTION", f"Connection only lasted {connection_duration:.1f}s",
-                                        consecutive_failures=self._consecutive_failures)
+                
+                # Check if we've exhausted backoff and should do a hard restart
+                if sleep_time >= self.max_sleep:
+                    failures_at_max_sleep += 1
+                    if failures_at_max_sleep >= MAX_FAILURES_BEFORE_RESTART:
+                        print(f"\n{'='*60}")
+                        print(f"⚠️  Exponential backoff exhausted ({failures_at_max_sleep} failures at max backoff)")
+                        print(f"{'='*60}")
+                        print(f"\nPerforming full process restart to recover...")
+                        await asyncio.sleep(1.0)
+                        if not _restart_cyberdriver_process():
+                            # Spawn failed - reset counters and continue retrying in this process
+                            failures_at_max_sleep = 0
+                            sleep_time = self.min_sleep
+                            continue
+                
+                # Add random jitter (0-30%)
+                jittered_sleep = sleep_time * (1 + random.uniform(0, 0.3))
+                
+                print(f"\n{'='*60}")
+                print(f"Retrying in {jittered_sleep:.1f} seconds... (attempt {self._consecutive_failures + 1})")
+                if sleep_time >= self.max_sleep:
+                    print(f"(Hard restart after {MAX_FAILURES_BEFORE_RESTART - failures_at_max_sleep} more failures at max backoff)")
+                print(f"{'='*60}\n")
                 
                 await asyncio.sleep(jittered_sleep)
                 sleep_time = min(sleep_time * 2, self.max_sleep)
@@ -5045,11 +5287,12 @@ def check_mei_health(context: str = "") -> bool:
                 # Check for Windows Defender quarantine hints
                 try:
                     # Check if Defender service is running
-                    import subprocess
+                    CREATE_NO_WINDOW = 0x08000000
                     result = subprocess.run(
                         ["powershell", "-NoProfile", "-Command", 
                          "Get-MpComputerStatus | Select-Object -Property RealTimeProtectionEnabled,AntivirusEnabled | ConvertTo-Json"],
-                        capture_output=True, text=True, timeout=5
+                        capture_output=True, text=True, timeout=5,
+                        creationflags=CREATE_NO_WINDOW
                     )
                     if result.returncode == 0:
                         f.write(f"Defender status: {result.stdout.strip()}\n")
@@ -5058,7 +5301,8 @@ def check_mei_health(context: str = "") -> bool:
                     result = subprocess.run(
                         ["powershell", "-NoProfile", "-Command",
                          "Get-MpThreatDetection | Where-Object { $_.InitialDetectionTime -gt (Get-Date).AddHours(-24) } | Select-Object -Property ThreatID,ProcessName,Resources | ConvertTo-Json"],
-                        capture_output=True, text=True, timeout=10
+                        capture_output=True, text=True, timeout=10,
+                        creationflags=CREATE_NO_WINDOW
                     )
                     if result.returncode == 0 and result.stdout.strip():
                         f.write(f"Recent Defender detections: {result.stdout.strip()}\n")
