@@ -1699,6 +1699,104 @@ def stop_running_instance(force: bool = False, timeout_seconds: float = 10.0) ->
     return 1
 
 
+def _stop_instance_for_replacement(pid: int, info: Dict[str, Any], timeout_seconds: float = 5.0) -> int:
+    """
+    Stop a running Cyberdriver instance to allow replacement with a new one.
+    
+    This is a quieter version of stop_running_instance, used when `cyberdriver join`
+    is called while another instance is already running.
+    
+    Args:
+        pid: The PID of the running instance
+        info: The PID file info dict
+        timeout_seconds: How long to wait for graceful shutdown before force killing
+        
+    Returns:
+        0 on success, non-zero on failure
+    """
+    if pid <= 0:
+        _remove_pid_file_safely()
+        return 0
+    
+    if not _pid_is_running(pid):
+        _remove_pid_file_safely()
+        return 0
+    
+    # On Windows, verify it's actually cyberdriver before killing
+    if platform.system() == "Windows":
+        image_name = _windows_tasklist_image_name(pid)
+        if image_name:
+            image_l = image_name.lower()
+            if image_l not in ("cyberdriver.exe", "python.exe", "pythonw.exe"):
+                # Not cyberdriver, don't kill it
+                return 2
+            if image_l in ("python.exe", "pythonw.exe"):
+                # Verify via pidfile argv
+                if not _pidfile_looks_like_cyberdriver(info):
+                    return 2
+    
+    # Try graceful shutdown first (SIGTERM on Unix, TerminateProcess on Windows)
+    deadline = time.time() + timeout_seconds
+    
+    if platform.system() == "Windows":
+        # Send WM_CLOSE via taskkill (graceful)
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid)],
+                capture_output=True,
+                timeout=3.0
+            )
+        except Exception:
+            pass
+        
+        # Wait for process to exit
+        while time.time() < deadline:
+            if not _pid_is_running(pid):
+                _remove_pid_file_safely()
+                return 0
+            time.sleep(0.2)
+        
+        # Force kill if still running
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True,
+                timeout=3.0
+            )
+        except Exception:
+            pass
+        
+        time.sleep(0.3)
+        if not _pid_is_running(pid):
+            _remove_pid_file_safely()
+            return 0
+        return 1
+    else:
+        # Unix: send SIGTERM
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        
+        while time.time() < deadline:
+            if not _pid_is_running(pid):
+                _remove_pid_file_safely()
+                return 0
+            time.sleep(0.2)
+        
+        # Force kill with SIGKILL
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        
+        time.sleep(0.3)
+        if not _pid_is_running(pid):
+            _remove_pid_file_safely()
+            return 0
+        return 1
+
+
 # -----------------------------------------------------------------------------
 # Network Utilities
 # -----------------------------------------------------------------------------
@@ -5273,25 +5371,15 @@ def run_coords_capture():
             
         # Only capture right-click (button.right)
         if pressed and button == mouse.Button.right:
-            # Print captured coordinates with colors
-            if platform.system() == "Windows":
-                try:
-                    import ctypes
-                    kernel32 = ctypes.windll.kernel32
-                    kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
-                    green = '\033[92m'
-                    white = '\033[97m'
-                    blue = '\033[94m'
-                    reset = '\033[0m'
-                    print(f"\n{green}✓{reset} {white}Click captured:{reset} X={blue}{x}{reset}, Y={blue}{y}{reset}\n")
-                except:
-                    print(f"\n✓ Click captured: X={x}, Y={y}\n")
-            else:
+            # Print captured coordinates with colors (if terminal supports it)
+            if _should_use_color():
                 green = '\033[92m'
                 white = '\033[97m'
                 blue = '\033[94m'
                 reset = '\033[0m'
                 print(f"\n{green}✓{reset} {white}Click captured:{reset} X={blue}{x}{reset}, Y={blue}{y}{reset}\n")
+            else:
+                print(f"\n✓ Click captured: X={x}, Y={y}\n")
             
             # Print usage example
             print(f"Use with keepalive:")
@@ -5905,18 +5993,59 @@ def main():
         _follow_log_file(log_path)
         sys.exit(0)
 
-    # Idempotency: if join is invoked while Cyberdriver is already running, do not
-    # start another instance. This applies to both background (default) and --foreground.
+    # If join is invoked while Cyberdriver is already running, stop the old instance
+    # and start a new one with the user's current flags. This makes the UX more intuitive.
     if args.command == "join" and not getattr(args, "_detached_child", False):
         info = _get_running_instance_pid_info()
         if info:
-            pid_int = int(info.get("pid", -1))
+            old_pid = int(info.get("pid", -1))
+            old_argv = info.get("argv", [])
+            timestamp = datetime.now().isoformat()
+            
             print_banner(mode="connecting")
-            print(f"Cyberdriver is already running (PID {pid_int}).")
-            print(f"Logs: {_default_stdio_log_path()}")
-            _print_prominent_stop_hint()
-            print("\nIf you want to restart with different flags, run `cyberdriver stop` first.")
-            sys.exit(0)
+            # Use yellow/warning color for visibility (if terminal supports it)
+            if _should_use_color():
+                print(f"\033[93mCyberdriver is already running (PID {old_pid}).\033[0m")
+                print(f"\033[93mStopping old instance and starting new one with current flags...\033[0m")
+            else:
+                print(f"Cyberdriver is already running (PID {old_pid}).")
+                print(f"Stopping old instance and starting new one with current flags...")
+            
+            # Log this replacement event
+            try:
+                log_path = get_config_dir() / "instance-replacement.log"
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(f"\n[{timestamp}] Replacing running instance\n")
+                    f.write(f"Old PID: {old_pid}\n")
+                    f.write(f"Old argv: {' '.join(str(a) for a in old_argv)}\n")
+                    f.write(f"New argv: {' '.join(sys.argv)}\n")
+                    f.write(f"New PID: {os.getpid()}\n")
+            except Exception:
+                pass
+            
+            # Stop the old instance (reuse existing stop logic but quieter)
+            stop_result = _stop_instance_for_replacement(old_pid, info)
+            if stop_result == 0:
+                if _should_use_color():
+                    print(f"\033[92mOld instance stopped successfully.\033[0m")  # Green
+                else:
+                    print(f"Old instance stopped successfully.")
+            else:
+                if _should_use_color():
+                    print(f"\033[91mWarning: Could not stop old instance cleanly (result={stop_result}).\033[0m")  # Red
+                    print(f"\033[91mProceeding anyway - old instance may still be running.\033[0m")
+                else:
+                    print(f"Warning: Could not stop old instance cleanly (result={stop_result}).")
+                    print(f"Proceeding anyway - old instance may still be running.")
+            
+            # Log completion
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(f"Stop result: {stop_result}\n")
+            except Exception:
+                pass
+            
+            print()  # Blank line before continuing
 
     # NOW it's safe to do cleanup - we've confirmed no other instance is running that we'd interfere with.
     # Clean up old _MEI folders from previous runs (Windows only, PyInstaller frozen only)
