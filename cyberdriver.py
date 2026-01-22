@@ -4698,7 +4698,7 @@ class TunnelClient:
             )
             
             if is_file_error:
-                print(f"[TUNNEL] Detected file-not-found error - checking _MEI health...", flush=True)
+                print(f"[TUNNEL] Detected file-not-found error - triggering immediate restart...", flush=True)
                 # Set flag for main loop to trigger restart
                 os.environ["CYBERDRIVER_MEI_CORRUPTED"] = "1"
                 try:
@@ -4709,6 +4709,10 @@ class TunnelClient:
                         f.write(f"Path: {path}\n")
                 except Exception:
                     pass
+                
+                # Raise a special exception to break out of the WebSocket loop immediately
+                # This prevents waiting for more retries before restarting
+                raise RuntimeError(f"MEI_CORRUPTION_DETECTED: {error_msg}")
             
             result = {
                 "status": 500,
