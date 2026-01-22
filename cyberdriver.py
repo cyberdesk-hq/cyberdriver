@@ -5013,23 +5013,128 @@ def check_mei_health(context: str = "") -> bool:
     if missing:
         from datetime import datetime
         timestamp = datetime.now().isoformat()
+        
+        # Get list of existing directories for debugging
+        existing = []
+        try:
+            existing = [f for f in os.listdir(meipass) if os.path.isdir(os.path.join(meipass, f))]
+        except Exception:
+            pass
+        
+        # Print to console
         print(f"\n{'='*70}")
         print(f"[CRITICAL] _MEI HEALTH CHECK FAILED at {timestamp}")
         print(f"[CRITICAL] Context: {context}")
         print(f"[CRITICAL] _MEIPASS: {meipass}")
         print(f"[CRITICAL] Missing directories: {missing}")
-        
-        # List what DOES exist for debugging
-        try:
-            existing = [f for f in os.listdir(meipass) if os.path.isdir(os.path.join(meipass, f))]
-            print(f"[CRITICAL] Existing directories ({len(existing)}): {existing[:20]}{'...' if len(existing) > 20 else ''}")
-        except Exception as e:
-            print(f"[CRITICAL] Could not list directory: {e}")
-        
+        print(f"[CRITICAL] Existing directories ({len(existing)}): {existing[:20]}{'...' if len(existing) > 20 else ''}")
         print(f"{'='*70}\n")
+        
+        # Log to persistent file for post-mortem analysis
+        try:
+            log_path = get_config_dir() / "mei-health-failures.log"
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n{'='*70}\n")
+                f.write(f"Timestamp: {timestamp}\n")
+                f.write(f"Context: {context}\n")
+                f.write(f"_MEIPASS: {meipass}\n")
+                f.write(f"Missing directories: {missing}\n")
+                f.write(f"Existing directories ({len(existing)}): {existing}\n")
+                f.write(f"PID: {os.getpid()}\n")
+                
+                # Check for Windows Defender quarantine hints
+                try:
+                    # Check if Defender service is running
+                    import subprocess
+                    result = subprocess.run(
+                        ["powershell", "-NoProfile", "-Command", 
+                         "Get-MpComputerStatus | Select-Object -Property RealTimeProtectionEnabled,AntivirusEnabled | ConvertTo-Json"],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if result.returncode == 0:
+                        f.write(f"Defender status: {result.stdout.strip()}\n")
+                    
+                    # Check Defender threat history (last 24 hours)
+                    result = subprocess.run(
+                        ["powershell", "-NoProfile", "-Command",
+                         "Get-MpThreatDetection | Where-Object { $_.InitialDetectionTime -gt (Get-Date).AddHours(-24) } | Select-Object -Property ThreatID,ProcessName,Resources | ConvertTo-Json"],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        f.write(f"Recent Defender detections: {result.stdout.strip()}\n")
+                except Exception as defender_err:
+                    f.write(f"Could not check Defender status: {defender_err}\n")
+                
+                f.write(f"{'='*70}\n")
+        except Exception as log_err:
+            print(f"[CRITICAL] Could not write to MEI health log: {log_err}")
+        
         return False
     
     return True
+
+
+def add_defender_exclusion() -> bool:
+    """
+    Attempt to add Windows Defender exclusion for PyInstaller extraction directory.
+    
+    This helps prevent Defender from quarantining/deleting files from the _MEI folder
+    during runtime, which is a known issue with PyInstaller executables.
+    
+    Returns:
+        True if exclusion was added (or already exists), False if failed (e.g., no admin)
+    """
+    if platform.system() != "Windows" or not getattr(sys, 'frozen', False):
+        return False
+    
+    meipass = getattr(sys, '_MEIPASS', None)
+    if not meipass:
+        return False
+    
+    # The parent directory where all _MEI folders live (e.g., %LOCALAPPDATA%\.cyberdriver\_pyinstaller)
+    mei_parent = os.path.dirname(meipass)
+    
+    try:
+        # First check if exclusion already exists
+        check_cmd = f'(Get-MpPreference).ExclusionPath -contains "{mei_parent}"'
+        check_result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", check_cmd],
+            capture_output=True, text=True, timeout=10,
+            creationflags=0x08000000  # CREATE_NO_WINDOW
+        )
+        
+        if check_result.returncode == 0 and "True" in check_result.stdout:
+            # Exclusion already exists
+            return True
+        
+        # Try to add exclusion (requires admin privileges)
+        add_cmd = f'Add-MpExclusion -Path "{mei_parent}"'
+        add_result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", add_cmd],
+            capture_output=True, text=True, timeout=10,
+            creationflags=0x08000000  # CREATE_NO_WINDOW
+        )
+        
+        if add_result.returncode == 0:
+            print(f"[INFO] Added Windows Defender exclusion for: {mei_parent}")
+            return True
+        else:
+            # Likely failed due to lack of admin privileges - this is expected
+            # Log for debugging but don't alarm the user
+            try:
+                log_path = get_config_dir() / "defender-exclusion.log"
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(f"\n[{datetime.now().isoformat()}] Failed to add Defender exclusion\n")
+                    f.write(f"Path: {mei_parent}\n")
+                    f.write(f"Error: {add_result.stderr}\n")
+            except:
+                pass
+            return False
+            
+    except subprocess.TimeoutExpired:
+        return False
+    except Exception:
+        return False
 
 
 def main():
@@ -5037,8 +5142,9 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Clean up old _MEI folders from previous runs (Windows only, PyInstaller frozen only)
-    cleanup_old_mei_folders()
+    # NOTE: cleanup_old_mei_folders() is intentionally NOT called here.
+    # It's called AFTER the idempotency check to prevent a new instance from
+    # deleting the _MEI folder of an already-running instance before we detect it.
 
     # If we were launched in "detached/invisible" mode, redirect stdout/stderr to a log file.
     _setup_detached_stdio_if_configured()
@@ -5234,6 +5340,15 @@ def main():
             _print_prominent_stop_hint()
             print("\nIf you want to restart with different flags, run `cyberdriver stop` first.")
             sys.exit(0)
+
+    # NOW it's safe to do cleanup - we've confirmed no other instance is running that we'd interfere with.
+    # Clean up old _MEI folders from previous runs (Windows only, PyInstaller frozen only)
+    cleanup_old_mei_folders()
+    
+    # Try to add Windows Defender exclusion for PyInstaller extraction directory.
+    # This helps prevent Defender from quarantining/deleting files from _MEI during runtime.
+    # Requires admin privileges - silently fails if not admin.
+    add_defender_exclusion()
 
     # On Windows, default to running `join` invisibly in a detached process so closing the
     # launching terminal (or an agent hitting Alt+F4) cannot kill Cyberdriver.
