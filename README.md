@@ -49,7 +49,7 @@ New-Item -ItemType Directory -Force -Path $toolDir
 
 # Download cyberdriver
 try {
-    Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.37/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe" -ErrorAction Stop
+    Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.38/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe" -ErrorAction Stop
 } catch {
     Write-Host "ERROR: Failed to download Cyberdriver. Please check your internet connection and try again." -ForegroundColor Red
     return
@@ -77,7 +77,7 @@ if (Test-Path "$toolDir\cyberdriver.exe") {
 
 ```bash
 # Choose version and target directory
-VERSION=0.0.37
+VERSION=0.0.38
 TOOL_DIR="$HOME/.cyberdriver"
 mkdir -p "$TOOL_DIR"
 
@@ -228,7 +228,7 @@ After the update, Cyberdriver will restart with those exact same flags.
 If you're on an older version and encounter TLS certificate errors, update to the latest version:
 
 ```powershell
-Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.37/cyberdriver.exe" -OutFile "$env:USERPROFILE\.cyberdriver\cyberdriver.exe"
+Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.38/cyberdriver.exe" -OutFile "$env:USERPROFILE\.cyberdriver\cyberdriver.exe"
 ```
 
 > If you have any other issues, reach out to the team! We'll get on it asap.

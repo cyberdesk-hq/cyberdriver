@@ -1372,7 +1372,7 @@ async def connect_with_headers(uri, headers_dict):
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
 PID_FILE = "cyberdriver.pid.json"
-VERSION = "0.0.37"
+VERSION = "0.0.38"
 
 @dataclass
 class Config:
@@ -2220,6 +2220,7 @@ async def get_diagnostics():
     import gc
     
     diagnostics = {
+        "version": VERSION,
         "timestamp": time.time(),
         "uptime_seconds": time.time() - app.state.start_time if hasattr(app.state, "start_time") else None,
         "platform": platform.system(),
@@ -3274,7 +3275,10 @@ async def post_mouse_move(payload: Dict[str, int]):
 
 @app.post("/computer/input/mouse/click")
 async def post_mouse_click(payload: Dict[str, Any]):
-    """Click the mouse with full press/release control."""
+    """Click the mouse with full press/release control.
+    
+    Supports native double/triple click via the 'clicks' parameter (1, 2, or 3).
+    """
     button = payload.get("button", "left").lower()
     if button not in ("left", "right", "middle"):
         raise HTTPException(status_code=400, detail="Invalid button: expected 'left', 'right', or 'middle'")
@@ -3282,14 +3286,19 @@ async def post_mouse_click(payload: Dict[str, Any]):
     down = payload.get("down")
     x = payload.get("x")
     y = payload.get("y")
+    clicks = payload.get("clicks", 1)
+    
+    # Validate clicks parameter
+    if not isinstance(clicks, int) or clicks < 1 or clicks > 3:
+        raise HTTPException(status_code=400, detail="clicks must be 1, 2, or 3")
     
     # Move to position if specified
     if x is not None and y is not None:
         pyautogui.moveTo(int(x), int(y), duration=0)
     
     if down is None:
-        # Full click
-        pyautogui.click(button=button)
+        # Full click(s) - native double/triple click support
+        pyautogui.click(button=button, clicks=clicks)
     elif down:
         pyautogui.mouseDown(button=button)
     else:
