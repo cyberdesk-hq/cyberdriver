@@ -2084,6 +2084,26 @@ async def global_exception_handler(request, exc):
     """Global exception handler that logs errors and checks for _MEI corruption."""
     from fastapi.responses import JSONResponse
     
+    # Immediately log that we entered this handler
+    timestamp = datetime.now().isoformat()
+    try:
+        print(f"\n[GLOBAL EXCEPTION HANDLER] {timestamp}", flush=True)
+        print(f"[GLOBAL EXCEPTION HANDLER] Exception type: {type(exc).__name__}", flush=True)
+        print(f"[GLOBAL EXCEPTION HANDLER] Exception message: {exc}", flush=True)
+        sys.stdout.flush()
+    except Exception:
+        pass
+    
+    # Also log to file
+    try:
+        log_path = get_config_dir() / "global-exception-handler.log"
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n[{timestamp}] GLOBAL EXCEPTION HANDLER INVOKED\n")
+            f.write(f"Exception type: {type(exc).__name__}\n")
+            f.write(f"Exception message: {exc}\n")
+    except Exception:
+        pass
+    
     # Get request path for context
     path = str(request.url.path) if hasattr(request, 'url') else "unknown"
     context = f"Request to {path}"
@@ -3710,20 +3730,51 @@ async def post_powershell_exec(payload: Dict[str, Any]):
     if not command:
         raise HTTPException(status_code=400, detail="Missing 'command' field")
     
-    # Run in thread pool to avoid blocking
-    # Let exceptions bubble up to global handler which checks for MEI corruption
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        executor,
-        execute_powershell_command,
-        command,
-        session_id,
-        working_directory,
-        same_session,
-        timeout
-    )
-    
-    return result
+    try:
+        # Run in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            executor,
+            execute_powershell_command,
+            command,
+            session_id,
+            working_directory,
+            same_session,
+            timeout
+        )
+        return result
+    except Exception as e:
+        # Log the error with full details
+        timestamp = datetime.now().isoformat()
+        error_type = type(e).__name__
+        error_msg = str(e)
+        
+        # Log to console
+        print(f"\n{'='*60}", flush=True)
+        print(f"[POWERSHELL EXEC ERROR] {timestamp}", flush=True)
+        print(f"Error type: {error_type}", flush=True)
+        print(f"Error message: {error_msg}", flush=True)
+        print(f"Command: {command[:100]}..." if len(command) > 100 else f"Command: {command}", flush=True)
+        print(f"{'='*60}\n", flush=True)
+        
+        # Log to file
+        try:
+            log_path = get_config_dir() / "powershell-errors.log"
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n[{timestamp}] POWERSHELL EXEC ERROR\n")
+                f.write(f"Type: {error_type}\n")
+                f.write(f"Message: {error_msg}\n")
+                f.write(f"Command: {command}\n")
+                import traceback
+                f.write(f"Traceback:\n{traceback.format_exc()}\n")
+        except Exception:
+            pass
+        
+        # Check for MEI corruption
+        _log_error_and_check_mei(e, "powershell/exec endpoint")
+        
+        # Re-raise to let FastAPI handle response
+        raise
 
 @app.post("/computer/shell/powershell/session")
 async def post_powershell_session(payload: Dict[str, Any]):
