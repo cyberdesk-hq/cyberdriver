@@ -1895,11 +1895,27 @@ def _log_error_and_check_mei(error: Exception, context: str = "") -> bool:
     error_str = str(error).lower()
     error_type = type(error).__name__
     
-    # Always log the error
+    # Always log the error - use both print and direct file logging
     timestamp = datetime.now().isoformat()
-    print(f"\n[ERROR] {timestamp} - {context}")
-    print(f"[ERROR] Type: {error_type}")
-    print(f"[ERROR] Message: {error}")
+    
+    # Log to console (may not appear if stdout is captured)
+    try:
+        print(f"\n[ERROR] {timestamp} - {context}", flush=True)
+        print(f"[ERROR] Type: {error_type}", flush=True)
+        print(f"[ERROR] Message: {error}", flush=True)
+        sys.stdout.flush()
+    except Exception:
+        pass
+    
+    # Also log to persistent file so we always have a record
+    try:
+        log_path = get_config_dir() / "api-errors.log"
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n[{timestamp}] {context}\n")
+            f.write(f"Type: {error_type}\n")
+            f.write(f"Message: {error}\n")
+    except Exception:
+        pass
     
     # Check if this looks like a file-not-found error that could indicate _MEI corruption
     is_file_error = (
@@ -1913,10 +1929,20 @@ def _log_error_and_check_mei(error: Exception, context: str = "") -> bool:
     )
     
     if is_file_error:
-        print(f"[ERROR] Detected file-not-found error - checking _MEI health...")
+        try:
+            print(f"[ERROR] Detected file-not-found error - checking _MEI health...", flush=True)
+        except Exception:
+            pass
         
-        # Import check_mei_health (defined later in file, but available at runtime)
-        # We do a quick inline check here to avoid circular dependency
+        # Log to persistent file
+        try:
+            log_path = get_config_dir() / "api-errors.log"
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{timestamp}] Detected file-not-found error - checking _MEI health...\n")
+        except Exception:
+            pass
+        
+        # Check if we're running as frozen PyInstaller exe on Windows
         if getattr(sys, 'frozen', False) and platform.system() == "Windows":
             meipass = getattr(sys, '_MEIPASS', None)
             if meipass:
@@ -1924,9 +1950,13 @@ def _log_error_and_check_mei(error: Exception, context: str = "") -> bool:
                 missing = [d for d in critical_dirs if not os.path.exists(os.path.join(meipass, d))]
                 
                 if missing:
-                    print(f"[CRITICAL] _MEI health check FAILED!")
-                    print(f"[CRITICAL] Missing directories: {missing}")
-                    print(f"[CRITICAL] Triggering hard restart to recover...")
+                    try:
+                        print(f"[CRITICAL] _MEI health check FAILED!", flush=True)
+                        print(f"[CRITICAL] Missing directories: {missing}", flush=True)
+                        print(f"[CRITICAL] Triggering hard restart to recover...", flush=True)
+                        sys.stdout.flush()
+                    except Exception:
+                        pass
                     
                     # Log to persistent file
                     try:
@@ -1943,7 +1973,10 @@ def _log_error_and_check_mei(error: Exception, context: str = "") -> bool:
                     os.environ["CYBERDRIVER_MEI_CORRUPTED"] = "1"
                     return True
                 else:
-                    print(f"[INFO] _MEI health check passed - error is not due to folder corruption")
+                    try:
+                        print(f"[INFO] _MEI health check passed - error is not due to folder corruption", flush=True)
+                    except Exception:
+                        pass
     
     return False
 
@@ -3376,8 +3409,8 @@ executor = ThreadPoolExecutor(max_workers=5)
 
 def execute_powershell_command(command: str, session_id: str, working_directory: Optional[str] = None, same_session: bool = True, timeout: float = 30.0):
     """Execute PowerShell command in a session with timeout."""
-    import subprocess
-    import threading
+    # Note: subprocess is already imported at top of file (line 50)
+    # Don't re-import here as it could fail if _MEI is corrupted
     
     # For clean output, we'll use a different approach - execute each command as a separate process
     # This avoids the echo/prompt issues with interactive PowerShell
