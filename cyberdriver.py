@@ -4659,7 +4659,57 @@ class TunnelClient:
             duration_ms = (time.time() - request_start) * 1000
             # Ensure we always have a meaningful error message
             error_msg = str(e) if str(e) else f"{type(e).__name__}: (no details)"
+            error_type = type(e).__name__
             debug_logger.error("REQUEST", f"Request failed: {error_msg}", method=method, path=path, duration_ms=f"{duration_ms:.1f}ms")
+            
+            # Log to console with full details
+            timestamp = datetime.now().isoformat()
+            print(f"\n{'='*60}", flush=True)
+            print(f"[TUNNEL FORWARD ERROR] {timestamp}", flush=True)
+            print(f"Error type: {error_type}", flush=True)
+            print(f"Error message: {error_msg}", flush=True)
+            print(f"Method: {method}", flush=True)
+            print(f"Path: {path}", flush=True)
+            print(f"URL: {url}", flush=True)
+            print(f"{'='*60}\n", flush=True)
+            
+            # Log to file with full traceback
+            try:
+                log_path = get_config_dir() / "tunnel-forward-errors.log"
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(f"\n[{timestamp}] TUNNEL FORWARD ERROR\n")
+                    f.write(f"Type: {error_type}\n")
+                    f.write(f"Message: {error_msg}\n")
+                    f.write(f"Method: {method}\n")
+                    f.write(f"Path: {path}\n")
+                    f.write(f"URL: {url}\n")
+                    import traceback
+                    f.write(f"Traceback:\n{traceback.format_exc()}\n")
+            except Exception:
+                pass
+            
+            # Check for MEI corruption indicators
+            is_file_error = (
+                isinstance(e, FileNotFoundError) or
+                isinstance(e, OSError) and getattr(e, 'errno', None) == 2 or
+                "errno 2" in error_msg.lower() or
+                "no such file or directory" in error_msg.lower() or
+                "cannot find the file" in error_msg.lower()
+            )
+            
+            if is_file_error:
+                print(f"[TUNNEL] Detected file-not-found error - checking _MEI health...", flush=True)
+                # Set flag for main loop to trigger restart
+                os.environ["CYBERDRIVER_MEI_CORRUPTED"] = "1"
+                try:
+                    log_path = get_config_dir() / "mei-corruption-detected.log"
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(f"\n[{timestamp}] MEI corruption detected in tunnel forward\n")
+                        f.write(f"Error: {error_msg}\n")
+                        f.write(f"Path: {path}\n")
+                except Exception:
+                    pass
+            
             result = {
                 "status": 500,
                 "headers": {"content-type": "text/plain"},
