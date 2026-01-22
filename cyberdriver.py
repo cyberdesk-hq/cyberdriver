@@ -5135,8 +5135,43 @@ def signal_handler(signum, frame):
     sys.exit(0)
 
 
+def _stdout_supports_unicode():
+    """Check if stdout encoding supports Unicode characters."""
+    try:
+        encoding = getattr(sys.stdout, 'encoding', None) or 'ascii'
+        # Test if we can encode a box-drawing character
+        '█'.encode(encoding)
+        return True
+    except (UnicodeEncodeError, LookupError):
+        return False
+
+
+def print_banner_ascii(mode="default"):
+    """Print ASCII-only banner for terminals that don't support Unicode (e.g., PowerShell ISE)."""
+    print("Welcome to Cyberdriver!")
+    print()
+    
+    if mode == "connecting":
+        print("Connecting to Cyberdesk Cloud...")
+    else:
+        print("Get started:")
+        print("-> Join: cyberdriver join --secret YOUR_API_KEY")
+        print("-> Keepalive: cyberdriver join --secret YOUR_API_KEY --keepalive")
+        print("-> Black screen recovery: cyberdriver join --secret YOUR_API_KEY --black-screen-recovery")
+        print("-> Persistent display: cyberdriver join --secret YOUR_API_KEY --add-persistent-display")
+    
+    print("-> Run -h for help")
+    print("-> Visit https://docs.cyberdesk.io for documentation")
+    print()
+
+
 def print_banner_no_color(mode="default"):
     """Print banner without colors for terminals that don't support ANSI."""
+    # Check if stdout supports Unicode; if not, use ASCII fallback
+    if not _stdout_supports_unicode():
+        print_banner_ascii(mode)
+        return
+    
     banner = [
         " ██████╗██╗   ██╗██████╗ ███████╗██████╗ ██████╗ ██████╗ ██╗██╗   ██╗███████╗██████╗ ",
         "██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗██╔══██╗██╔══██╗██║██║   ██║██╔════╝██╔══██╗",
@@ -5175,6 +5210,12 @@ def print_banner(mode="default"):
     # avoid ANSI codes so logs remain readable in files.
     if os.environ.get("CYBERDRIVER_NO_COLOR") or os.environ.get("CYBERDRIVER_STDIO_LOG"):
         print_banner_no_color(mode)
+        return
+
+    # Check if stdout supports Unicode; if not, use ASCII fallback
+    # This handles PowerShell ISE and other legacy terminals using cp1252/charmap encoding
+    if not _stdout_supports_unicode():
+        print_banner_ascii(mode)
         return
 
     # Enable Windows terminal colors if needed
