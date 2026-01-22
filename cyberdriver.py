@@ -3543,27 +3543,12 @@ def _restart_cyberdriver_process() -> bool:
     _remove_pid_file_safely()
     
     if platform.system() == "Windows":
-        # On Windows, we need to spawn a detached process and exit
-        
-        # CRITICAL: Clear PyInstaller environment variables so child gets fresh _MEI
-        # This is the key to getting a new extraction directory
-        env = os.environ.copy()
-        for k in list(env.keys()):
-            if k == "_MEIPASS2" or k.startswith("_PYI_"):
-                env.pop(k, None)
-        
-        # Force child to create its own _MEI extraction directory
-        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
-        
-        # Pass restart count to child so we can detect infinite restart loops
-        env["CYBERDRIVER_RESTART_COUNT"] = str(restart_count)
-        
-        # CRITICAL: Tell the child it's already "detached" so it doesn't try to spawn
-        # ANOTHER process and go through the detach dance again
-        env["CYBERDRIVER_DETACHED"] = "1"
+        # On Windows, we need to spawn a truly hidden process.
+        # Direct subprocess flags (DETACHED_PROCESS, CREATE_NO_WINDOW) have compatibility
+        # issues with PyInstaller frozen executables - they still show a window!
+        # The only reliable approach is using VBScript via wscript to launch hidden.
         
         # Determine if user originally ran with --foreground
-        # If so, we should spawn with a visible console. Otherwise, spawn hidden.
         is_foreground = "--foreground" in sys.argv or "-f" in sys.argv
         
         try:
@@ -3573,38 +3558,106 @@ def _restart_cyberdriver_process() -> bool:
                 CREATE_NEW_CONSOLE = 0x00000010
                 CREATE_NEW_PROCESS_GROUP = 0x00000200
                 
+                env = os.environ.copy()
+                for k in list(env.keys()):
+                    if k == "_MEIPASS2" or k.startswith("_PYI_"):
+                        env.pop(k, None)
+                env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+                env["CYBERDRIVER_RESTART_COUNT"] = str(restart_count)
+                env["CYBERDRIVER_DETACHED"] = "1"
+                
                 proc = subprocess.Popen(
                     cmd,
                     creationflags=CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
                     env=env,
                     close_fds=True,
                 )
-            else:
-                # Background/detached mode: spawn completely hidden
-                DETACHED_PROCESS = 0x00000008
-                CREATE_NEW_PROCESS_GROUP = 0x00000200
-                CREATE_NO_WINDOW = 0x08000000
                 
-                proc = subprocess.Popen(
-                    cmd,
-                    creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
-                    env=env,
-                    close_fds=True,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                time.sleep(0.5)
+                if proc.poll() is not None:
+                    print(f"⚠️  Warning: New process exited immediately with code {proc.returncode}")
+            else:
+                # Background mode: use VBScript + PowerShell for truly hidden launch
+                # This is the same approach used by _windows_relaunch_detached()
+                
+                config_dir = get_config_dir()
+                config_dir.mkdir(parents=True, exist_ok=True)
+                
+                exe_path = cmd[0]
+                exe_args = cmd[1:] if len(cmd) > 1 else []
+                args_for_ps = subprocess.list2cmdline(exe_args)
+                
+                # PowerShell script that uses .NET ProcessStartInfo for hidden launch
+                ps_script_path = config_dir / "restart-hidden.ps1"
+                ps_content = f'''# Restart launcher - uses .NET for explicit env control
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = "{exe_path}"
+$psi.Arguments = '{args_for_ps}'
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
+
+# Clear PyInstaller environment variables
+$psi.EnvironmentVariables.Remove("_MEIPASS2")
+$psi.EnvironmentVariables.Remove("_PYI_APPLICATION_HOME_DIR") 
+$psi.EnvironmentVariables.Remove("_PYI_PARENT_PROCESS_LEVEL")
+
+# CRITICAL: Force fresh _MEI extraction
+$psi.EnvironmentVariables["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+
+# Pass restart count to detect infinite loops
+$psi.EnvironmentVariables["CYBERDRIVER_RESTART_COUNT"] = "{restart_count}"
+
+# Tell child it's already detached
+$psi.EnvironmentVariables["CYBERDRIVER_DETACHED"] = "1"
+
+# Start hidden
+[System.Diagnostics.Process]::Start($psi) | Out-Null
+'''
+                
+                with open(ps_script_path, "w", encoding="utf-8") as f:
+                    f.write(ps_content)
+                
+                # VBScript to run PowerShell hidden (wscript is the only truly silent launcher)
+                vbs_path = config_dir / "restart-hidden.vbs"
+                ps_path_escaped = str(ps_script_path).replace('"', '""')
+                vbs_content = f'''Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run "powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{ps_path_escaped}""", 0, False
+'''
+                
+                with open(vbs_path, "w", encoding="utf-8") as f:
+                    f.write(vbs_content)
+                
+                # Prepare clean environment for wscript
+                wscript_env = os.environ.copy()
+                for k in list(wscript_env.keys()):
+                    if k == "_MEIPASS2" or k.startswith("_PYI_"):
+                        wscript_env.pop(k, None)
+                
+                # Reset DLL search path
+                try:
+                    import ctypes
+                    ctypes.windll.kernel32.SetDllDirectoryW(None)
+                except Exception:
+                    pass
+                
+                # Run VBScript via wscript (silent)
+                CREATE_NO_WINDOW = 0x08000000
+                result = subprocess.run(
+                    ["wscript", "//NoLogo", str(vbs_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    creationflags=CREATE_NO_WINDOW,
+                    env=wscript_env,
                 )
-            
-            # Give the new process a moment to start and verify it's running
-            time.sleep(0.5)
-            
-            # Check if child process is still running (poll() returns None if running)
-            if proc.poll() is not None:
-                print(f"⚠️  Warning: New process exited immediately with code {proc.returncode}")
-                print("Continuing to exit current process anyway...")
+                
+                if result.returncode != 0:
+                    raise RuntimeError(f"VBScript launcher failed: {result.stderr or result.stdout}")
+                
+                # Brief pause to let child start
+                time.sleep(0.5)
             
             # Exit the current process
-            # Use os._exit() to avoid running atexit handlers which might interfere
             print("New process spawned. Exiting current process...")
             os._exit(0)
             
