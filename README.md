@@ -48,22 +48,36 @@ $toolDir = "$env:USERPROFILE\.cyberdriver"
 New-Item -ItemType Directory -Force -Path $toolDir
 
 # Download cyberdriver
-Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.37/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe"
-
-# Add to PATH if not already there
-$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if ($userPath -notlike "*$toolDir*") {
-    [Environment]::SetEnvironmentVariable("Path", $userPath + ";" + $toolDir, "User")
+try {
+    Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.38/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe" -ErrorAction Stop
+} catch {
+    Write-Host "ERROR: Failed to download Cyberdriver. Please check your internet connection and try again." -ForegroundColor Red
+    return
 }
 
-Write-Host "Cyberdriver installed! You may need to restart your terminal for PATH changes to take effect."
+# Verify installation
+if (Test-Path "$toolDir\cyberdriver.exe") {
+    $fileSize = (Get-Item "$toolDir\cyberdriver.exe").Length
+    if ($fileSize -gt 34MB) {
+        # Add to PATH if not already there
+        $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+        if ($userPath -notlike "*$toolDir*") {
+            [Environment]::SetEnvironmentVariable("Path", $userPath + ";" + $toolDir, "User")
+        }
+        Write-Host "Cyberdriver installed successfully! You may need to restart your terminal for PATH changes to take effect."
+    } else {
+        Write-Host "ERROR: Download appears incomplete (file too small). Please try again." -ForegroundColor Red
+    }
+} else {
+    Write-Host "ERROR: Download failed. Please try again." -ForegroundColor Red
+}
 ```
 
 ### macOS Installation (Bash/Zsh)
 
 ```bash
 # Choose version and target directory
-VERSION=0.0.37
+VERSION=0.0.38
 TOOL_DIR="$HOME/.cyberdriver"
 mkdir -p "$TOOL_DIR"
 
@@ -214,7 +228,7 @@ After the update, Cyberdriver will restart with those exact same flags.
 If you're on an older version and encounter TLS certificate errors, update to the latest version:
 
 ```powershell
-Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.37/cyberdriver.exe" -OutFile "$env:USERPROFILE\.cyberdriver\cyberdriver.exe"
+Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.38/cyberdriver.exe" -OutFile "$env:USERPROFILE\.cyberdriver\cyberdriver.exe"
 ```
 
 > If you have any other issues, reach out to the team! We'll get on it asap.

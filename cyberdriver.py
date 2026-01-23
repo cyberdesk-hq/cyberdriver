@@ -919,12 +919,21 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
     # Historically this was `_MEIPASS2`; in newer PyInstaller versions it is
     # `_PYI_APPLICATION_HOME_DIR` (and there are other `_PYI_*` vars).
     #
+    # CRITICAL FIX (PyInstaller 6.9+): Setting PYINSTALLER_RESET_ENVIRONMENT=1 tells
+    # the bootloader to ignore inherited _PYI_* variables and create a fresh _MEI
+    # extraction directory. This prevents the parent's cleanup from deleting files
+    # that the long-lived child process needs.
+    # See: https://pyinstaller.org/en/stable/common-issues-and-pitfalls.html
+    #
     # Make sure wscript starts with a clean environment so the detached process
     # creates its *own* extraction directory.
     wscript_env = os.environ.copy()
     for k in list(wscript_env.keys()):
         if k == "_MEIPASS2" or k.startswith("_PYI_"):
             wscript_env.pop(k, None)
+    
+    # Force child to create its own extraction directory (PyInstaller 6.9+)
+    wscript_env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
 
     # PyInstaller also adjusts the process DLL search path in onefile mode, which can
     # leak into child processes on Windows. Reset it before launching `wscript`.
@@ -948,36 +957,69 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
     # Escape for VBScript string literals: double all quotes.
     vbs_cmd_line = raw_cmd_line.replace('"', '""')
     
-    # Create VBScript that launches cyberdriver hidden
-    # The "0" parameter to Run means: hidden window
-    # The "False" parameter means: don't wait for the process to finish
+    # CRITICAL FIX (PyInstaller 6.9+): We need to set PYINSTALLER_RESET_ENVIRONMENT=1
+    # so the child process creates its own _MEI extraction directory instead of reusing
+    # the parent's. When the parent exits, it would otherwise delete files the child needs.
     #
-    # Belt-and-suspenders: also attempt to clear the env vars from within the VBScript
-    # process, in case the user's environment is unusual.
+    # We use PowerShell's Start-Process with explicit environment variable setup.
+    # This is more reliable than VBScript/cmd.exe for environment variable propagation.
     
-    vbs_content = f'''Set WshShell = CreateObject("WScript.Shell")
-Set objEnv = WshShell.Environment("Process")
-On Error Resume Next
-objEnv.Remove "_MEIPASS2"
-objEnv.Remove "_PYI_APPLICATION_HOME_DIR"
-On Error Goto 0
-WshShell.Run "{vbs_cmd_line}", 0, False
-'''
-    
-    # Write VBS to temp file
     config_dir = get_config_dir()
     config_dir.mkdir(parents=True, exist_ok=True)
-    vbs_path = config_dir / "launch-hidden.vbs"
     
-    # Also write the command we're trying to run for debugging
-    debug_path = config_dir / "launch-hidden-cmd.txt"
+    # Build PowerShell script that sets env vars and launches cyberdriver hidden
+    # We use Start-Process -WindowStyle Hidden for a truly hidden window
+    ps_script_path = config_dir / "launch-hidden.ps1"
+    
+    # Escape the exe path and args for PowerShell
+    exe_path = cmd[0] if cmd else sys.executable
+    exe_args = cmd[1:] if len(cmd) > 1 else []
+    
+    # Build argument string for Start-Process
+    args_for_ps = subprocess.list2cmdline(exe_args)
+    
+    ps_content = f'''# Use .NET ProcessStartInfo for explicit control over environment variables
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = "{exe_path}"
+$psi.Arguments = '{args_for_ps}'
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
+
+# Clear PyInstaller environment variables from the child's environment
+$psi.EnvironmentVariables.Remove("_MEIPASS2")
+$psi.EnvironmentVariables.Remove("_PYI_APPLICATION_HOME_DIR") 
+$psi.EnvironmentVariables.Remove("_PYI_PARENT_PROCESS_LEVEL")
+
+# CRITICAL: Force child to create its own _MEI extraction directory (PyInstaller 6.9+)
+$psi.EnvironmentVariables["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+
+# Start the process
+[System.Diagnostics.Process]::Start($psi) | Out-Null
+'''
+    
+    try:
+        with open(ps_script_path, "w", encoding="utf-8") as f:
+            f.write(ps_content)
+    except Exception as e:
+        raise RuntimeError(f"Failed to write PowerShell launcher: {e}")
+    
+    # Also write debug info
+    debug_path = config_dir / "launch-hidden-debug.txt"
     try:
         with open(debug_path, "w", encoding="utf-8") as f:
             f.write(f"Raw command: {raw_cmd_line}\n")
-            f.write(f"VBS command: {vbs_cmd_line}\n")
-            f.write(f"\nVBS script:\n{vbs_content}\n")
+            f.write(f"Exe path: {exe_path}\n")
+            f.write(f"Args: {args_for_ps}\n")
+            f.write(f"\nPowerShell script ({ps_script_path}):\n{ps_content}\n")
     except Exception:
         pass
+    
+    # Use VBScript to run PowerShell hidden (PowerShell itself might show a window briefly)
+    vbs_path = config_dir / "launch-hidden.vbs"
+    ps_path_escaped = str(ps_script_path).replace('"', '""')
+    vbs_content = f'''Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run "powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{ps_path_escaped}""", 0, False
+'''
     
     try:
         with open(vbs_path, "w", encoding="utf-8") as f:
@@ -1152,12 +1194,15 @@ def _follow_log_file(path: pathlib.Path) -> None:
                         return
                 except Exception:
                     pass
-                # If the writer truncated the file (size cap), reset our read position.
+                # If the writer truncated/rotated the file, our position is now past EOF.
+                # Seek to the END of the new file to continue following new content,
+                # not the beginning (which would re-print all old logs).
                 try:
                     if path.exists():
                         cur_size = path.stat().st_size
                         if f.tell() > cur_size:
-                            f.seek(0, os.SEEK_SET)
+                            print("\n[Log file was rotated, continuing from current position...]\n")
+                            f.seek(0, os.SEEK_END)  # Seek to END, not beginning
                 except Exception:
                     pass
                 line = f.readline()
@@ -1327,7 +1372,7 @@ async def connect_with_headers(uri, headers_dict):
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
 PID_FILE = "cyberdriver.pid.json"
-VERSION = "0.0.37"
+VERSION = "0.0.38"
 
 @dataclass
 class Config:
@@ -1622,6 +1667,7 @@ def stop_running_instance(force: bool = False, timeout_seconds: float = 10.0) ->
             print("Cyberdriver stopped.")
             return 0
         print("Failed to stop Cyberdriver.")
+        print("Please check Windows Task Manager for cyberdriver.exe. You can kill the task there.")
         return 1
     
     # For non-Windows, try graceful SIGTERM first
@@ -1649,7 +1695,106 @@ def stop_running_instance(force: bool = False, timeout_seconds: float = 10.0) ->
         print("Cyberdriver stopped (killed).")
         return 0
     print("Failed to stop Cyberdriver.")
+    print("Please check your system's process manager to manually kill the cyberdriver process.")
     return 1
+
+
+def _stop_instance_for_replacement(pid: int, info: Dict[str, Any], timeout_seconds: float = 5.0) -> int:
+    """
+    Stop a running Cyberdriver instance to allow replacement with a new one.
+    
+    This is a quieter version of stop_running_instance, used when `cyberdriver join`
+    is called while another instance is already running.
+    
+    Args:
+        pid: The PID of the running instance
+        info: The PID file info dict
+        timeout_seconds: How long to wait for graceful shutdown before force killing
+        
+    Returns:
+        0 on success, non-zero on failure
+    """
+    if pid <= 0:
+        _remove_pid_file_safely()
+        return 0
+    
+    if not _pid_is_running(pid):
+        _remove_pid_file_safely()
+        return 0
+    
+    # On Windows, verify it's actually cyberdriver before killing
+    if platform.system() == "Windows":
+        image_name = _windows_tasklist_image_name(pid)
+        if image_name:
+            image_l = image_name.lower()
+            if image_l not in ("cyberdriver.exe", "python.exe", "pythonw.exe"):
+                # Not cyberdriver, don't kill it
+                return 2
+            if image_l in ("python.exe", "pythonw.exe"):
+                # Verify via pidfile argv
+                if not _pidfile_looks_like_cyberdriver(info):
+                    return 2
+    
+    # Try graceful shutdown first (SIGTERM on Unix, TerminateProcess on Windows)
+    deadline = time.time() + timeout_seconds
+    
+    if platform.system() == "Windows":
+        # Send WM_CLOSE via taskkill (graceful)
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid)],
+                capture_output=True,
+                timeout=3.0
+            )
+        except Exception:
+            pass
+        
+        # Wait for process to exit
+        while time.time() < deadline:
+            if not _pid_is_running(pid):
+                _remove_pid_file_safely()
+                return 0
+            time.sleep(0.2)
+        
+        # Force kill if still running
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True,
+                timeout=3.0
+            )
+        except Exception:
+            pass
+        
+        time.sleep(0.3)
+        if not _pid_is_running(pid):
+            _remove_pid_file_safely()
+            return 0
+        return 1
+    else:
+        # Unix: send SIGTERM
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        
+        while time.time() < deadline:
+            if not _pid_is_running(pid):
+                _remove_pid_file_safely()
+                return 0
+            time.sleep(0.2)
+        
+        # Force kill with SIGKILL
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        
+        time.sleep(0.3)
+        if not _pid_is_running(pid):
+            _remove_pid_file_safely()
+            return 0
+        return 1
 
 
 # -----------------------------------------------------------------------------
@@ -1833,6 +1978,161 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Cyberdriver", version=VERSION, lifespan=lifespan)
 
 
+def _log_error_and_check_mei(error: Exception, context: str = "") -> bool:
+    """
+    Log an error and check if it indicates _MEI folder corruption.
+    
+    Args:
+        error: The exception that occurred
+        context: Description of where/when the error occurred
+        
+    Returns:
+        True if MEI appears corrupted and restart was triggered,
+        False otherwise (caller should continue normal error handling)
+    """
+    error_str = str(error).lower()
+    error_type = type(error).__name__
+    
+    # Always log the error - use both print and direct file logging
+    timestamp = datetime.now().isoformat()
+    
+    # Log to console (may not appear if stdout is captured)
+    try:
+        print(f"\n[ERROR] {timestamp} - {context}", flush=True)
+        print(f"[ERROR] Type: {error_type}", flush=True)
+        print(f"[ERROR] Message: {error}", flush=True)
+        sys.stdout.flush()
+    except Exception:
+        pass
+    
+    # Also log to persistent file so we always have a record
+    try:
+        log_path = get_config_dir() / "api-errors.log"
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n[{timestamp}] {context}\n")
+            f.write(f"Type: {error_type}\n")
+            f.write(f"Message: {error}\n")
+    except Exception:
+        pass
+    
+    # Check if this looks like a file-not-found error that could indicate _MEI corruption
+    is_file_error = (
+        isinstance(error, FileNotFoundError) or
+        isinstance(error, OSError) and getattr(error, 'errno', None) == 2 or
+        "errno 2" in error_str or
+        "no such file or directory" in error_str or
+        "filenotfounderror" in error_str or
+        "cannot find the file" in error_str or
+        "system cannot find" in error_str
+    )
+    
+    if is_file_error:
+        try:
+            print(f"[ERROR] Detected file-not-found error - checking _MEI health...", flush=True)
+        except Exception:
+            pass
+        
+        # Log to persistent file
+        try:
+            log_path = get_config_dir() / "api-errors.log"
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{timestamp}] Detected file-not-found error - checking _MEI health...\n")
+        except Exception:
+            pass
+        
+        # Check if we're running as frozen PyInstaller exe on Windows
+        if getattr(sys, 'frozen', False) and platform.system() == "Windows":
+            meipass = getattr(sys, '_MEIPASS', None)
+            if meipass:
+                critical_dirs = ['certifi', 'fastapi', 'websockets', 'pydantic_core', 'uvicorn']
+                missing = [d for d in critical_dirs if not os.path.exists(os.path.join(meipass, d))]
+                
+                if missing:
+                    try:
+                        print(f"[CRITICAL] _MEI health check FAILED!", flush=True)
+                        print(f"[CRITICAL] Missing directories: {missing}", flush=True)
+                        print(f"[CRITICAL] Triggering hard restart to recover...", flush=True)
+                        sys.stdout.flush()
+                    except Exception:
+                        pass
+                    
+                    # Log to persistent file
+                    try:
+                        log_path = get_config_dir() / "mei-corruption-detected.log"
+                        with open(log_path, "a", encoding="utf-8") as f:
+                            f.write(f"\n[{timestamp}] MEI corruption detected during: {context}\n")
+                            f.write(f"Error: {error}\n")
+                            f.write(f"Missing: {missing}\n")
+                    except Exception:
+                        pass
+                    
+                    # Schedule restart (can't do it synchronously from exception handler)
+                    # Set a flag that the main loop can check
+                    os.environ["CYBERDRIVER_MEI_CORRUPTED"] = "1"
+                    return True
+                else:
+                    try:
+                        print(f"[INFO] _MEI health check passed - error is not due to folder corruption", flush=True)
+                    except Exception:
+                        pass
+    
+    return False
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    """Global exception handler that logs errors and checks for _MEI corruption."""
+    from fastapi.responses import JSONResponse
+    
+    # Immediately log that we entered this handler
+    timestamp = datetime.now().isoformat()
+    try:
+        print(f"\n[GLOBAL EXCEPTION HANDLER] {timestamp}", flush=True)
+        print(f"[GLOBAL EXCEPTION HANDLER] Exception type: {type(exc).__name__}", flush=True)
+        print(f"[GLOBAL EXCEPTION HANDLER] Exception message: {exc}", flush=True)
+        sys.stdout.flush()
+    except Exception:
+        pass
+    
+    # Also log to file
+    try:
+        log_path = get_config_dir() / "global-exception-handler.log"
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n[{timestamp}] GLOBAL EXCEPTION HANDLER INVOKED\n")
+            f.write(f"Exception type: {type(exc).__name__}\n")
+            f.write(f"Exception message: {exc}\n")
+    except Exception:
+        pass
+    
+    # Get request path for context
+    path = str(request.url.path) if hasattr(request, 'url') else "unknown"
+    context = f"Request to {path}"
+    
+    # Log and check MEI health
+    mei_corrupted = _log_error_and_check_mei(exc, context)
+    
+    # If MEI is corrupted, add a hint to the error response
+    error_msg = str(exc)
+    if mei_corrupted:
+        error_msg = f"{error_msg} [MEI corruption detected - cyberdriver will restart]"
+    
+    # Return appropriate error response
+    if isinstance(exc, HTTPException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": exc.detail}
+        )
+    
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": type(exc).__name__,
+            "message": error_msg,
+            "timestamp": datetime.now().isoformat()
+        }
+    )
+
+
 @app.middleware("http")
 async def disable_buffering(request, call_next):
     """Middleware to ensure responses are not buffered."""
@@ -1920,6 +2220,7 @@ async def get_diagnostics():
     import gc
     
     diagnostics = {
+        "version": VERSION,
         "timestamp": time.time(),
         "uptime_seconds": time.time() - app.state.start_time if hasattr(app.state, "start_time") else None,
         "platform": platform.system(),
@@ -2574,6 +2875,10 @@ async def get_dimensions() -> Dict[str, int]:
 # Windows SendInput Implementation (Native Windows keyboard input)
 # -----------------------------------------------------------------------------
 
+# Global flag for experimental space key handling
+# When enabled, space is sent via VK code instead of scan code
+EXPERIMENTAL_SPACE_ENABLED = False
+
 # Hardware scan code mappings (PS/2 Set 1 scan codes)
 # These work correctly with Citrix/VDI unlike virtual key codes
 LETTER_SCANCODES = {
@@ -2598,6 +2903,7 @@ SPECIAL_KEY_SCANCODES = {
     'backspace': 0x0E,
     'tab': 0x0F,
     'enter': 0x1C, 'return': 0x1C,
+    'space': 0x39,  # Also in SYMBOL_SCANCODES as ' ', adding here for named key access
     'capslock': 0x3A,
     'home': 0xE047, 'end': 0xE04F,
     'pageup': 0xE049, 'pagedown': 0xE051,
@@ -2665,6 +2971,44 @@ async def _ensure_capslock_off():
         await asyncio.to_thread(_ensure_capslock_off_linux_sync)
 
 
+def _win32_send_vk_space(key_up: bool = False):
+    """Send space key using VK code (virtual key) instead of scan code.
+    
+    This is an experimental alternative for apps that may respond better to VK-based input.
+    Uses SendInput with VK_SPACE (0x20) instead of hardware scan code 0x39.
+    """
+    import ctypes
+    from ctypes import wintypes
+    
+    # Windows constants
+    INPUT_KEYBOARD = 1
+    KEYEVENTF_KEYUP = 0x0002
+    VK_SPACE = 0x20
+    
+    # Structures
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD), 
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG))]
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
+                    ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG))]
+    class HARDWAREINPUT(ctypes.Structure):
+        _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD)]
+    class _InputUnion(ctypes.Union):
+        _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT), ("hi", HARDWAREINPUT)]
+    class INPUT(ctypes.Structure):
+        _anonymous_ = ("u",)
+        _fields_ = [("type", wintypes.DWORD), ("u", _InputUnion)]
+    
+    flags = KEYEVENTF_KEYUP if key_up else 0
+    
+    # Build and send input event using VK code (wVk set, wScan=0, no KEYEVENTF_SCANCODE flag)
+    input_event = INPUT()
+    input_event.type = INPUT_KEYBOARD
+    input_event.ki = KEYBDINPUT(wVk=VK_SPACE, wScan=0, dwFlags=flags, time=0, dwExtraInfo=None)
+    ctypes.windll.user32.SendInput(1, ctypes.byref(input_event), ctypes.sizeof(INPUT))
+
+
 def _win32_send_key(scan_code: int, key_up: bool = False):
     """Low-level helper to send a single key event using Windows SendInput with scan code."""
     import ctypes
@@ -2711,6 +3055,12 @@ def _type_with_win32_sendinput(text: str):
     LSHIFT_SCANCODE = 0x2A
     
     for char in text:
+        # Handle space specially when experimental mode is enabled
+        if char == ' ' and EXPERIMENTAL_SPACE_ENABLED:
+            _win32_send_vk_space(key_up=False)
+            _win32_send_vk_space(key_up=True)
+            continue
+        
         upper_char = char.upper()
         scan_code = None
         needs_shift = False
@@ -2753,6 +3103,11 @@ def _press_key_with_scancode(key: str, key_up: bool = False):
     # Normalize key name: lowercase and remove underscores
     # This allows both "Page_Down" and "pagedown" to work
     key_lower = key.lower().replace('_', '')
+    
+    # Handle space specially when experimental mode is enabled
+    if key_lower == 'space' and EXPERIMENTAL_SPACE_ENABLED:
+        _win32_send_vk_space(key_up=key_up)
+        return
     
     # Check all scan code maps
     scan_code = (MODIFIER_SCANCODES.get(key_lower) or 
@@ -2920,7 +3275,10 @@ async def post_mouse_move(payload: Dict[str, int]):
 
 @app.post("/computer/input/mouse/click")
 async def post_mouse_click(payload: Dict[str, Any]):
-    """Click the mouse with full press/release control."""
+    """Click the mouse with full press/release control.
+    
+    Supports native double/triple click via the 'clicks' parameter (1, 2, or 3).
+    """
     button = payload.get("button", "left").lower()
     if button not in ("left", "right", "middle"):
         raise HTTPException(status_code=400, detail="Invalid button: expected 'left', 'right', or 'middle'")
@@ -2928,14 +3286,19 @@ async def post_mouse_click(payload: Dict[str, Any]):
     down = payload.get("down")
     x = payload.get("x")
     y = payload.get("y")
+    clicks = payload.get("clicks", 1)
+    
+    # Validate clicks parameter
+    if not isinstance(clicks, int) or clicks < 1 or clicks > 3:
+        raise HTTPException(status_code=400, detail="clicks must be 1, 2, or 3")
     
     # Move to position if specified
     if x is not None and y is not None:
         pyautogui.moveTo(int(x), int(y), duration=0)
     
     if down is None:
-        # Full click
-        pyautogui.click(button=button)
+        # Full click(s) - native double/triple click support
+        pyautogui.click(button=button, clicks=clicks)
     elif down:
         pyautogui.mouseDown(button=button)
     else:
@@ -3173,8 +3536,8 @@ executor = ThreadPoolExecutor(max_workers=5)
 
 def execute_powershell_command(command: str, session_id: str, working_directory: Optional[str] = None, same_session: bool = True, timeout: float = 30.0):
     """Execute PowerShell command in a session with timeout."""
-    import subprocess
-    import threading
+    # Note: subprocess is already imported at top of file (line 50)
+    # Don't re-import here as it could fail if _MEI is corrupted
     
     # For clean output, we'll use a different approach - execute each command as a separate process
     # This avoids the echo/prompt issues with interactive PowerShell
@@ -3388,11 +3751,39 @@ async def post_powershell_exec(payload: Dict[str, Any]):
             same_session,
             timeout
         )
-        
         return result
-        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to execute command: {e}")
+        # Log the error with full details
+        timestamp = datetime.now().isoformat()
+        error_type = type(e).__name__
+        error_msg = str(e)
+        
+        # Log to console
+        print(f"\n{'='*60}", flush=True)
+        print(f"[POWERSHELL EXEC ERROR] {timestamp}", flush=True)
+        print(f"Error type: {error_type}", flush=True)
+        print(f"Error message: {error_msg}", flush=True)
+        print(f"Command: {command[:100]}..." if len(command) > 100 else f"Command: {command}", flush=True)
+        print(f"{'='*60}\n", flush=True)
+        
+        # Log to file
+        try:
+            log_path = get_config_dir() / "powershell-errors.log"
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n[{timestamp}] POWERSHELL EXEC ERROR\n")
+                f.write(f"Type: {error_type}\n")
+                f.write(f"Message: {error_msg}\n")
+                f.write(f"Command: {command}\n")
+                import traceback
+                f.write(f"Traceback:\n{traceback.format_exc()}\n")
+        except Exception:
+            pass
+        
+        # Check for MEI corruption
+        _log_error_and_check_mei(e, "powershell/exec endpoint")
+        
+        # Re-raise to let FastAPI handle response
+        raise
 
 @app.post("/computer/shell/powershell/session")
 async def post_powershell_session(payload: Dict[str, Any]):
@@ -3411,6 +3802,262 @@ async def post_powershell_session(payload: Dict[str, Any]):
     elif action == "destroy":
         # No-op since we don't maintain sessions anymore
         return {"message": "Session destroyed (no-op in stateless mode)"}
+
+
+# -----------------------------------------------------------------------------
+# Self-Restart for Recovery
+# -----------------------------------------------------------------------------
+
+def _get_restart_count() -> int:
+    """Get the current restart count from environment or return 0."""
+    try:
+        return int(os.environ.get("CYBERDRIVER_RESTART_COUNT", "0"))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _restart_cyberdriver_process() -> bool:
+    """
+    Restart cyberdriver by spawning a new process and exiting the current one.
+    
+    This is the equivalent of the user manually running:
+        cyberdriver stop
+        cyberdriver join [all original flags]
+    
+    This is used to recover from situations where _MEI files are deleted or corrupted,
+    as a fresh process will extract to a completely new _MEI directory.
+    
+    The function:
+    1. Removes the pid file (so new process doesn't think we're already running)
+    2. Spawns a new cyberdriver process with the exact same command-line arguments
+    3. Exits the current process
+    
+    Safety: After MAX_RESTARTS consecutive restarts without a successful long connection,
+    the process will exit rather than restart again to prevent infinite loops.
+    
+    Returns:
+        True if we're about to exit (new process spawned successfully)
+        False if spawn failed and we should continue in current process
+        
+    Note: If successful, this function exits the process and never returns.
+    """
+    MAX_RESTARTS = 5  # Maximum consecutive restarts before giving up
+    
+    restart_count = _get_restart_count() + 1
+    
+    # Check if we've exceeded max restarts
+    if restart_count > MAX_RESTARTS:
+        print(f"\n{'='*60}")
+        print(f"❌ RESTART LIMIT REACHED")
+        print(f"{'='*60}")
+        print(f"\nCyberdriver has restarted {restart_count - 1} times without establishing")
+        print(f"a stable connection. This may indicate:")
+        print(f"   1. The Cyberdesk API is down for extended maintenance")
+        print(f"   2. Network connectivity issues")
+        print(f"   3. Persistent _MEI folder corruption (try reinstalling)")
+        print(f"\nTo restart manually, run: cyberdriver join --secret YOUR_KEY")
+        print(f"{'='*60}\n")
+        sys.exit(1)
+    
+    print(f"\n{'='*60}")
+    print(f"🔄 RESTARTING CYBERDRIVER (attempt {restart_count}/{MAX_RESTARTS})")
+    print(f"{'='*60}")
+    print(f"Spawning fresh process to recover from potential _MEI issues...")
+    print(f"This is equivalent to: cyberdriver stop && cyberdriver join ...")
+    print(f"{'='*60}\n")
+    
+    # Build the command to restart with the exact same arguments
+    if getattr(sys, 'frozen', False):
+        # Running as frozen PyInstaller exe
+        cmd = [sys.executable] + sys.argv[1:]
+    else:
+        # Running as Python script
+        cmd = [sys.executable, os.path.abspath(__file__)] + sys.argv[1:]
+    
+    # Log the restart for debugging
+    try:
+        log_path = get_config_dir() / "restart-history.log"
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n[{datetime.now().isoformat()}] Restarting cyberdriver (attempt {restart_count}/{MAX_RESTARTS})\n")
+            f.write(f"Command: {' '.join(cmd)}\n")
+            f.write(f"PID (old): {os.getpid()}\n")
+            f.write(f"_MEIPASS: {getattr(sys, '_MEIPASS', 'N/A')}\n")
+    except Exception:
+        pass
+    
+    # Remove pid file so new process doesn't think we're still running
+    # This is equivalent to what "cyberdriver stop" does
+    _remove_pid_file_safely()
+    
+    if platform.system() == "Windows":
+        # On Windows, we need to spawn a truly hidden process.
+        # Direct subprocess flags (DETACHED_PROCESS, CREATE_NO_WINDOW) have compatibility
+        # issues with PyInstaller frozen executables - they still show a window!
+        # The only reliable approach is using VBScript via wscript to launch hidden.
+        
+        # Determine if user originally ran with --foreground
+        is_foreground = "--foreground" in sys.argv or "-f" in sys.argv
+        
+        try:
+            if is_foreground:
+                # Foreground mode: spawn with visible console so user sees output
+                # Use CREATE_NEW_CONSOLE so the new process gets its own console
+                CREATE_NEW_CONSOLE = 0x00000010
+                CREATE_NEW_PROCESS_GROUP = 0x00000200
+                
+                env = os.environ.copy()
+                for k in list(env.keys()):
+                    if k == "_MEIPASS2" or k.startswith("_PYI_"):
+                        env.pop(k, None)
+                # CRITICAL: Clear the MEI corruption flag so new process doesn't immediately restart again
+                env.pop("CYBERDRIVER_MEI_CORRUPTED", None)
+                env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+                env["CYBERDRIVER_RESTART_COUNT"] = str(restart_count)
+                env["CYBERDRIVER_DETACHED"] = "1"
+                
+                proc = subprocess.Popen(
+                    cmd,
+                    creationflags=CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
+                    env=env,
+                    close_fds=True,
+                )
+                
+                time.sleep(0.5)
+                if proc.poll() is not None:
+                    print(f"⚠️  Warning: New process exited immediately with code {proc.returncode}")
+            else:
+                # Background mode: use VBScript + PowerShell for truly hidden launch
+                # This is the same approach used by _windows_relaunch_detached()
+                
+                config_dir = get_config_dir()
+                config_dir.mkdir(parents=True, exist_ok=True)
+                
+                exe_path = cmd[0]
+                exe_args = cmd[1:] if len(cmd) > 1 else []
+                args_for_ps = subprocess.list2cmdline(exe_args)
+                
+                # PowerShell script that uses .NET ProcessStartInfo for hidden launch
+                ps_script_path = config_dir / "restart-hidden.ps1"
+                ps_content = f'''# Restart launcher - uses .NET for explicit env control
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = "{exe_path}"
+$psi.Arguments = '{args_for_ps}'
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
+
+# Clear PyInstaller environment variables
+$psi.EnvironmentVariables.Remove("_MEIPASS2")
+$psi.EnvironmentVariables.Remove("_PYI_APPLICATION_HOME_DIR") 
+$psi.EnvironmentVariables.Remove("_PYI_PARENT_PROCESS_LEVEL")
+
+# CRITICAL: Clear MEI corruption flag so new process doesn't immediately restart again
+$psi.EnvironmentVariables.Remove("CYBERDRIVER_MEI_CORRUPTED")
+
+# CRITICAL: Force fresh _MEI extraction
+$psi.EnvironmentVariables["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+
+# Pass restart count to detect infinite loops
+$psi.EnvironmentVariables["CYBERDRIVER_RESTART_COUNT"] = "{restart_count}"
+
+# Tell child it's already detached
+$psi.EnvironmentVariables["CYBERDRIVER_DETACHED"] = "1"
+
+# Start hidden
+[System.Diagnostics.Process]::Start($psi) | Out-Null
+'''
+                
+                with open(ps_script_path, "w", encoding="utf-8") as f:
+                    f.write(ps_content)
+                
+                # VBScript to run PowerShell hidden (wscript is the only truly silent launcher)
+                vbs_path = config_dir / "restart-hidden.vbs"
+                ps_path_escaped = str(ps_script_path).replace('"', '""')
+                vbs_content = f'''Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run "powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{ps_path_escaped}""", 0, False
+'''
+                
+                with open(vbs_path, "w", encoding="utf-8") as f:
+                    f.write(vbs_content)
+                
+                # Prepare clean environment for wscript
+                wscript_env = os.environ.copy()
+                for k in list(wscript_env.keys()):
+                    if k == "_MEIPASS2" or k.startswith("_PYI_"):
+                        wscript_env.pop(k, None)
+                # Clear MEI corruption flag (the PS script handles this for the child, but be safe)
+                wscript_env.pop("CYBERDRIVER_MEI_CORRUPTED", None)
+                
+                # Reset DLL search path
+                try:
+                    import ctypes
+                    ctypes.windll.kernel32.SetDllDirectoryW(None)
+                except Exception:
+                    pass
+                
+                # Run VBScript via wscript (silent)
+                CREATE_NO_WINDOW = 0x08000000
+                result = subprocess.run(
+                    ["wscript", "//NoLogo", str(vbs_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    creationflags=CREATE_NO_WINDOW,
+                    env=wscript_env,
+                )
+                
+                if result.returncode != 0:
+                    raise RuntimeError(f"VBScript launcher failed: {result.stderr or result.stdout}")
+                
+                # Brief pause to let child start
+                time.sleep(0.5)
+            
+            # Exit the current process
+            print("New process spawned. Exiting current process...")
+            os._exit(0)
+            
+        except Exception as e:
+            print(f"\n{'='*60}")
+            print(f"❌ FAILED TO SPAWN NEW PROCESS")
+            print(f"{'='*60}")
+            print(f"Error: {e}")
+            print(f"\nCyberdriver will continue running in current process.")
+            print(f"You may need to manually restart with: cyberdriver stop && cyberdriver join ...")
+            print(f"{'='*60}\n")
+            # Don't exit - let the current process continue
+            return
+    else:
+        # On Unix, we can use execv to replace the current process entirely
+        # This is cleaner as it reuses the same PID and console
+        
+        # Clear PyInstaller environment variables
+        for k in list(os.environ.keys()):
+            if k == "_MEIPASS2" or k.startswith("_PYI_"):
+                del os.environ[k]
+        # CRITICAL: Clear MEI corruption flag so new process doesn't immediately restart again
+        os.environ.pop("CYBERDRIVER_MEI_CORRUPTED", None)
+        os.environ["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        
+        # Pass restart count to child so we can detect infinite restart loops
+        os.environ["CYBERDRIVER_RESTART_COUNT"] = str(restart_count)
+        
+        # Tell the new process it's already "detached" so it doesn't try to fork again
+        os.environ["CYBERDRIVER_DETACHED"] = "1"
+        
+        # Replace current process with new one
+        # This never returns - the current process is replaced
+        try:
+            print("Replacing current process with fresh instance...")
+            os.execv(cmd[0], cmd)
+        except Exception as e:
+            print(f"\n{'='*60}")
+            print(f"❌ FAILED TO EXEC NEW PROCESS")
+            print(f"{'='*60}")
+            print(f"Error: {e}")
+            print(f"\nCyberdriver will continue running in current process.")
+            print(f"You may need to manually restart with: cyberdriver stop && cyberdriver join ...")
+            print(f"{'='*60}\n")
+            # Don't exit - let the current process continue
+            return
 
 
 # -----------------------------------------------------------------------------
@@ -3492,21 +4139,49 @@ class TunnelClient:
         if total_collected > 0:
             debug_logger.debug("CLEANUP", f"GC collected {total_collected} objects")
         
+        # 4. Health check - detect if _MEI files have been deleted
+        # This helps diagnose the mysterious file deletion bug
+        check_mei_health(f"before_retry (attempt #{self._connection_attempt + 1})")
+        
     async def run(self):
         """Run the tunnel with exponential backoff reconnection.
         
-        IMPORTANT: Each retry does full cleanup to mimic Ctrl+C + restart:
-        - Fresh SSL context (in connect_with_headers)
-        - Reset ThreadPoolExecutor
-        - Clear caches
-        - Garbage collection
+        On connection failure:
+        1. First, try exponential backoff (1s → 2s → 4s → 8s → 16s)
+        2. If we hit max backoff 3 times in a row, do a full process restart
+        
+        The full restart is equivalent to the user manually running:
+            cyberdriver stop && cyberdriver join [same flags]
+        
+        This heals from situations where _MEI files are deleted or corrupted,
+        as a fresh process will extract to a completely new _MEI directory.
+        
+        Exceptions that don't retry:
+        - Authentication errors (4001/403): Exit immediately
+        - Task cancellation: Propagate immediately
+        
+        Special handling:
+        - Rate limit (4008): Wait specified duration, then continue backoff
         """
         import random
         
         sleep_time = self.min_sleep
+        failures_at_max_sleep = 0  # Track consecutive failures at max backoff
+        MAX_FAILURES_BEFORE_RESTART = 3  # After 3 failures at max backoff, do hard restart
         
         while True:
             connection_start = time.time()
+            
+            # Check if MEI corruption was detected by the API error handler
+            # If so, trigger immediate restart
+            if os.environ.get("CYBERDRIVER_MEI_CORRUPTED") == "1":
+                print(f"\n{'='*60}")
+                print(f"[CRITICAL] MEI corruption detected by API - triggering restart")
+                print(f"{'='*60}")
+                os.environ.pop("CYBERDRIVER_MEI_CORRUPTED", None)
+                await asyncio.sleep(1.0)
+                if not _restart_cyberdriver_process():
+                    print("Restart failed - continuing with current process")
             
             # Full cleanup before EVERY connection attempt
             # This mimics what happens when you Ctrl+C and restart
@@ -3517,6 +4192,7 @@ class TunnelClient:
                 # This line is never reached - _connect_and_run always raises
                 sleep_time = self.min_sleep
                 self._consecutive_failures = 0
+                failures_at_max_sleep = 0
             except asyncio.CancelledError:
                 # Allow task cancellation to stop the tunnel immediately
                 raise
@@ -3545,6 +4221,11 @@ class TunnelClient:
                 # Short-lived connections indicate an ongoing problem
                 if connection_duration > 10:
                     self._consecutive_failures = 0
+                    failures_at_max_sleep = 0
+                    # Reset restart count since we had a successful long connection
+                    # This clears the CYBERDRIVER_RESTART_COUNT env var
+                    if "CYBERDRIVER_RESTART_COUNT" in os.environ:
+                        del os.environ["CYBERDRIVER_RESTART_COUNT"]
                 else:
                     self._consecutive_failures += 1
                     debug_logger.warning("CONNECTION", f"Connection only lasted {connection_duration:.1f}s",
@@ -3594,6 +4275,7 @@ class TunnelClient:
                     await asyncio.sleep(wait_seconds)
                     # Reset sleep time after rate limit wait
                     sleep_time = self.min_sleep
+                    failures_at_max_sleep = 0
                     continue
                 
                 # For other close codes, continue with exponential backoff
@@ -3616,15 +4298,30 @@ class TunnelClient:
                     print("   1. Check your internet connection")
                     print("   2. Verify the server is accessible")
                 
-                # Add random jitter (0-30%) to avoid thundering herd and give network stack time to clean up
+                # Check if we've exhausted backoff and should do a hard restart
+                if sleep_time >= self.max_sleep:
+                    failures_at_max_sleep += 1
+                    if failures_at_max_sleep >= MAX_FAILURES_BEFORE_RESTART:
+                        print(f"\n{'='*60}")
+                        print(f"⚠️  Exponential backoff exhausted ({failures_at_max_sleep} failures at max backoff)")
+                        print(f"{'='*60}")
+                        print(f"\nPerforming full process restart to recover...")
+                        await asyncio.sleep(1.0)  # Brief pause before restart
+                        if not _restart_cyberdriver_process():
+                            # Spawn failed - reset counters and continue retrying in this process
+                            failures_at_max_sleep = 0
+                            sleep_time = self.min_sleep
+                            continue
+                
+                # Add random jitter (0-30%) to avoid thundering herd
                 jittered_sleep = sleep_time * (1 + random.uniform(0, 0.3))
                 
                 print(f"\n{'='*60}")
-                print(f"Retrying in {jittered_sleep:.1f} seconds...")
+                print(f"Retrying in {jittered_sleep:.1f} seconds... (attempt {self._consecutive_failures + 1})")
+                if sleep_time >= self.max_sleep:
+                    print(f"(Hard restart after {MAX_FAILURES_BEFORE_RESTART - failures_at_max_sleep} more failures at max backoff)")
                 print(f"{'='*60}\n")
                 
-                # Note: _consecutive_failures is already handled above based on connection duration
-                # (reset to 0 if >10s, incremented if <10s)
                 await asyncio.sleep(jittered_sleep)
                 sleep_time = min(sleep_time * 2, self.max_sleep)
                 
@@ -3649,17 +4346,18 @@ class TunnelClient:
                     print("\nPlease check:")
                     print("   1. Your API key is correct (from Cyberdesk dashboard)")
                     print("   2. The API key hasn't been regenerated recently")
+                    # Exit for auth errors - don't retry
+                    sys.exit(1)
                 
                 elif "errno 2" in error_msg or "no such file or directory" in error_msg:
-                    # This is a Windows-specific error that occurs when the server closes
-                    # the connection immediately after the handshake completes
-                    print("\n⚠️  Connection Closed by Server")
-                    print("\nThe server accepted the connection but then closed it.")
-                    print("\nPossible causes:")
-                    print("   1. Server is temporarily overloaded or restarting")
-                    print("   2. Network proxy/firewall interference")
-                    print("   3. Rapid reconnection attempts triggered rate limiting")
-                    print("\nThis usually resolves after a few retries.")
+                    # This could be _MEI folder corruption - do immediate restart
+                    print("\n⚠️  File Not Found Error (possibly _MEI folder issue)")
+                    print("\nThis may indicate the PyInstaller extraction folder was corrupted.")
+                    print("Performing immediate restart to recover...")
+                    await asyncio.sleep(1.0)
+                    if not _restart_cyberdriver_process():
+                        # Spawn failed - continue retrying in this process
+                        print("Restart failed. Continuing with exponential backoff...")
                     
                 else:
                     print("\n⚠️  Unknown Connection Error")
@@ -3668,22 +4366,40 @@ class TunnelClient:
                     print("   2. Install TLS certificates: https://github.com/cyberdesk-hq/cyberdriver#tls-certificate-errors")
                     print("   3. Check your internet connection")
                 
-                # Add random jitter (0-30%) to avoid thundering herd and give network stack time to clean up
-                jittered_sleep = sleep_time * (1 + random.uniform(0, 0.3))
-                
-                print(f"\n{'='*60}")
-                print(f"Retrying in {jittered_sleep:.1f} seconds...")
-                print(f"{'='*60}\n")
-                
-                # Apply same connection duration logic as ConnectionClosed handler
-                # Only count as failure if connection was short-lived
+                # Track failures for backoff exhaustion
                 connection_duration = time.time() - connection_start
                 if connection_duration > 10:
                     self._consecutive_failures = 0
+                    failures_at_max_sleep = 0
+                    # Reset restart count since we had a successful long connection
+                    if "CYBERDRIVER_RESTART_COUNT" in os.environ:
+                        del os.environ["CYBERDRIVER_RESTART_COUNT"]
                 else:
                     self._consecutive_failures += 1
-                    debug_logger.warning("CONNECTION", f"Connection only lasted {connection_duration:.1f}s",
-                                        consecutive_failures=self._consecutive_failures)
+                
+                # Check if we've exhausted backoff and should do a hard restart
+                if sleep_time >= self.max_sleep:
+                    failures_at_max_sleep += 1
+                    if failures_at_max_sleep >= MAX_FAILURES_BEFORE_RESTART:
+                        print(f"\n{'='*60}")
+                        print(f"⚠️  Exponential backoff exhausted ({failures_at_max_sleep} failures at max backoff)")
+                        print(f"{'='*60}")
+                        print(f"\nPerforming full process restart to recover...")
+                        await asyncio.sleep(1.0)
+                        if not _restart_cyberdriver_process():
+                            # Spawn failed - reset counters and continue retrying in this process
+                            failures_at_max_sleep = 0
+                            sleep_time = self.min_sleep
+                            continue
+                
+                # Add random jitter (0-30%)
+                jittered_sleep = sleep_time * (1 + random.uniform(0, 0.3))
+                
+                print(f"\n{'='*60}")
+                print(f"Retrying in {jittered_sleep:.1f} seconds... (attempt {self._consecutive_failures + 1})")
+                if sleep_time >= self.max_sleep:
+                    print(f"(Hard restart after {MAX_FAILURES_BEFORE_RESTART - failures_at_max_sleep} more failures at max backoff)")
+                print(f"{'='*60}\n")
                 
                 await asyncio.sleep(jittered_sleep)
                 sleep_time = min(sleep_time * 2, self.max_sleep)
@@ -3741,6 +4457,10 @@ class TunnelClient:
                 print(f"{green}✓{reset} {white}{connected_msg}{reset}")
             else:
                 print(f"✓ {connected_msg}")
+            
+            # Health check on successful connection (baseline for later comparison)
+            check_mei_health(f"after_connect (attempt #{self._connection_attempt})")
+            
             # Optionally re-print countdown immediately after connect
             try:
                 if self.keepalive_manager is not None and hasattr(self.keepalive_manager, "_print_countdown"):
@@ -3804,6 +4524,11 @@ class TunnelClient:
                     
                     # Also log resource stats on failure to help diagnose
                     debug_logger.resource_stats()
+                    
+                    # CRITICAL: Check if _MEI files were deleted (errno 2 = ENOENT)
+                    # This diagnostic helps catch the mysterious file deletion bug
+                    if error_code == 2:  # ENOENT - No such file or directory
+                        check_mei_health(f"OSError ENOENT during websocket message loop")
                     
                     # Always print duration for immediate failures (< 5 seconds)
                     if connection_duration < 5.0:
@@ -3952,7 +4677,61 @@ class TunnelClient:
             duration_ms = (time.time() - request_start) * 1000
             # Ensure we always have a meaningful error message
             error_msg = str(e) if str(e) else f"{type(e).__name__}: (no details)"
+            error_type = type(e).__name__
             debug_logger.error("REQUEST", f"Request failed: {error_msg}", method=method, path=path, duration_ms=f"{duration_ms:.1f}ms")
+            
+            # Log to console with full details
+            timestamp = datetime.now().isoformat()
+            print(f"\n{'='*60}", flush=True)
+            print(f"[TUNNEL FORWARD ERROR] {timestamp}", flush=True)
+            print(f"Error type: {error_type}", flush=True)
+            print(f"Error message: {error_msg}", flush=True)
+            print(f"Method: {method}", flush=True)
+            print(f"Path: {path}", flush=True)
+            print(f"URL: {url}", flush=True)
+            print(f"{'='*60}\n", flush=True)
+            
+            # Log to file with full traceback
+            try:
+                log_path = get_config_dir() / "tunnel-forward-errors.log"
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(f"\n[{timestamp}] TUNNEL FORWARD ERROR\n")
+                    f.write(f"Type: {error_type}\n")
+                    f.write(f"Message: {error_msg}\n")
+                    f.write(f"Method: {method}\n")
+                    f.write(f"Path: {path}\n")
+                    f.write(f"URL: {url}\n")
+                    import traceback
+                    f.write(f"Traceback:\n{traceback.format_exc()}\n")
+            except Exception:
+                pass
+            
+            # Check for MEI corruption indicators
+            is_file_error = (
+                isinstance(e, FileNotFoundError) or
+                isinstance(e, OSError) and getattr(e, 'errno', None) == 2 or
+                "errno 2" in error_msg.lower() or
+                "no such file or directory" in error_msg.lower() or
+                "cannot find the file" in error_msg.lower()
+            )
+            
+            if is_file_error:
+                print(f"[TUNNEL] Detected file-not-found error - triggering immediate restart...", flush=True)
+                # Set flag for main loop to trigger restart
+                os.environ["CYBERDRIVER_MEI_CORRUPTED"] = "1"
+                try:
+                    log_path = get_config_dir() / "mei-corruption-detected.log"
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(f"\n[{timestamp}] MEI corruption detected in tunnel forward\n")
+                        f.write(f"Error: {error_msg}\n")
+                        f.write(f"Path: {path}\n")
+                except Exception:
+                    pass
+                
+                # Raise a special exception to break out of the WebSocket loop immediately
+                # This prevents waiting for more retries before restarting
+                raise RuntimeError(f"MEI_CORRUPTION_DETECTED: {error_msg}")
+            
             result = {
                 "status": 500,
                 "headers": {"content-type": "text/plain"},
@@ -4715,25 +5494,15 @@ def run_coords_capture():
             
         # Only capture right-click (button.right)
         if pressed and button == mouse.Button.right:
-            # Print captured coordinates with colors
-            if platform.system() == "Windows":
-                try:
-                    import ctypes
-                    kernel32 = ctypes.windll.kernel32
-                    kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
-                    green = '\033[92m'
-                    white = '\033[97m'
-                    blue = '\033[94m'
-                    reset = '\033[0m'
-                    print(f"\n{green}✓{reset} {white}Click captured:{reset} X={blue}{x}{reset}, Y={blue}{y}{reset}\n")
-                except:
-                    print(f"\n✓ Click captured: X={x}, Y={y}\n")
-            else:
+            # Print captured coordinates with colors (if terminal supports it)
+            if _should_use_color():
                 green = '\033[92m'
                 white = '\033[97m'
                 blue = '\033[94m'
                 reset = '\033[0m'
                 print(f"\n{green}✓{reset} {white}Click captured:{reset} X={blue}{x}{reset}, Y={blue}{y}{reset}\n")
+            else:
+                print(f"\n✓ Click captured: X={x}, Y={y}\n")
             
             # Print usage example
             print(f"Use with keepalive:")
@@ -4777,8 +5546,43 @@ def signal_handler(signum, frame):
     sys.exit(0)
 
 
+def _stdout_supports_unicode():
+    """Check if stdout encoding supports Unicode characters."""
+    try:
+        encoding = getattr(sys.stdout, 'encoding', None) or 'ascii'
+        # Test if we can encode a box-drawing character
+        '█'.encode(encoding)
+        return True
+    except (UnicodeEncodeError, LookupError):
+        return False
+
+
+def print_banner_ascii(mode="default"):
+    """Print ASCII-only banner for terminals that don't support Unicode (e.g., PowerShell ISE)."""
+    print("Welcome to Cyberdriver!")
+    print()
+    
+    if mode == "connecting":
+        print("Connecting to Cyberdesk Cloud...")
+    else:
+        print("Get started:")
+        print("-> Join: cyberdriver join --secret YOUR_API_KEY")
+        print("-> Keepalive: cyberdriver join --secret YOUR_API_KEY --keepalive")
+        print("-> Black screen recovery: cyberdriver join --secret YOUR_API_KEY --black-screen-recovery")
+        print("-> Persistent display: cyberdriver join --secret YOUR_API_KEY --add-persistent-display")
+    
+    print("-> Run -h for help")
+    print("-> Visit https://docs.cyberdesk.io for documentation")
+    print()
+
+
 def print_banner_no_color(mode="default"):
     """Print banner without colors for terminals that don't support ANSI."""
+    # Check if stdout supports Unicode; if not, use ASCII fallback
+    if not _stdout_supports_unicode():
+        print_banner_ascii(mode)
+        return
+    
     banner = [
         " ██████╗██╗   ██╗██████╗ ███████╗██████╗ ██████╗ ██████╗ ██╗██╗   ██╗███████╗██████╗ ",
         "██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗██╔══██╗██╔══██╗██║██║   ██║██╔════╝██╔══██╗",
@@ -4817,6 +5621,12 @@ def print_banner(mode="default"):
     # avoid ANSI codes so logs remain readable in files.
     if os.environ.get("CYBERDRIVER_NO_COLOR") or os.environ.get("CYBERDRIVER_STDIO_LOG"):
         print_banner_no_color(mode)
+        return
+
+    # Check if stdout supports Unicode; if not, use ASCII fallback
+    # This handles PowerShell ISE and other legacy terminals using cp1252/charmap encoding
+    if not _stdout_supports_unicode():
+        print_banner_ascii(mode)
         return
 
     # Enable Windows terminal colors if needed
@@ -4924,16 +5734,222 @@ def cleanup_old_mei_folders() -> None:
         print(f"[INFO] Cleaned up {cleaned_count} old temporary folder(s)")
 
 
+def check_mei_health(context: str = "") -> bool:
+    """
+    Check if critical files in _MEI folder still exist.
+    
+    This diagnostic function helps catch when files are mysteriously deleted
+    from PyInstaller's extraction folder during runtime.
+    
+    Args:
+        context: Description of when/why this check is being called
+        
+    Returns:
+        True if healthy, False if files are missing
+    """
+    if not getattr(sys, 'frozen', False) or platform.system() != "Windows":
+        return True
+    
+    meipass = getattr(sys, '_MEIPASS', None)
+    if not meipass:
+        return True
+    
+    # Critical directories that should always exist in the _MEI extraction
+    # Note: We check for directories that PyInstaller ACTUALLY extracts as separate folders
+    # Some packages (like starlette, httpx) are bundled differently and don't appear as dirs
+    # pydantic v2 uses pydantic_core as the compiled core, not a pydantic directory
+    critical_dirs = ['certifi', 'fastapi', 'websockets', 'pydantic_core', 'uvicorn']
+    
+    missing = []
+    for d in critical_dirs:
+        dir_path = os.path.join(meipass, d)
+        if not os.path.exists(dir_path):
+            missing.append(d)
+    
+    if missing:
+        from datetime import datetime
+        timestamp = datetime.now().isoformat()
+        
+        # Get list of existing directories for debugging
+        existing = []
+        try:
+            existing = [f for f in os.listdir(meipass) if os.path.isdir(os.path.join(meipass, f))]
+        except Exception:
+            pass
+        
+        # Print to console
+        print(f"\n{'='*70}")
+        print(f"[CRITICAL] _MEI HEALTH CHECK FAILED at {timestamp}")
+        print(f"[CRITICAL] Context: {context}")
+        print(f"[CRITICAL] _MEIPASS: {meipass}")
+        print(f"[CRITICAL] Missing directories: {missing}")
+        print(f"[CRITICAL] Existing directories ({len(existing)}): {existing[:20]}{'...' if len(existing) > 20 else ''}")
+        print(f"{'='*70}\n")
+        
+        # Log to persistent file for post-mortem analysis
+        try:
+            log_path = get_config_dir() / "mei-health-failures.log"
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n{'='*70}\n")
+                f.write(f"Timestamp: {timestamp}\n")
+                f.write(f"Context: {context}\n")
+                f.write(f"_MEIPASS: {meipass}\n")
+                f.write(f"Missing directories: {missing}\n")
+                f.write(f"Existing directories ({len(existing)}): {existing}\n")
+                f.write(f"PID: {os.getpid()}\n")
+                
+                # Check for Windows Defender quarantine hints (if Defender is available)
+                try:
+                    CREATE_NO_WINDOW = 0x08000000
+                    
+                    # First check if Defender cmdlets are available
+                    cmdlet_check = subprocess.run(
+                        ["powershell", "-NoProfile", "-Command", 
+                         "Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue"],
+                        capture_output=True, text=True, timeout=5,
+                        creationflags=CREATE_NO_WINDOW
+                    )
+                    
+                    if cmdlet_check.returncode == 0 and cmdlet_check.stdout.strip():
+                        # Defender cmdlets available - check status
+                        result = subprocess.run(
+                            ["powershell", "-NoProfile", "-Command", 
+                             "Get-MpComputerStatus | Select-Object -Property RealTimeProtectionEnabled,AntivirusEnabled | ConvertTo-Json"],
+                            capture_output=True, text=True, timeout=5,
+                            creationflags=CREATE_NO_WINDOW
+                        )
+                        if result.returncode == 0:
+                            f.write(f"Defender status: {result.stdout.strip()}\n")
+                        
+                        # Check Defender threat history (last 24 hours)
+                        result = subprocess.run(
+                            ["powershell", "-NoProfile", "-Command",
+                             "Get-MpThreatDetection | Where-Object { $_.InitialDetectionTime -gt (Get-Date).AddHours(-24) } | Select-Object -Property ThreatID,ProcessName,Resources | ConvertTo-Json"],
+                            capture_output=True, text=True, timeout=10,
+                            creationflags=CREATE_NO_WINDOW
+                        )
+                        if result.returncode == 0 and result.stdout.strip():
+                            f.write(f"Recent Defender detections: {result.stdout.strip()}\n")
+                    else:
+                        f.write("Windows Defender cmdlets not available (may have third-party AV)\n")
+                except Exception as defender_err:
+                    f.write(f"Could not check Defender status: {defender_err}\n")
+                
+                f.write(f"{'='*70}\n")
+        except Exception as log_err:
+            print(f"[CRITICAL] Could not write to MEI health log: {log_err}")
+        
+        return False
+    
+    return True
+
+
+def add_defender_exclusion() -> bool:
+    """
+    Attempt to add Windows Defender exclusion for PyInstaller extraction directory.
+    
+    This helps prevent Defender from quarantining/deleting files from the _MEI folder
+    during runtime, which is a known issue with PyInstaller executables.
+    
+    Returns:
+        True if exclusion was added (or already exists), False if failed (e.g., no admin, no Defender)
+    """
+    if platform.system() != "Windows" or not getattr(sys, 'frozen', False):
+        return False
+    
+    meipass = getattr(sys, '_MEIPASS', None)
+    if not meipass:
+        return False
+    
+    # The parent directory where all _MEI folders live (e.g., %LOCALAPPDATA%\.cyberdriver\_pyinstaller)
+    mei_parent = os.path.dirname(meipass)
+    CREATE_NO_WINDOW = 0x08000000
+    
+    try:
+        # First check if Windows Defender cmdlets are available
+        # This can fail on Windows Server, or systems with third-party AV that replaced Defender
+        check_cmdlet = 'Get-Command Get-MpPreference -ErrorAction SilentlyContinue'
+        cmdlet_check = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", check_cmdlet],
+            capture_output=True, text=True, timeout=5,
+            creationflags=CREATE_NO_WINDOW
+        )
+        
+        if cmdlet_check.returncode != 0 or not cmdlet_check.stdout.strip():
+            # Defender cmdlets not available - this is normal on some Windows configurations
+            # Don't log as an error since it's not actionable
+            return False
+        
+        # Check if exclusion already exists
+        check_cmd = f'(Get-MpPreference).ExclusionPath -contains "{mei_parent}"'
+        check_result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", check_cmd],
+            capture_output=True, text=True, timeout=10,
+            creationflags=CREATE_NO_WINDOW
+        )
+        
+        if check_result.returncode == 0 and "True" in check_result.stdout:
+            # Exclusion already exists
+            return True
+        
+        # Try to add exclusion (requires admin privileges)
+        add_cmd = f'Add-MpExclusion -Path "{mei_parent}"'
+        add_result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", add_cmd],
+            capture_output=True, text=True, timeout=10,
+            creationflags=CREATE_NO_WINDOW
+        )
+        
+        if add_result.returncode == 0:
+            print(f"[INFO] Added Windows Defender exclusion for: {mei_parent}")
+            return True
+        else:
+            # Likely failed due to lack of admin privileges - this is expected
+            # Only log if it's NOT a "cmdlet not found" error (we already checked for that)
+            error_text = add_result.stderr.lower()
+            if "not recognized" not in error_text and "commandnotfound" not in error_text:
+                try:
+                    log_path = get_config_dir() / "defender-exclusion.log"
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(f"\n[{datetime.now().isoformat()}] Failed to add Defender exclusion\n")
+                        f.write(f"Path: {mei_parent}\n")
+                        f.write(f"Error: {add_result.stderr}\n")
+                except:
+                    pass
+            return False
+            
+    except subprocess.TimeoutExpired:
+        return False
+    except Exception:
+        return False
+
+
 def main():
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Clean up old _MEI folders from previous runs (Windows only, PyInstaller frozen only)
-    cleanup_old_mei_folders()
+    # NOTE: cleanup_old_mei_folders() is intentionally NOT called here.
+    # It's called AFTER the idempotency check to prevent a new instance from
+    # deleting the _MEI folder of an already-running instance before we detect it.
 
     # If we were launched in "detached/invisible" mode, redirect stdout/stderr to a log file.
     _setup_detached_stdio_if_configured()
+    
+    # Log PyInstaller environment for diagnostics (helps debug _MEI folder issues)
+    # Only log in detached/background mode (logging to file) to avoid cluttering terminal output
+    if getattr(sys, 'frozen', False) and platform.system() == "Windows" and os.environ.get("CYBERDRIVER_STDIO_LOG"):
+        meipass = getattr(sys, '_MEIPASS', 'N/A')
+        pyi_reset = os.environ.get('PYINSTALLER_RESET_ENVIRONMENT', 'not set')
+        pyi_home = os.environ.get('_PYI_APPLICATION_HOME_DIR', 'not set')
+        pyi_level = os.environ.get('_PYI_PARENT_PROCESS_LEVEL', 'not set')
+        print(f"[PYINSTALLER] _MEIPASS={meipass}")
+        print(f"[PYINSTALLER] PYINSTALLER_RESET_ENVIRONMENT={pyi_reset}")
+        print(f"[PYINSTALLER] _PYI_APPLICATION_HOME_DIR={pyi_home}")
+        print(f"[PYINSTALLER] _PYI_PARENT_PROCESS_LEVEL={pyi_level}")
+        
+        # Initial health check at startup
+        check_mei_health("startup")
     
     # Print banner if no arguments or help requested
     if len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] in ['-h', '--help']):
@@ -5024,6 +6040,7 @@ def main():
     join_parser.add_argument("--interactive", action="store_true", help="Interactive CLI to Disable/Re-enable without exiting")
     join_parser.add_argument("--register-as-keepalive-for", type=str, default=None, help="Register this instance as the remote keepalive (host) for MAIN_MACHINE_ID")
     join_parser.add_argument("--debug", action="store_true", help="Enable debug logging to ~/.cyberdriver/logs/ (daily log files)")
+    join_parser.add_argument("--experimental-space", action="store_true", help="Send space key via VK code instead of scan code (may fix issues with some apps like Cerner)")
     join_parser.add_argument(
         "--foreground",
         action="store_true",
@@ -5079,10 +6096,12 @@ def main():
         sys.exit(0)
 
     if args.command == "stop":
+        print("Stopping Cyberdriver...")
         sys.exit(stop_running_instance(force=bool(getattr(args, "force", False)),
                                        timeout_seconds=float(getattr(args, "timeout", 10.0))))
 
     if args.command == "logs":
+        print("Loading Cyberdriver logs...")
         default_path = _default_stdio_log_path()
         log_path = pathlib.Path(getattr(args, "path", None) or default_path)
         if not log_path.exists():
@@ -5097,18 +6116,68 @@ def main():
         _follow_log_file(log_path)
         sys.exit(0)
 
-    # Idempotency: if join is invoked while Cyberdriver is already running, do not
-    # start another instance. This applies to both background (default) and --foreground.
+    # If join is invoked while Cyberdriver is already running, stop the old instance
+    # and start a new one with the user's current flags. This makes the UX more intuitive.
     if args.command == "join" and not getattr(args, "_detached_child", False):
         info = _get_running_instance_pid_info()
         if info:
-            pid_int = int(info.get("pid", -1))
+            old_pid = int(info.get("pid", -1))
+            old_argv = info.get("argv", [])
+            timestamp = datetime.now().isoformat()
+            
             print_banner(mode="connecting")
-            print(f"Cyberdriver is already running (PID {pid_int}).")
-            print(f"Logs: {_default_stdio_log_path()}")
-            _print_prominent_stop_hint()
-            print("\nIf you want to restart with different flags, run `cyberdriver stop` first.")
-            sys.exit(0)
+            # Use yellow/warning color for visibility (if terminal supports it)
+            if _should_use_color():
+                print(f"\033[93mCyberdriver is already running (PID {old_pid}).\033[0m")
+                print(f"\033[93mStopping old instance and starting new one with current flags...\033[0m")
+            else:
+                print(f"Cyberdriver is already running (PID {old_pid}).")
+                print(f"Stopping old instance and starting new one with current flags...")
+            
+            # Log this replacement event
+            try:
+                log_path = get_config_dir() / "instance-replacement.log"
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(f"\n[{timestamp}] Replacing running instance\n")
+                    f.write(f"Old PID: {old_pid}\n")
+                    f.write(f"Old argv: {' '.join(str(a) for a in old_argv)}\n")
+                    f.write(f"New argv: {' '.join(sys.argv)}\n")
+                    f.write(f"New PID: {os.getpid()}\n")
+            except Exception:
+                pass
+            
+            # Stop the old instance (reuse existing stop logic but quieter)
+            stop_result = _stop_instance_for_replacement(old_pid, info)
+            if stop_result == 0:
+                if _should_use_color():
+                    print(f"\033[92mOld instance stopped successfully.\033[0m")  # Green
+                else:
+                    print(f"Old instance stopped successfully.")
+            else:
+                if _should_use_color():
+                    print(f"\033[91mWarning: Could not stop old instance cleanly (result={stop_result}).\033[0m")  # Red
+                    print(f"\033[91mProceeding anyway - old instance may still be running.\033[0m")
+                else:
+                    print(f"Warning: Could not stop old instance cleanly (result={stop_result}).")
+                    print(f"Proceeding anyway - old instance may still be running.")
+            
+            # Log completion
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(f"Stop result: {stop_result}\n")
+            except Exception:
+                pass
+            
+            print()  # Blank line before continuing
+
+    # NOW it's safe to do cleanup - we've confirmed no other instance is running that we'd interfere with.
+    # Clean up old _MEI folders from previous runs (Windows only, PyInstaller frozen only)
+    cleanup_old_mei_folders()
+    
+    # Try to add Windows Defender exclusion for PyInstaller extraction directory.
+    # This helps prevent Defender from quarantining/deleting files from _MEI during runtime.
+    # Requires admin privileges - silently fails if not admin.
+    add_defender_exclusion()
 
     # On Windows, default to running `join` invisibly in a detached process so closing the
     # launching terminal (or an agent hitting Alt+F4) cannot kill Cyberdriver.
@@ -5221,6 +6290,12 @@ def main():
         # Disable close button
         if disable_windows_console_close_button():
             print("✓ Console close button disabled (use Ctrl+C to exit)")
+    
+    # Set experimental space flag if enabled
+    if args.command == "join" and getattr(args, "experimental_space", False):
+        global EXPERIMENTAL_SPACE_ENABLED
+        EXPERIMENTAL_SPACE_ENABLED = True
+        print("✓ Experimental space mode enabled (using VK code instead of scan code)")
     
     try:
         if args.command == "start":

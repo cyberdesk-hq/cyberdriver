@@ -83,7 +83,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,  # Disabled to reduce antivirus false positives (PyInstaller + UPX triggers heuristics)
     upx_exclude=[],
     # Use a persistent directory for PyInstaller extraction to avoid Windows temp cleanup issues.
     # %LOCALAPPDATA% is expanded by the bootloader at runtime on Windows.
