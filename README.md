@@ -240,8 +240,7 @@ If you're on a corporate network that uses SSL inspection (e.g., Zscaler, Palo A
 If your IT department has installed their CA certificate in the Windows certificate store, tell Cyberdriver to use it:
 
 ```powershell
-$env:CYBERDRIVER_USE_SYSTEM_CERTS = "true"
-cyberdriver join --secret YOUR_API_KEY
+cyberdriver join --secret YOUR_API_KEY --use-system-certs
 ```
 
 **Option 2: Use a Custom CA File**
@@ -249,8 +248,7 @@ cyberdriver join --secret YOUR_API_KEY
 If you have your corporate CA certificate as a file:
 
 ```powershell
-$env:CYBERDRIVER_CA_FILE = "C:\path\to\corporate-ca.crt"
-cyberdriver join --secret YOUR_API_KEY
+cyberdriver join --secret YOUR_API_KEY --ca-file "C:\path\to\corporate-ca.crt"
 ```
 
 **Option 3: Disable SSL Verification (Testing Only)**
@@ -258,9 +256,10 @@ cyberdriver join --secret YOUR_API_KEY
 ⚠️ **INSECURE** - Only use this for testing. Your connection will NOT be protected against attacks.
 
 ```powershell
-$env:CYBERDRIVER_SSL_VERIFY = "false"
-cyberdriver join --secret YOUR_API_KEY
+cyberdriver join --secret YOUR_API_KEY --no-ssl-verify
 ```
+
+You can also use environment variables instead: `CYBERDRIVER_USE_SYSTEM_CERTS=true`, `CYBERDRIVER_CA_FILE=/path/to/ca.crt`, or `CYBERDRIVER_SSL_VERIFY=false`.
 
 > If you have any other issues, reach out to the team! We'll get on it asap.
 

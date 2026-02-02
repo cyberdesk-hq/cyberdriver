@@ -6090,6 +6090,9 @@ def main():
     join_parser.add_argument("--register-as-keepalive-for", type=str, default=None, help="Register this instance as the remote keepalive (host) for MAIN_MACHINE_ID")
     join_parser.add_argument("--debug", action="store_true", help="Enable debug logging to ~/.cyberdriver/logs/ (daily log files)")
     join_parser.add_argument("--experimental-space", action="store_true", help="Send space key via VK code instead of scan code (may fix issues with some apps like Cerner)")
+    join_parser.add_argument("--use-system-certs", action="store_true", help="Use system certificate store instead of bundled certs (for corporate SSL inspection)")
+    join_parser.add_argument("--ca-file", type=str, default=None, help="Path to custom CA certificate file")
+    join_parser.add_argument("--no-ssl-verify", action="store_true", help="Disable SSL verification (INSECURE, for testing only)")
     join_parser.add_argument(
         "--foreground",
         action="store_true",
@@ -6345,6 +6348,19 @@ def main():
         global EXPERIMENTAL_SPACE_ENABLED
         EXPERIMENTAL_SPACE_ENABLED = True
         print("✓ Experimental space mode enabled (using VK code instead of scan code)")
+    
+    # Set SSL/TLS configuration from command line flags
+    # These set environment variables that connect_with_headers() reads
+    if args.command == "join":
+        if getattr(args, "no_ssl_verify", False):
+            os.environ["CYBERDRIVER_SSL_VERIFY"] = "false"
+            print("⚠️  SSL verification disabled (--no-ssl-verify)")
+        if getattr(args, "use_system_certs", False):
+            os.environ["CYBERDRIVER_USE_SYSTEM_CERTS"] = "true"
+            print("✓ Using system certificate store (--use-system-certs)")
+        if getattr(args, "ca_file", None):
+            os.environ["CYBERDRIVER_CA_FILE"] = args.ca_file
+            print(f"✓ Using custom CA file: {args.ca_file}")
     
     try:
         if args.command == "start":
