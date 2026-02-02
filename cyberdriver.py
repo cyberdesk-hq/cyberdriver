@@ -1294,35 +1294,84 @@ async def connect_with_headers(uri, headers_dict):
     IMPORTANT: Creates a fresh SSL context for EVERY connection to avoid cached
     session issues that can cause reconnection failures. This mimics what happens
     when you Ctrl+C and restart the process.
+    
+    Environment variables for SSL/TLS configuration:
+    - CYBERDRIVER_SSL_VERIFY=false: Disable SSL verification (INSECURE, for testing only)
+    - CYBERDRIVER_USE_SYSTEM_CERTS=true: Use system CA store instead of bundled certifi
+      (useful for corporate networks with SSL inspection where the corporate CA is
+      installed in the system trust store)
+    - CYBERDRIVER_CA_FILE=/path/to/ca.crt: Use a custom CA certificate file
     """
     import ssl
     
-    # Create a FRESH SSL context for every connection attempt
-    # This is critical - the default context caches SSL sessions, and if a session
-    # gets into a bad state (e.g., server closed unexpectedly), it can poison
-    # future connections. Creating a fresh context ensures we start clean.
-    #
-    # We use certifi's CA bundle to ensure we have up-to-date root certificates,
-    # which fixes TLS errors on Windows machines missing Let's Encrypt's ISRG Root X1.
-    try:
-        ca_file = certifi.where()
-        if os.path.exists(ca_file):
-            ssl_context = ssl.create_default_context(cafile=ca_file)
-            # Best-effort debug signal (no-op unless debug logger is enabled).
+    # Check for SSL verification disable (INSECURE - testing only)
+    ssl_verify = os.environ.get("CYBERDRIVER_SSL_VERIFY", "true").lower()
+    if ssl_verify in ("false", "0", "no", "off"):
+        print("\n" + "=" * 70)
+        print("⚠️  WARNING: SSL VERIFICATION DISABLED (CYBERDRIVER_SSL_VERIFY=false)")
+        print("   This is INSECURE and should only be used for testing!")
+        print("   Your connection is NOT protected against man-in-the-middle attacks.")
+        print("=" * 70 + "\n")
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        try:
+            debug_logger.debug("SSL", "SSL verification DISABLED (insecure)")
+        except Exception:
+            pass
+    else:
+        # Check for custom CA file
+        custom_ca_file = os.environ.get("CYBERDRIVER_CA_FILE")
+        if custom_ca_file:
+            if os.path.exists(custom_ca_file):
+                ssl_context = ssl.create_default_context(cafile=custom_ca_file)
+                print(f"[SSL] Using custom CA file: {custom_ca_file}")
+                try:
+                    debug_logger.debug("SSL", f"Using custom CA file: {custom_ca_file}")
+                except Exception:
+                    pass
+            else:
+                print(f"[ERROR] Custom CA file not found: {custom_ca_file}")
+                print("[ERROR] Falling back to default certificate handling")
+                ssl_context = ssl.create_default_context()
+        # Check for system certs preference
+        elif os.environ.get("CYBERDRIVER_USE_SYSTEM_CERTS", "").lower() in ("true", "1", "yes", "on"):
+            # Use system certificate store - useful for corporate environments
+            # where IT has installed their SSL inspection CA in the system store
+            ssl_context = ssl.create_default_context()
+            print("[SSL] Using system certificate store (CYBERDRIVER_USE_SYSTEM_CERTS=true)")
             try:
-                debug_logger.debug("SSL", f"Using certifi CA bundle: {ca_file}")
+                debug_logger.debug("SSL", "Using system certificate store")
             except Exception:
                 pass
         else:
-            # Certifi bundle not found (PyInstaller bundling issue?) - fall back to system
-            print(f"[WARNING] Certifi CA bundle not found at: {ca_file}")
-            print("[WARNING] Falling back to system CA store")
-            ssl_context = ssl.create_default_context()
-    except Exception as e:
-        # Any error with certifi - fall back to system defaults
-        print(f"[WARNING] Certifi error: {e}")
-        print("[WARNING] Falling back to system CA store")
-        ssl_context = ssl.create_default_context()
+            # Default: use certifi's CA bundle
+            # Create a FRESH SSL context for every connection attempt
+            # This is critical - the default context caches SSL sessions, and if a session
+            # gets into a bad state (e.g., server closed unexpectedly), it can poison
+            # future connections. Creating a fresh context ensures we start clean.
+            #
+            # We use certifi's CA bundle to ensure we have up-to-date root certificates,
+            # which fixes TLS errors on Windows machines missing Let's Encrypt's ISRG Root X1.
+            try:
+                ca_file = certifi.where()
+                if os.path.exists(ca_file):
+                    ssl_context = ssl.create_default_context(cafile=ca_file)
+                    # Best-effort debug signal (no-op unless debug logger is enabled).
+                    try:
+                        debug_logger.debug("SSL", f"Using certifi CA bundle: {ca_file}")
+                    except Exception:
+                        pass
+                else:
+                    # Certifi bundle not found (PyInstaller bundling issue?) - fall back to system
+                    print(f"[WARNING] Certifi CA bundle not found at: {ca_file}")
+                    print("[WARNING] Falling back to system CA store")
+                    ssl_context = ssl.create_default_context()
+            except Exception as e:
+                # Any error with certifi - fall back to system defaults
+                print(f"[WARNING] Certifi error: {e}")
+                print("[WARNING] Falling back to system CA store")
+                ssl_context = ssl.create_default_context()
     
     # Common kwargs for robustness across proxies
     ws_kwargs = {

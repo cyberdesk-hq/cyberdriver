@@ -231,6 +231,37 @@ If you're on an older version and encounter TLS certificate errors, update to th
 Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.38/cyberdriver.exe" -OutFile "$env:USERPROFILE\.cyberdriver\cyberdriver.exe"
 ```
 
+#### Corporate Networks with SSL Inspection
+
+If you're on a corporate network that uses SSL inspection (e.g., Zscaler, Palo Alto, Fortinet) and see errors like `self signed certificate in certificate chain`, your IT department's SSL inspection certificate needs to be trusted.
+
+**Option 1: Use System Certificate Store**
+
+If your IT department has installed their CA certificate in the Windows certificate store, tell Cyberdriver to use it:
+
+```powershell
+$env:CYBERDRIVER_USE_SYSTEM_CERTS = "true"
+cyberdriver join --secret YOUR_API_KEY
+```
+
+**Option 2: Use a Custom CA File**
+
+If you have your corporate CA certificate as a file:
+
+```powershell
+$env:CYBERDRIVER_CA_FILE = "C:\path\to\corporate-ca.crt"
+cyberdriver join --secret YOUR_API_KEY
+```
+
+**Option 3: Disable SSL Verification (Testing Only)**
+
+⚠️ **INSECURE** - Only use this for testing. Your connection will NOT be protected against attacks.
+
+```powershell
+$env:CYBERDRIVER_SSL_VERIFY = "false"
+cyberdriver join --secret YOUR_API_KEY
+```
+
 > If you have any other issues, reach out to the team! We'll get on it asap.
 
 
