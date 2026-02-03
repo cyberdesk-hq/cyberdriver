@@ -1294,6 +1294,14 @@ async def connect_with_headers(uri, headers_dict):
     IMPORTANT: Creates a fresh SSL context for EVERY connection to avoid cached
     session issues that can cause reconnection failures. This mimics what happens
     when you Ctrl+C and restart the process.
+    
+    SSL Certificate Strategy:
+    Uses system certificate store by default, which automatically includes:
+    - Corporate SSL inspection certificates (installed by IT)
+    - Standard root CAs on properly configured machines
+    
+    Additionally loads certifi's CA bundle as a fallback for Windows machines
+    that may be missing root certificates like Let's Encrypt's ISRG Root X1.
     """
     import ssl
     
@@ -1302,27 +1310,26 @@ async def connect_with_headers(uri, headers_dict):
     # gets into a bad state (e.g., server closed unexpectedly), it can poison
     # future connections. Creating a fresh context ensures we start clean.
     #
-    # We use certifi's CA bundle to ensure we have up-to-date root certificates,
-    # which fixes TLS errors on Windows machines missing Let's Encrypt's ISRG Root X1.
+    # Strategy: Use system certs (handles corporate SSL inspection) and also
+    # load certifi's bundle as additional trusted CAs (handles missing root certs).
+    ssl_context = ssl.create_default_context()  # Starts with system certificate store
+    
+    # Additionally load certifi's CA bundle to handle Windows machines missing root certs
+    # This is additive - we keep system certs AND add certifi's certs
     try:
         ca_file = certifi.where()
         if os.path.exists(ca_file):
-            ssl_context = ssl.create_default_context(cafile=ca_file)
-            # Best-effort debug signal (no-op unless debug logger is enabled).
+            ssl_context.load_verify_locations(cafile=ca_file)
             try:
-                debug_logger.debug("SSL", f"Using certifi CA bundle: {ca_file}")
+                debug_logger.debug("SSL", f"Using system certs + certifi bundle: {ca_file}")
             except Exception:
                 pass
-        else:
-            # Certifi bundle not found (PyInstaller bundling issue?) - fall back to system
-            print(f"[WARNING] Certifi CA bundle not found at: {ca_file}")
-            print("[WARNING] Falling back to system CA store")
-            ssl_context = ssl.create_default_context()
     except Exception as e:
-        # Any error with certifi - fall back to system defaults
-        print(f"[WARNING] Certifi error: {e}")
-        print("[WARNING] Falling back to system CA store")
-        ssl_context = ssl.create_default_context()
+        # Certifi not available - that's okay, system certs should work for most cases
+        try:
+            debug_logger.debug("SSL", f"Using system certs only (certifi unavailable: {e})")
+        except Exception:
+            pass
     
     # Common kwargs for robustness across proxies
     ws_kwargs = {
@@ -1372,7 +1379,7 @@ async def connect_with_headers(uri, headers_dict):
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
 PID_FILE = "cyberdriver.pid.json"
-VERSION = "0.0.38"
+VERSION = "0.0.39"
 
 @dataclass
 class Config:

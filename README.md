@@ -49,7 +49,7 @@ New-Item -ItemType Directory -Force -Path $toolDir
 
 # Download cyberdriver
 try {
-    Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.38/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe" -ErrorAction Stop
+    Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.39/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe" -ErrorAction Stop
 } catch {
     Write-Host "ERROR: Failed to download Cyberdriver. Please check your internet connection and try again." -ForegroundColor Red
     return
@@ -77,7 +77,7 @@ if (Test-Path "$toolDir\cyberdriver.exe") {
 
 ```bash
 # Choose version and target directory
-VERSION=0.0.38
+VERSION=0.0.39
 TOOL_DIR="$HOME/.cyberdriver"
 mkdir -p "$TOOL_DIR"
 
@@ -223,15 +223,11 @@ After the update, Cyberdriver will restart with those exact same flags.
 
 ### TLS Certificate Errors
 
-**v0.0.36+**: Cyberdriver now bundles its own CA certificates, so TLS errors on Windows machines missing root certs should be fixed automatically.
+Cyberdriver uses your system's certificate store by default, which works automatically on most machines including corporate networks with SSL inspection (Zscaler, Palo Alto, Fortinet, etc.).
 
-If you're on an older version and encounter TLS certificate errors, update to the latest version:
+As a fallback, Cyberdriver bundles the `certifi` package which contains up-to-date root CA certificates including Let's Encrypt's ISRG Root X1. This ensures connectivity even on Windows machines missing root certificates.
 
-```powershell
-Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.38/cyberdriver.exe" -OutFile "$env:USERPROFILE\.cyberdriver\cyberdriver.exe"
-```
-
-> If you have any other issues, reach out to the team! We'll get on it asap.
+If you're still experiencing TLS errors, please reach out to the team for assistance.
 
 
 
