@@ -49,7 +49,7 @@ New-Item -ItemType Directory -Force -Path $toolDir
 
 # Download cyberdriver
 try {
-    Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.38/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe" -ErrorAction Stop
+    Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.39/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe" -ErrorAction Stop
 } catch {
     Write-Host "ERROR: Failed to download Cyberdriver. Please check your internet connection and try again." -ForegroundColor Red
     return
@@ -77,7 +77,7 @@ if (Test-Path "$toolDir\cyberdriver.exe") {
 
 ```bash
 # Choose version and target directory
-VERSION=0.0.38
+VERSION=0.0.39
 TOOL_DIR="$HOME/.cyberdriver"
 mkdir -p "$TOOL_DIR"
 
@@ -223,45 +223,11 @@ After the update, Cyberdriver will restart with those exact same flags.
 
 ### TLS Certificate Errors
 
-**v0.0.36+**: Cyberdriver now bundles its own CA certificates, so TLS errors on Windows machines missing root certs should be fixed automatically.
+Cyberdriver uses your system's certificate store by default, which works automatically on most machines including corporate networks with SSL inspection (Zscaler, Palo Alto, Fortinet, etc.).
 
-If you're on an older version and encounter TLS certificate errors, update to the latest version:
+As a fallback, Cyberdriver bundles the `certifi` package which contains up-to-date root CA certificates including Let's Encrypt's ISRG Root X1. This ensures connectivity even on Windows machines missing root certificates.
 
-```powershell
-Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.38/cyberdriver.exe" -OutFile "$env:USERPROFILE\.cyberdriver\cyberdriver.exe"
-```
-
-#### Corporate Networks with SSL Inspection
-
-If you're on a corporate network that uses SSL inspection (e.g., Zscaler, Palo Alto, Fortinet) and see errors like `self signed certificate in certificate chain`, your IT department's SSL inspection certificate needs to be trusted.
-
-**Option 1: Use System Certificate Store**
-
-If your IT department has installed their CA certificate in the Windows certificate store, tell Cyberdriver to use it:
-
-```powershell
-cyberdriver join --secret YOUR_API_KEY --use-system-certs
-```
-
-**Option 2: Use a Custom CA File**
-
-If you have your corporate CA certificate as a file:
-
-```powershell
-cyberdriver join --secret YOUR_API_KEY --ca-file "C:\path\to\corporate-ca.crt"
-```
-
-**Option 3: Disable SSL Verification (Testing Only)**
-
-⚠️ **INSECURE** - Only use this for testing. Your connection will NOT be protected against attacks.
-
-```powershell
-cyberdriver join --secret YOUR_API_KEY --no-ssl-verify
-```
-
-You can also use environment variables instead: `CYBERDRIVER_USE_SYSTEM_CERTS=true`, `CYBERDRIVER_CA_FILE=/path/to/ca.crt`, or `CYBERDRIVER_SSL_VERIFY=false`.
-
-> If you have any other issues, reach out to the team! We'll get on it asap.
+If you're still experiencing TLS errors, please reach out to the team for assistance.
 
 
 

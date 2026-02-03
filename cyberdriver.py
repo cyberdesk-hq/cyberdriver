@@ -1295,83 +1295,41 @@ async def connect_with_headers(uri, headers_dict):
     session issues that can cause reconnection failures. This mimics what happens
     when you Ctrl+C and restart the process.
     
-    Environment variables for SSL/TLS configuration:
-    - CYBERDRIVER_SSL_VERIFY=false: Disable SSL verification (INSECURE, for testing only)
-    - CYBERDRIVER_USE_SYSTEM_CERTS=true: Use system CA store instead of bundled certifi
-      (useful for corporate networks with SSL inspection where the corporate CA is
-      installed in the system trust store)
-    - CYBERDRIVER_CA_FILE=/path/to/ca.crt: Use a custom CA certificate file
+    SSL Certificate Strategy:
+    Uses system certificate store by default, which automatically includes:
+    - Corporate SSL inspection certificates (installed by IT)
+    - Standard root CAs on properly configured machines
+    
+    Additionally loads certifi's CA bundle as a fallback for Windows machines
+    that may be missing root certificates like Let's Encrypt's ISRG Root X1.
     """
     import ssl
     
-    # Check for SSL verification disable (INSECURE - testing only)
-    ssl_verify = os.environ.get("CYBERDRIVER_SSL_VERIFY", "true").lower()
-    if ssl_verify in ("false", "0", "no", "off"):
-        print("\n" + "=" * 70)
-        print("⚠️  WARNING: SSL VERIFICATION DISABLED (CYBERDRIVER_SSL_VERIFY=false)")
-        print("   This is INSECURE and should only be used for testing!")
-        print("   Your connection is NOT protected against man-in-the-middle attacks.")
-        print("=" * 70 + "\n")
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-        try:
-            debug_logger.debug("SSL", "SSL verification DISABLED (insecure)")
-        except Exception:
-            pass
-    else:
-        # Check for custom CA file
-        custom_ca_file = os.environ.get("CYBERDRIVER_CA_FILE")
-        if custom_ca_file:
-            if os.path.exists(custom_ca_file):
-                ssl_context = ssl.create_default_context(cafile=custom_ca_file)
-                print(f"[SSL] Using custom CA file: {custom_ca_file}")
-                try:
-                    debug_logger.debug("SSL", f"Using custom CA file: {custom_ca_file}")
-                except Exception:
-                    pass
-            else:
-                print(f"[ERROR] Custom CA file not found: {custom_ca_file}")
-                print("[ERROR] Falling back to default certificate handling")
-                ssl_context = ssl.create_default_context()
-        # Check for system certs preference
-        elif os.environ.get("CYBERDRIVER_USE_SYSTEM_CERTS", "").lower() in ("true", "1", "yes", "on"):
-            # Use system certificate store - useful for corporate environments
-            # where IT has installed their SSL inspection CA in the system store
-            ssl_context = ssl.create_default_context()
-            print("[SSL] Using system certificate store (CYBERDRIVER_USE_SYSTEM_CERTS=true)")
+    # Create a FRESH SSL context for every connection attempt
+    # This is critical - the default context caches SSL sessions, and if a session
+    # gets into a bad state (e.g., server closed unexpectedly), it can poison
+    # future connections. Creating a fresh context ensures we start clean.
+    #
+    # Strategy: Use system certs (handles corporate SSL inspection) and also
+    # load certifi's bundle as additional trusted CAs (handles missing root certs).
+    ssl_context = ssl.create_default_context()  # Starts with system certificate store
+    
+    # Additionally load certifi's CA bundle to handle Windows machines missing root certs
+    # This is additive - we keep system certs AND add certifi's certs
+    try:
+        ca_file = certifi.where()
+        if os.path.exists(ca_file):
+            ssl_context.load_verify_locations(cafile=ca_file)
             try:
-                debug_logger.debug("SSL", "Using system certificate store")
+                debug_logger.debug("SSL", f"Using system certs + certifi bundle: {ca_file}")
             except Exception:
                 pass
-        else:
-            # Default: use certifi's CA bundle
-            # Create a FRESH SSL context for every connection attempt
-            # This is critical - the default context caches SSL sessions, and if a session
-            # gets into a bad state (e.g., server closed unexpectedly), it can poison
-            # future connections. Creating a fresh context ensures we start clean.
-            #
-            # We use certifi's CA bundle to ensure we have up-to-date root certificates,
-            # which fixes TLS errors on Windows machines missing Let's Encrypt's ISRG Root X1.
-            try:
-                ca_file = certifi.where()
-                if os.path.exists(ca_file):
-                    ssl_context = ssl.create_default_context(cafile=ca_file)
-                    # Best-effort debug signal (no-op unless debug logger is enabled).
-                    try:
-                        debug_logger.debug("SSL", f"Using certifi CA bundle: {ca_file}")
-                    except Exception:
-                        pass
-                else:
-                    # Certifi bundle not found (PyInstaller bundling issue?) - fall back to system
-                    print(f"[WARNING] Certifi CA bundle not found at: {ca_file}")
-                    print("[WARNING] Falling back to system CA store")
-                    ssl_context = ssl.create_default_context()
-            except Exception as e:
-                # Any error with certifi - fall back to system defaults
-                print(f"[WARNING] Certifi error: {e}")
-                print("[WARNING] Falling back to system CA store")
-                ssl_context = ssl.create_default_context()
+    except Exception as e:
+        # Certifi not available - that's okay, system certs should work for most cases
+        try:
+            debug_logger.debug("SSL", f"Using system certs only (certifi unavailable: {e})")
+        except Exception:
+            pass
     
     # Common kwargs for robustness across proxies
     ws_kwargs = {
@@ -1421,7 +1379,7 @@ async def connect_with_headers(uri, headers_dict):
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
 PID_FILE = "cyberdriver.pid.json"
-VERSION = "0.0.38"
+VERSION = "0.0.39"
 
 @dataclass
 class Config:
@@ -6090,9 +6048,6 @@ def main():
     join_parser.add_argument("--register-as-keepalive-for", type=str, default=None, help="Register this instance as the remote keepalive (host) for MAIN_MACHINE_ID")
     join_parser.add_argument("--debug", action="store_true", help="Enable debug logging to ~/.cyberdriver/logs/ (daily log files)")
     join_parser.add_argument("--experimental-space", action="store_true", help="Send space key via VK code instead of scan code (may fix issues with some apps like Cerner)")
-    join_parser.add_argument("--use-system-certs", action="store_true", help="Use system certificate store instead of bundled certs (for corporate SSL inspection)")
-    join_parser.add_argument("--ca-file", type=str, default=None, help="Path to custom CA certificate file")
-    join_parser.add_argument("--no-ssl-verify", action="store_true", help="Disable SSL verification (INSECURE, for testing only)")
     join_parser.add_argument(
         "--foreground",
         action="store_true",
@@ -6348,19 +6303,6 @@ def main():
         global EXPERIMENTAL_SPACE_ENABLED
         EXPERIMENTAL_SPACE_ENABLED = True
         print("✓ Experimental space mode enabled (using VK code instead of scan code)")
-    
-    # Set SSL/TLS configuration from command line flags
-    # These set environment variables that connect_with_headers() reads
-    if args.command == "join":
-        if getattr(args, "no_ssl_verify", False):
-            os.environ["CYBERDRIVER_SSL_VERIFY"] = "false"
-            print("⚠️  SSL verification disabled (--no-ssl-verify)")
-        if getattr(args, "use_system_certs", False):
-            os.environ["CYBERDRIVER_USE_SYSTEM_CERTS"] = "true"
-            print("✓ Using system certificate store (--use-system-certs)")
-        if getattr(args, "ca_file", None):
-            os.environ["CYBERDRIVER_CA_FILE"] = args.ca_file
-            print(f"✓ Using custom CA file: {args.ca_file}")
     
     try:
         if args.command == "start":
