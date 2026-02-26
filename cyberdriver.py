@@ -1965,6 +1965,42 @@ pyautogui.PAUSE = 0
 # where display changes can trigger false positives
 pyautogui.FAILSAFE = False
 
+
+def _get_env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    """Parse a float env var with safe fallback and clamping."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        print(f"Warning: invalid {name}={raw!r}; using default {default}")
+        return default
+    return max(minimum, value)
+
+
+# Post-type settle delay:
+# Remote desktops (Citrix/RDP/VDI) can render injected keystrokes slightly after
+# key events are queued. A short char-count-based wait reduces races with immediate
+# follow-up actions/screenshots.
+TYPING_SETTLE_BASE_SECONDS = _get_env_float("CYBERDRIVER_TYPING_SETTLE_BASE_SECONDS", 0.05)
+TYPING_SETTLE_PER_CHAR_SECONDS = _get_env_float("CYBERDRIVER_TYPING_SETTLE_PER_CHAR_SECONDS", 0.007)
+TYPING_SETTLE_MAX_SECONDS = _get_env_float("CYBERDRIVER_TYPING_SETTLE_MAX_SECONDS", 1.2)
+
+
+def _compute_typing_settle_delay(text: str) -> float:
+    char_count = len(text or "")
+    uncapped = TYPING_SETTLE_BASE_SECONDS + (char_count * TYPING_SETTLE_PER_CHAR_SECONDS)
+    max_delay = max(TYPING_SETTLE_MAX_SECONDS, TYPING_SETTLE_BASE_SECONDS)
+    return max(0.0, min(uncapped, max_delay))
+
+
+async def _wait_for_typing_settle(text: str) -> None:
+    delay_seconds = _compute_typing_settle_delay(text)
+    if delay_seconds <= 0:
+        return
+    await asyncio.sleep(delay_seconds)
+
 # -----------------------------------------------------------------------------
 # Local API implementation
 # -----------------------------------------------------------------------------
@@ -3144,12 +3180,14 @@ async def post_keyboard_type(payload: Dict[str, str]):
     if platform.system() == "Windows":
         try:
             _type_with_win32_sendinput(text)
+            await _wait_for_typing_settle(text)
             return {}
         except Exception as e:
             print(f"Warning: SendInput failed ({e}), falling back to PyAutoGUI")
     
     # Fallback for non-Windows or if SendInput fails
     pyautogui.typewrite(text)
+    await _wait_for_typing_settle(text)
     return {}
 
 
