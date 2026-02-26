@@ -1981,14 +1981,15 @@ def _get_env_float(name: str, default: float, minimum: float = 0.0) -> float:
 
 # Post-type settle delay:
 # Remote desktops (Citrix/RDP/VDI) can render injected keystrokes slightly after
-# key events are queued. We wait 5ms per typed character (no base delay, no cap)
-# to reduce races with immediate follow-up actions/screenshots.
-TYPING_SETTLE_PER_CHAR_SECONDS = _get_env_float("CYBERDRIVER_TYPING_SETTLE_PER_CHAR_SECONDS", 0.005)
+# key events are queued. We apply a fixed base delay plus a char-count-based
+# delay to reduce races with immediate follow-up actions/screenshots.
+TYPING_SETTLE_BASE_SECONDS = _get_env_float("CYBERDRIVER_TYPING_SETTLE_BASE_SECONDS", 0.05)
+TYPING_SETTLE_PER_CHAR_SECONDS = _get_env_float("CYBERDRIVER_TYPING_SETTLE_PER_CHAR_SECONDS", 0.007)
 
 
 def _compute_typing_settle_delay(text: str) -> float:
     char_count = len(text or "")
-    return max(0.0, char_count * TYPING_SETTLE_PER_CHAR_SECONDS)
+    return max(0.0, TYPING_SETTLE_BASE_SECONDS + (char_count * TYPING_SETTLE_PER_CHAR_SECONDS))
 
 
 async def _wait_for_typing_settle(text: str) -> None:
