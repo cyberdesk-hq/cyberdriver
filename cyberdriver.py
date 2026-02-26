@@ -42,6 +42,7 @@ import argparse
 import asyncio
 import base64
 import json
+import math
 import os
 import platform
 import pathlib
@@ -1379,7 +1380,7 @@ async def connect_with_headers(uri, headers_dict):
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
 PID_FILE = "cyberdriver.pid.json"
-VERSION = "0.0.39"
+VERSION = "0.0.40"
 
 @dataclass
 class Config:
@@ -1975,6 +1976,9 @@ def _get_env_float(name: str, default: float, minimum: float = 0.0) -> float:
         value = float(raw)
     except ValueError:
         print(f"Warning: invalid {name}={raw!r}; using default {default}")
+        return default
+    if not math.isfinite(value):
+        print(f"Warning: non-finite {name}={raw!r}; using default {default}")
         return default
     return max(minimum, value)
 
