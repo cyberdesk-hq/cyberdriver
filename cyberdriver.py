@@ -41,6 +41,7 @@ Usage:
 import argparse
 import asyncio
 import base64
+import builtins
 import json
 import math
 import os
@@ -77,7 +78,60 @@ from fastapi.responses import Response, JSONResponse
 import uvicorn
 import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatus
-from datetime import datetime
+from datetime import datetime, timezone
+
+# -----------------------------------------------------------------------------
+# UTC Timestamped Console Printing
+# -----------------------------------------------------------------------------
+
+_ISO_TIMESTAMP_PREFIX_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2}T")
+_ORIGINAL_PRINT = builtins.print
+
+
+def _utc_now_iso() -> str:
+    """Return current UTC timestamp in ISO 8601 format with milliseconds."""
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _prefix_log_line_with_utc_timestamp(text: str) -> str:
+    """Prefix a log line with UTC timestamp while preserving leading blank lines."""
+    if not text:
+        return f"[{_utc_now_iso()}]"
+
+    leading_newlines = len(text) - len(text.lstrip("\n"))
+    prefix = text[:leading_newlines]
+    body = text[leading_newlines:]
+
+    # Keep in-place status/countdown updates untouched.
+    if body.startswith("\r"):
+        return text
+    # Avoid double-prefixing lines that already begin with an ISO timestamp.
+    if _ISO_TIMESTAMP_PREFIX_RE.match(body):
+        return text
+
+    if not body:
+        return f"{prefix}[{_utc_now_iso()}]"
+    return f"{prefix}[{_utc_now_iso()}] {body}"
+
+
+def _print_with_utc_timestamp(*args, **kwargs):
+    """Global print wrapper that adds UTC timestamps to regular log lines."""
+    end = kwargs.get("end", "\n")
+    # Preserve non-line-buffered prints used by countdown/progress output.
+    if end != "\n":
+        _ORIGINAL_PRINT(*args, **kwargs)
+        return
+
+    if not args:
+        _ORIGINAL_PRINT(f"[{_utc_now_iso()}]", **kwargs)
+        return
+
+    first_arg = _prefix_log_line_with_utc_timestamp(str(args[0]))
+    _ORIGINAL_PRINT(first_arg, *args[1:], **kwargs)
+
+
+if getattr(builtins.print, "__name__", "") != "_print_with_utc_timestamp":
+    builtins.print = _print_with_utc_timestamp
 
 # -----------------------------------------------------------------------------
 # Debug Logging System
@@ -119,7 +173,7 @@ class DebugLogger:
     
     def _get_log_file(self) -> pathlib.Path:
         """Get the current log file path, rotating by day."""
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if self._current_date != today:
             self._current_date = today
             self._log_file = self.log_dir / f"cyberdriver-{today}.log"
@@ -127,7 +181,7 @@ class DebugLogger:
     
     def _format_timestamp(self) -> str:
         """Get formatted timestamp for log entries."""
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        return _utc_now_iso()
     
     def _write(self, level: str, category: str, message: str, **context):
         """Write a log entry."""
@@ -775,7 +829,7 @@ def _setup_detached_stdio_if_configured():
             try:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
                 with open(self._path, "w", encoding=self._encoding) as f:
-                    f.write(f"[{datetime.now().isoformat()}] Log truncated (max 10MB)\n")
+                    f.write(f"[{_utc_now_iso()}] Log truncated (max 10MB)\n")
                     f.flush()
             except Exception:
                 # If truncation fails, fall back to append to whatever exists.
@@ -821,7 +875,7 @@ def _setup_detached_stdio_if_configured():
                     try:
                         if encoded is None:
                             encoded = text.encode(self._encoding, errors="replace")
-                        marker_str = f"\n[{datetime.now().isoformat()}] Log chunk truncated to fit 10MB cap\n"
+                        marker_str = f"\n[{_utc_now_iso()}] Log chunk truncated to fit 10MB cap\n"
                         marker_b = marker_str.encode(self._encoding, errors="replace")
                         if len(marker_b) >= remaining:
                             tail_b = encoded[-remaining:]
@@ -880,7 +934,7 @@ def _setup_detached_stdio_if_configured():
         atexit.register(lambda: writer.close())
         sys.stdout = writer  # type: ignore[assignment]
         sys.stderr = writer  # type: ignore[assignment]
-        print(f"\n[{datetime.now().isoformat()}] Cyberdriver detached logging started")
+        print("\nCyberdriver detached logging started")
         sys.stdout.flush()
     except Exception:
         # If we can't redirect logs, just continue silently.
@@ -1481,7 +1535,7 @@ def write_pid_info(info: Dict[str, Any]) -> None:
         payload = dict(info)
         payload.setdefault("pid", os.getpid())
         payload.setdefault("version", VERSION)
-        payload.setdefault("started_at", datetime.now().isoformat())
+        payload.setdefault("started_at", _utc_now_iso())
         payload.setdefault("frozen", bool(getattr(sys, "frozen", False)))
         payload.setdefault("argv", sys.argv[:])
 
@@ -2038,7 +2092,7 @@ def _log_error_and_check_mei(error: Exception, context: str = "") -> bool:
     error_type = type(error).__name__
     
     # Always log the error - use both print and direct file logging
-    timestamp = datetime.now().isoformat()
+    timestamp = _utc_now_iso()
     
     # Log to console (may not appear if stdout is captured)
     try:
@@ -2129,7 +2183,7 @@ async def global_exception_handler(request, exc):
     from fastapi.responses import JSONResponse
     
     # Immediately log that we entered this handler
-    timestamp = datetime.now().isoformat()
+    timestamp = _utc_now_iso()
     try:
         print(f"\n[GLOBAL EXCEPTION HANDLER] {timestamp}", flush=True)
         print(f"[GLOBAL EXCEPTION HANDLER] Exception type: {type(exc).__name__}", flush=True)
@@ -2172,7 +2226,7 @@ async def global_exception_handler(request, exc):
         content={
             "error": type(exc).__name__,
             "message": error_msg,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": _utc_now_iso()
         }
     )
 
@@ -3800,7 +3854,7 @@ async def post_powershell_exec(payload: Dict[str, Any]):
         return result
     except Exception as e:
         # Log the error with full details
-        timestamp = datetime.now().isoformat()
+        timestamp = _utc_now_iso()
         error_type = type(e).__name__
         error_msg = str(e)
         
@@ -3924,7 +3978,7 @@ def _restart_cyberdriver_process() -> bool:
     try:
         log_path = get_config_dir() / "restart-history.log"
         with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"\n[{datetime.now().isoformat()}] Restarting cyberdriver (attempt {restart_count}/{MAX_RESTARTS})\n")
+            f.write(f"\n[{_utc_now_iso()}] Restarting cyberdriver (attempt {restart_count}/{MAX_RESTARTS})\n")
             f.write(f"Command: {' '.join(cmd)}\n")
             f.write(f"PID (old): {os.getpid()}\n")
             f.write(f"_MEIPASS: {getattr(sys, '_MEIPASS', 'N/A')}\n")
@@ -4727,7 +4781,7 @@ class TunnelClient:
             debug_logger.error("REQUEST", f"Request failed: {error_msg}", method=method, path=path, duration_ms=f"{duration_ms:.1f}ms")
             
             # Log to console with full details
-            timestamp = datetime.now().isoformat()
+            timestamp = _utc_now_iso()
             print(f"\n{'='*60}", flush=True)
             print(f"[TUNNEL FORWARD ERROR] {timestamp}", flush=True)
             print(f"Error type: {error_type}", flush=True)
@@ -5814,7 +5868,7 @@ def check_mei_health(context: str = "") -> bool:
     
     if missing:
         from datetime import datetime
-        timestamp = datetime.now().isoformat()
+        timestamp = _utc_now_iso()
         
         # Get list of existing directories for debugging
         existing = []
@@ -5957,7 +6011,7 @@ def add_defender_exclusion() -> bool:
                 try:
                     log_path = get_config_dir() / "defender-exclusion.log"
                     with open(log_path, "a", encoding="utf-8") as f:
-                        f.write(f"\n[{datetime.now().isoformat()}] Failed to add Defender exclusion\n")
+                        f.write(f"\n[{_utc_now_iso()}] Failed to add Defender exclusion\n")
                         f.write(f"Path: {mei_parent}\n")
                         f.write(f"Error: {add_result.stderr}\n")
                 except:
@@ -6169,7 +6223,7 @@ def main():
         if info:
             old_pid = int(info.get("pid", -1))
             old_argv = info.get("argv", [])
-            timestamp = datetime.now().isoformat()
+            timestamp = _utc_now_iso()
             
             print_banner(mode="connecting")
             # Use yellow/warning color for visibility (if terminal supports it)
