@@ -48,6 +48,7 @@ import os
 import platform
 import pathlib
 import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -72,7 +73,7 @@ import numpy as np
 import pyautogui
 import pyperclip
 from PIL import Image
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from fastapi.responses import Response, JSONResponse
 import uvicorn
@@ -126,8 +127,20 @@ def _print_with_utc_timestamp(*args, **kwargs):
         _ORIGINAL_PRINT(f"[{_utc_now_iso()}]", **kwargs)
         return
 
-    first_arg = _prefix_log_line_with_utc_timestamp(str(args[0]))
-    _ORIGINAL_PRINT(first_arg, *args[1:], **kwargs)
+    sep = kwargs.get("sep", " ")
+    text_args = [str(arg) for arg in args]
+
+    # If each argument can become its own line (e.g., sep="\n"), prefix each one.
+    if "\n" in sep:
+        prefixed_args = [_prefix_log_line_with_utc_timestamp(text) for text in text_args]
+        _ORIGINAL_PRINT(*prefixed_args, **kwargs)
+        return
+
+    # Otherwise render exactly one output line and prefix it once.
+    rendered = sep.join(text_args)
+    kwargs_single = dict(kwargs)
+    kwargs_single.pop("sep", None)
+    _ORIGINAL_PRINT(_prefix_log_line_with_utc_timestamp(rendered), **kwargs_single)
 
 
 if getattr(builtins.print, "__name__", "") != "_print_with_utc_timestamp":
@@ -2312,15 +2325,63 @@ async def post_remote_keepalive_disable():
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
-@app.post("/shutdown")
+def _extract_bearer_token(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    parts = value.split(" ", 1)
+    if len(parts) != 2:
+        return None
+    scheme, token = parts[0].strip().lower(), parts[1].strip()
+    if scheme != "bearer" or not token:
+        return None
+    return token
+
+
+def _get_shutdown_auth_token() -> Optional[str]:
+    """Resolve shutdown auth token from env or runtime state."""
+    env_token = os.environ.get("CYBERDRIVER_SHUTDOWN_TOKEN")
+    if env_token:
+        return env_token
+    state_token = getattr(app.state, "shutdown_token", None)
+    if isinstance(state_token, str) and state_token:
+        return state_token
+    return None
+
+
+def _get_shutdown_request_token(request: Request, payload: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Extract shutdown token from Authorization/header/body."""
+    token = _extract_bearer_token(request.headers.get("authorization"))
+    if token:
+        return token
+
+    header_token = request.headers.get("x-cyberdriver-shutdown-token")
+    if header_token:
+        return header_token.strip()
+
+    if isinstance(payload, dict):
+        payload_token = payload.get("token")
+        if payload_token is not None:
+            return str(payload_token).strip()
+
+    return None
+
+
 @app.post("/internal/shutdown")
-async def post_shutdown(payload: Optional[Dict[str, Any]] = None):
+async def post_shutdown(request: Request, payload: Optional[Dict[str, Any]] = None):
     """Request cyberdriver to terminate itself.
 
     Intended for cloud control-plane use when a machine/session is being turned off.
     Returns immediately, then exits the process shortly after the response is sent.
     """
     try:
+        expected_token = _get_shutdown_auth_token()
+        if not expected_token:
+            raise HTTPException(status_code=503, detail="Shutdown token is not configured")
+
+        provided_token = _get_shutdown_request_token(request, payload)
+        if not provided_token or not secrets.compare_digest(provided_token, expected_token):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
         pid = os.getpid()
         reason = None
         source = "unknown"
@@ -2355,6 +2416,8 @@ async def post_shutdown(payload: Optional[Dict[str, Any]] = None):
             "reason": reason,
             "source": source,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
@@ -3985,7 +4048,21 @@ def _restart_cyberdriver_process() -> bool:
         
     Note: If successful, this function exits the process and never returns.
     """
+    RESTART_WARNING_EVERY = 50
+    RESTART_HISTORY_MAX_BYTES = 1 * 1024 * 1024  # Cap restart-history.log at 1MB
+
     restart_count = _get_restart_count() + 1
+
+    if restart_count >= RESTART_WARNING_EVERY and restart_count % RESTART_WARNING_EVERY == 0:
+        print(f"\n{'='*60}")
+        print("⚠️  High restart count detected")
+        print(f"{'='*60}")
+        print(f"Cyberdriver has restarted {restart_count} times in this recovery chain.")
+        print("The process will keep retrying, but this usually indicates a persistent issue:")
+        print("  1. API/network connectivity problems")
+        print("  2. Persistent local environment corruption")
+        print("  3. Invalid machine configuration")
+        print(f"{'='*60}\n")
 
     print(f"\n{'='*60}")
     print(f"🔄 RESTARTING CYBERDRIVER (attempt #{restart_count})")
@@ -4005,6 +4082,15 @@ def _restart_cyberdriver_process() -> bool:
     # Log the restart for debugging
     try:
         log_path = get_config_dir() / "restart-history.log"
+        try:
+            if log_path.exists() and log_path.stat().st_size > RESTART_HISTORY_MAX_BYTES:
+                with open(log_path, "w", encoding="utf-8") as f:
+                    f.write(
+                        f"[{_utc_now_iso()}] restart-history.log truncated "
+                        f"(exceeded {RESTART_HISTORY_MAX_BYTES} bytes)\n"
+                    )
+        except Exception:
+            pass
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(f"\n[{_utc_now_iso()}] Restarting cyberdriver (attempt #{restart_count})\n")
             f.write(f"Command: {' '.join(cmd)}\n")
@@ -5389,6 +5475,8 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
     """Run both API server and tunnel client."""
     # Store connection info for use by update endpoint
     _set_connection_info(host, port)
+    # Use join secret as default auth token for /internal/shutdown.
+    app.state.shutdown_token = secret
     
     config = get_config()
     
