@@ -2325,45 +2325,18 @@ async def post_remote_keepalive_disable():
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
-def _extract_bearer_token(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return None
-    parts = value.split(" ", 1)
-    if len(parts) != 2:
-        return None
-    scheme, token = parts[0].strip().lower(), parts[1].strip()
-    if scheme != "bearer" or not token:
-        return None
-    return token
+TUNNEL_INTERNAL_REQUEST_HEADER = "x-cyberdesk-tunnel-token"
 
 
-def _get_shutdown_auth_token() -> Optional[str]:
-    """Resolve shutdown auth token from env or runtime state."""
-    env_token = os.environ.get("CYBERDRIVER_SHUTDOWN_TOKEN")
-    if env_token:
-        return env_token
-    state_token = getattr(app.state, "shutdown_token", None)
-    if isinstance(state_token, str) and state_token:
-        return state_token
-    return None
-
-
-def _get_shutdown_request_token(request: Request, payload: Optional[Dict[str, Any]]) -> Optional[str]:
-    """Extract shutdown token from Authorization/header/body."""
-    token = _extract_bearer_token(request.headers.get("authorization"))
-    if token:
-        return token
-
-    header_token = request.headers.get("x-cyberdriver-shutdown-token")
-    if header_token:
-        return header_token.strip()
-
-    if isinstance(payload, dict):
-        payload_token = payload.get("token")
-        if payload_token is not None:
-            return str(payload_token).strip()
-
-    return None
+def _is_request_from_active_tunnel(request: Request) -> bool:
+    """Return True if request carries the active in-process tunnel marker."""
+    expected = getattr(app.state, "tunnel_internal_token", None)
+    if not isinstance(expected, str) or not expected:
+        return False
+    provided = request.headers.get(TUNNEL_INTERNAL_REQUEST_HEADER)
+    if not provided:
+        return False
+    return secrets.compare_digest(provided, expected)
 
 
 @app.post("/internal/shutdown")
@@ -2374,13 +2347,8 @@ async def post_shutdown(request: Request, payload: Optional[Dict[str, Any]] = No
     Returns immediately, then exits the process shortly after the response is sent.
     """
     try:
-        expected_token = _get_shutdown_auth_token()
-        if not expected_token:
-            raise HTTPException(status_code=503, detail="Shutdown token is not configured")
-
-        provided_token = _get_shutdown_request_token(request, payload)
-        if not provided_token or not secrets.compare_digest(provided_token, expected_token):
-            raise HTTPException(status_code=401, detail="Unauthorized")
+        if not _is_request_from_active_tunnel(request):
+            raise HTTPException(status_code=403, detail="Forbidden: tunnel-only endpoint")
 
         pid = os.getpid()
         reason = None
@@ -4285,7 +4253,7 @@ class TunnelClient:
     IDEMPOTENCY_CACHE_TTL = 60.0  # Seconds to keep cached responses
     IDEMPOTENCY_CACHE_MAX_SIZE = 1000  # Maximum number of cached responses
     
-    def __init__(self, host: str, port: int, secret: str, target_port: int, config: Config, keepalive_manager: Optional["KeepAliveManager"] = None, remote_keepalive_for_main_id: Optional[str] = None):
+    def __init__(self, host: str, port: int, secret: str, target_port: int, config: Config, keepalive_manager: Optional["KeepAliveManager"] = None, remote_keepalive_for_main_id: Optional[str] = None, internal_request_token: Optional[str] = None):
         self.host = host
         self.port = port
         self.secret = secret
@@ -4297,6 +4265,7 @@ class TunnelClient:
         self._consecutive_failures = 0  # Track consecutive short-lived connections for diagnostics
         self.keepalive_manager = keepalive_manager
         self.remote_keepalive_for_main_id = remote_keepalive_for_main_id
+        self.internal_request_token = internal_request_token
         
         # Idempotency cache: key -> (timestamp, response)
         # Used to prevent duplicate execution of actions when retries occur
@@ -4797,6 +4766,9 @@ class TunnelClient:
         path = meta["path"]
         query = meta.get("query", "")
         headers = meta.get("headers", {})
+        request_headers = dict(headers) if isinstance(headers, dict) else {}
+        if self.internal_request_token:
+            request_headers[TUNNEL_INTERNAL_REQUEST_HEADER] = self.internal_request_token
         
         # Check for idempotency key (case-insensitive header lookup)
         idempotency_key: Optional[str] = None
@@ -4855,7 +4827,7 @@ class TunnelClient:
                     pool=30.0
                 )
                 async with httpx.AsyncClient(timeout=timeout_obj) as request_client:
-                    async with request_client.stream(method, url, headers=headers, content=body) as response:
+                    async with request_client.stream(method, url, headers=request_headers, content=body) as response:
                         duration_ms = (time.time() - request_start) * 1000
                         print(f"{method} {path} -> {response.status_code}")
                         debug_logger.request_forwarded(method, path, response.status_code, duration_ms)
@@ -4872,7 +4844,7 @@ class TunnelClient:
                         }
             else:
                 # Use default client for all other requests (30s timeout) 
-                async with client.stream(method, url, headers=headers, content=body) as response:
+                async with client.stream(method, url, headers=request_headers, content=body) as response:
                     duration_ms = (time.time() - request_start) * 1000
                     print(f"{method} {path} -> {response.status_code}")
                     debug_logger.request_forwarded(method, path, response.status_code, duration_ms)
@@ -5475,8 +5447,9 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
     """Run both API server and tunnel client."""
     # Store connection info for use by update endpoint
     _set_connection_info(host, port)
-    # Use join secret as default auth token for /internal/shutdown.
-    app.state.shutdown_token = secret
+    # Per-process marker used to gate tunnel-only internal endpoints.
+    tunnel_internal_token = secrets.token_hex(32)
+    app.state.tunnel_internal_token = tunnel_internal_token
     
     config = get_config()
     
@@ -5575,7 +5548,8 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
         return TunnelClient(
             host, port, secret, actual_target_port, config,
             keepalive_manager=keepalive_manager if keepalive_enabled else None,
-            remote_keepalive_for_main_id=register_as_keepalive_for
+            remote_keepalive_for_main_id=register_as_keepalive_for,
+            internal_request_token=tunnel_internal_token,
         )
 
     async def start_tunnel():
