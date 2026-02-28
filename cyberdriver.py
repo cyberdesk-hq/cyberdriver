@@ -2047,7 +2047,10 @@ def _get_env_float(name: str, default: float, minimum: float = 0.0) -> float:
     if not math.isfinite(value):
         print(f"Warning: non-finite {name}={raw!r}; using default {default}")
         return default
-    return max(minimum, value)
+    if value < minimum:
+        print(f"Warning: {name}={raw!r} is below minimum {minimum}; clamping to {minimum}")
+        return minimum
+    return value
 
 
 # Post-type settle delay:
