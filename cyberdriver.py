@@ -2312,6 +2312,53 @@ async def post_remote_keepalive_disable():
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+@app.post("/shutdown")
+@app.post("/internal/shutdown")
+async def post_shutdown(payload: Optional[Dict[str, Any]] = None):
+    """Request cyberdriver to terminate itself.
+
+    Intended for cloud control-plane use when a machine/session is being turned off.
+    Returns immediately, then exits the process shortly after the response is sent.
+    """
+    try:
+        pid = os.getpid()
+        reason = None
+        source = "unknown"
+        if isinstance(payload, dict):
+            reason = payload.get("reason")
+            source = str(payload.get("source") or source)
+
+        if getattr(app.state, "shutdown_requested", False):
+            return {
+                "status": "already_shutting_down",
+                "pid": pid,
+                "reason": reason,
+                "source": source,
+            }
+
+        app.state.shutdown_requested = True
+        print(f"Shutdown requested via API (pid={pid}, source={source}, reason={reason or 'none'})")
+
+        async def _delayed_shutdown():
+            # Small delay gives HTTP response time to flush through tunnel/proxy.
+            await asyncio.sleep(0.25)
+            try:
+                _remove_pid_file_safely()
+            except Exception:
+                pass
+            os._exit(0)
+
+        asyncio.create_task(_delayed_shutdown())
+        return {
+            "status": "shutting_down",
+            "pid": pid,
+            "reason": reason,
+            "source": source,
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @app.get("/internal/diagnostics")
 async def get_diagnostics():
     """Get diagnostic information for debugging connection issues."""
@@ -3932,35 +3979,16 @@ def _restart_cyberdriver_process() -> bool:
     2. Spawns a new cyberdriver process with the exact same command-line arguments
     3. Exits the current process
     
-    Safety: After MAX_RESTARTS consecutive restarts without a successful long connection,
-    the process will exit rather than restart again to prevent infinite loops.
-    
     Returns:
         True if we're about to exit (new process spawned successfully)
         False if spawn failed and we should continue in current process
         
     Note: If successful, this function exits the process and never returns.
     """
-    MAX_RESTARTS = 5  # Maximum consecutive restarts before giving up
-    
     restart_count = _get_restart_count() + 1
-    
-    # Check if we've exceeded max restarts
-    if restart_count > MAX_RESTARTS:
-        print(f"\n{'='*60}")
-        print(f"❌ RESTART LIMIT REACHED")
-        print(f"{'='*60}")
-        print(f"\nCyberdriver has restarted {restart_count - 1} times without establishing")
-        print(f"a stable connection. This may indicate:")
-        print(f"   1. The Cyberdesk API is down for extended maintenance")
-        print(f"   2. Network connectivity issues")
-        print(f"   3. Persistent _MEI folder corruption (try reinstalling)")
-        print(f"\nTo restart manually, run: cyberdriver join --secret YOUR_KEY")
-        print(f"{'='*60}\n")
-        sys.exit(1)
-    
+
     print(f"\n{'='*60}")
-    print(f"🔄 RESTARTING CYBERDRIVER (attempt {restart_count}/{MAX_RESTARTS})")
+    print(f"🔄 RESTARTING CYBERDRIVER (attempt #{restart_count})")
     print(f"{'='*60}")
     print(f"Spawning fresh process to recover from potential _MEI issues...")
     print(f"This is equivalent to: cyberdriver stop && cyberdriver join ...")
@@ -3978,7 +4006,7 @@ def _restart_cyberdriver_process() -> bool:
     try:
         log_path = get_config_dir() / "restart-history.log"
         with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"\n[{_utc_now_iso()}] Restarting cyberdriver (attempt {restart_count}/{MAX_RESTARTS})\n")
+            f.write(f"\n[{_utc_now_iso()}] Restarting cyberdriver (attempt #{restart_count})\n")
             f.write(f"Command: {' '.join(cmd)}\n")
             f.write(f"PID (old): {os.getpid()}\n")
             f.write(f"_MEIPASS: {getattr(sys, '_MEIPASS', 'N/A')}\n")
