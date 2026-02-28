@@ -64,7 +64,7 @@ from typing import Dict, List, Optional, Tuple, Union, Any
 from enum import Enum
 from dataclasses import dataclass
 from io import BytesIO
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 import certifi
 import httpx
@@ -87,6 +87,7 @@ from datetime import datetime, timezone
 
 _ISO_TIMESTAMP_PREFIX_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2}T")
 _ORIGINAL_PRINT = builtins.print
+_PRINT_TIMESTAMP_STATE = threading.local()
 
 
 def _utc_now_iso() -> str:
@@ -115,8 +116,29 @@ def _prefix_log_line_with_utc_timestamp(text: str) -> str:
     return f"{prefix}[{_utc_now_iso()}] {body}"
 
 
+@contextmanager
+def _suppress_print_timestamps():
+    """Temporarily disable timestamp prefixing for system/UX output."""
+    previous_depth = int(getattr(_PRINT_TIMESTAMP_STATE, "suppress_depth", 0))
+    _PRINT_TIMESTAMP_STATE.suppress_depth = previous_depth + 1
+    try:
+        yield
+    finally:
+        if previous_depth <= 0:
+            try:
+                delattr(_PRINT_TIMESTAMP_STATE, "suppress_depth")
+            except Exception:
+                pass
+        else:
+            _PRINT_TIMESTAMP_STATE.suppress_depth = previous_depth
+
+
 def _print_with_utc_timestamp(*args, **kwargs):
     """Global print wrapper that adds UTC timestamps to regular log lines."""
+    if int(getattr(_PRINT_TIMESTAMP_STATE, "suppress_depth", 0)) > 0:
+        _ORIGINAL_PRINT(*args, **kwargs)
+        return
+
     end = kwargs.get("end", "\n")
     # Preserve non-line-buffered prints used by countdown/progress output.
     if end != "\n":
@@ -6146,7 +6168,8 @@ def main():
     
     # Print banner if no arguments or help requested
     if len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] in ['-h', '--help']):
-        print_banner()
+        with _suppress_print_timestamps():
+            print_banner()
     
     parser = argparse.ArgumentParser(
         description="Remote computer control via Cyberdesk",
@@ -6274,7 +6297,8 @@ def main():
     # Handle help or no command
     if not args.command or args.help:
         if not (len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] in ['-h', '--help'])):
-            print_banner()
+            with _suppress_print_timestamps():
+                print_banner()
         print("Commands:")
         print("  join --secret KEY                         Connect to Cyberdesk Cloud")
         print("  join --secret KEY --keepalive             Enable keepalive")
@@ -6318,7 +6342,8 @@ def main():
             old_argv = info.get("argv", [])
             timestamp = _utc_now_iso()
             
-            print_banner(mode="connecting")
+            with _suppress_print_timestamps():
+                print_banner(mode="connecting")
             # Use yellow/warning color for visibility (if terminal supports it)
             if _should_use_color():
                 print(f"\033[93mCyberdriver is already running (PID {old_pid}).\033[0m")
@@ -6399,13 +6424,14 @@ def main():
             child_argv.append(f"--_stdio-log={stdio_log_path}")
 
             # Show the nice banner in the *current* terminal (this is not the detached child).
-            print_banner(mode="connecting")
-            print("Cyberdriver is now running in the background.")
-            print("You can close PowerShell.")
-            print(f"Logs: {stdio_log_path}")
-            _print_prominent_stop_hint()
-            print("(You can also end cyberdriver.exe in Task Manager.)")
-            print()
+            with _suppress_print_timestamps():
+                print_banner(mode="connecting")
+                print("Cyberdriver is now running in the background.")
+                print("You can close PowerShell.")
+                print(f"Logs: {stdio_log_path}")
+                _print_prominent_stop_hint()
+                print("(You can also end cyberdriver.exe in Task Manager.)")
+                print()
             _windows_relaunch_detached(child_argv, stdio_log_path)
 
             # Default UX: return immediately. If the user wants logs in this terminal,
@@ -6424,7 +6450,8 @@ def main():
     
     # Show banner for join command
     if args.command == "join":
-        print_banner(mode="connecting")
+        with _suppress_print_timestamps():
+            print_banner(mode="connecting")
     
     # Check for admin privileges if black screen recovery or persistent display is enabled
     needs_admin = False
