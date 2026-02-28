@@ -2079,13 +2079,20 @@ def _get_env_float(name: str, default: float, minimum: float = 0.0) -> float:
 # Remote desktops (Citrix/RDP/VDI) can render injected keystrokes slightly after
 # key events are queued. We apply a fixed base delay plus a char-count-based
 # delay to reduce races with immediate follow-up actions/screenshots.
+# To prevent upstream request timeouts from causing duplicate retry typing,
+# this delay is capped by default. Set CYBERDRIVER_TYPING_SETTLE_MAX_SECONDS=0
+# to disable the cap and use purely uncapped linear delay.
 TYPING_SETTLE_BASE_SECONDS = _get_env_float("CYBERDRIVER_TYPING_SETTLE_BASE_SECONDS", 0.05)
 TYPING_SETTLE_PER_CHAR_SECONDS = _get_env_float("CYBERDRIVER_TYPING_SETTLE_PER_CHAR_SECONDS", 0.007)
+TYPING_SETTLE_MAX_SECONDS = _get_env_float("CYBERDRIVER_TYPING_SETTLE_MAX_SECONDS", 1.5)
 
 
 def _compute_typing_settle_delay(text: str) -> float:
     char_count = len(text or "")
-    return max(0.0, TYPING_SETTLE_BASE_SECONDS + (char_count * TYPING_SETTLE_PER_CHAR_SECONDS))
+    uncapped_delay = TYPING_SETTLE_BASE_SECONDS + (char_count * TYPING_SETTLE_PER_CHAR_SECONDS)
+    if TYPING_SETTLE_MAX_SECONDS <= 0:
+        return max(0.0, uncapped_delay)
+    return max(0.0, min(uncapped_delay, TYPING_SETTLE_MAX_SECONDS))
 
 
 async def _wait_for_typing_settle(text: str) -> None:
@@ -3254,6 +3261,7 @@ def _win32_send_key(scan_code: int, key_up: bool = False):
 def _type_with_win32_sendinput(text: str):
     """Type text using Windows SendInput API with hardware scan codes."""
     LSHIFT_SCANCODE = 0x2A
+    unsupported_chars: Dict[str, int] = {}
     
     for char in text:
         # Handle space specially when experimental mode is enabled
@@ -3282,7 +3290,7 @@ def _type_with_win32_sendinput(text: str):
             scan_code = SYMBOL_SCANCODES[char]
         
         if scan_code is None:
-            print(f"Warning: Character '{char}' not supported by scan code method, skipping")
+            unsupported_chars[char] = unsupported_chars.get(char, 0) + 1
             continue
         
         # Send key events
@@ -3292,6 +3300,17 @@ def _type_with_win32_sendinput(text: str):
         _win32_send_key(scan_code, key_up=True)
         if needs_shift:
             _win32_send_key(LSHIFT_SCANCODE, key_up=True)
+
+    if unsupported_chars:
+        total_unsupported = sum(unsupported_chars.values())
+        top_items = sorted(unsupported_chars.items(), key=lambda item: item[1], reverse=True)[:5]
+        summary = ", ".join(f"{repr(ch)} x{count}" for ch, count in top_items)
+        remaining = len(unsupported_chars) - len(top_items)
+        extra = f" (+{remaining} more)" if remaining > 0 else ""
+        print(
+            f"Warning: Skipped {total_unsupported} unsupported character(s) "
+            f"in scan code typing: {summary}{extra}"
+        )
 
 
 def _press_key_with_scancode(key: str, key_up: bool = False):
