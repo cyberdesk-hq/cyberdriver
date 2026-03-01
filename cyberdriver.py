@@ -3409,16 +3409,15 @@ async def post_keyboard_type(payload: Dict[str, str]):
             # Ensure Caps Lock is OFF to prevent case inversion
             await _ensure_capslock_off()
 
-            # Run keyboard typing in a worker thread so long inputs don't block the event loop.
-            # This keeps tunnel I/O responsive while typing and reduces cascading timeouts.
+            # Execute typing on the request thread to preserve input-path behavior.
             if platform.system() == "Windows":
                 try:
-                    await asyncio.to_thread(_type_with_win32_sendinput, text)
+                    _type_with_win32_sendinput(text)
                 except Exception as e:
                     print(f"Warning: SendInput failed ({e}), falling back to PyAutoGUI")
-                    await asyncio.to_thread(pyautogui.typewrite, text)
+                    pyautogui.typewrite(text)
             else:
-                await asyncio.to_thread(pyautogui.typewrite, text)
+                pyautogui.typewrite(text)
 
             await _wait_for_typing_settle(text)
             app.state.keyboard_type_last_hash = text_hash
