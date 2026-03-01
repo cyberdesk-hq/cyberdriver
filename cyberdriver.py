@@ -3393,6 +3393,18 @@ async def post_keyboard_type(payload: Dict[str, str]):
 
     async with typing_lock:
         now = time.time()
+        # Re-check in-flight state after acquiring the lock to avoid a race where
+        # two identical requests pass the pre-lock check simultaneously.
+        inflight_hash = getattr(app.state, "keyboard_type_inflight_hash", None)
+        inflight_started = float(getattr(app.state, "keyboard_type_inflight_started_at", 0.0) or 0.0)
+        if (
+            isinstance(inflight_hash, str)
+            and inflight_hash == text_hash
+            and (now - inflight_started) <= KEYBOARD_TYPE_INFLIGHT_DEDUPE_MAX_SECONDS
+        ):
+            print("Duplicate /keyboard/type payload detected after lock acquisition; skipping retry typing")
+            return {}
+
         last_hash = getattr(app.state, "keyboard_type_last_hash", None)
         last_completed = float(getattr(app.state, "keyboard_type_last_completed_at", 0.0) or 0.0)
         if (
