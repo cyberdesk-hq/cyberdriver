@@ -42,6 +42,7 @@ import argparse
 import asyncio
 import base64
 import builtins
+import hashlib
 import json
 import math
 import os
@@ -2081,11 +2082,34 @@ def _get_env_float(name: str, default: float, minimum: float = 0.0) -> float:
 # delay to reduce races with immediate follow-up actions/screenshots.
 TYPING_SETTLE_BASE_SECONDS = _get_env_float("CYBERDRIVER_TYPING_SETTLE_BASE_SECONDS", 0.05)
 TYPING_SETTLE_PER_CHAR_SECONDS = _get_env_float("CYBERDRIVER_TYPING_SETTLE_PER_CHAR_SECONDS", 0.007)
+KEYBOARD_TYPE_SECONDS_PER_CHAR_ESTIMATE = _get_env_float(
+    "CYBERDRIVER_KEYBOARD_TYPE_SECONDS_PER_CHAR_ESTIMATE", 0.004
+)
+KEYBOARD_TYPE_TIMEOUT_BUFFER_SECONDS = _get_env_float(
+    "CYBERDRIVER_KEYBOARD_TYPE_TIMEOUT_BUFFER_SECONDS", 8.0
+)
+KEYBOARD_TYPE_DEDUPE_WINDOW_SECONDS = _get_env_float(
+    "CYBERDRIVER_KEYBOARD_TYPE_DEDUPE_WINDOW_SECONDS", 5.0
+)
+KEYBOARD_TYPE_INFLIGHT_DEDUPE_MAX_SECONDS = _get_env_float(
+    "CYBERDRIVER_KEYBOARD_TYPE_INFLIGHT_DEDUPE_MAX_SECONDS", 300.0, minimum=1.0
+)
 
 
 def _compute_typing_settle_delay(text: str) -> float:
     char_count = len(text or "")
     return max(0.0, TYPING_SETTLE_BASE_SECONDS + (char_count * TYPING_SETTLE_PER_CHAR_SECONDS))
+
+
+def _hash_keyboard_type_text(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8", errors="replace")).hexdigest()
+
+
+def _estimate_keyboard_type_timeout_seconds(text: str) -> float:
+    char_count = len(text or "")
+    estimated_typing_seconds = char_count * KEYBOARD_TYPE_SECONDS_PER_CHAR_ESTIMATE
+    settle_seconds = _compute_typing_settle_delay(text)
+    return max(30.0, estimated_typing_seconds + settle_seconds + KEYBOARD_TYPE_TIMEOUT_BUFFER_SECONDS)
 
 
 async def _wait_for_typing_settle(text: str) -> None:
@@ -2103,6 +2127,11 @@ async def lifespan(app: FastAPI):
     """Manage application lifespan events."""
     # Startup
     app.state.start_time = time.time()
+    app.state.keyboard_type_lock = asyncio.Lock()
+    app.state.keyboard_type_inflight_hash = None
+    app.state.keyboard_type_inflight_started_at = 0.0
+    app.state.keyboard_type_last_hash = None
+    app.state.keyboard_type_last_completed_at = 0.0
     yield
     # Shutdown
     print("Shutting down...")
@@ -3254,6 +3283,7 @@ def _win32_send_key(scan_code: int, key_up: bool = False):
 def _type_with_win32_sendinput(text: str):
     """Type text using Windows SendInput API with hardware scan codes."""
     LSHIFT_SCANCODE = 0x2A
+    unsupported_chars: Dict[str, int] = {}
     
     for char in text:
         # Handle space specially when experimental mode is enabled
@@ -3282,7 +3312,7 @@ def _type_with_win32_sendinput(text: str):
             scan_code = SYMBOL_SCANCODES[char]
         
         if scan_code is None:
-            print(f"Warning: Character '{char}' not supported by scan code method, skipping")
+            unsupported_chars[char] = unsupported_chars.get(char, 0) + 1
             continue
         
         # Send key events
@@ -3292,6 +3322,17 @@ def _type_with_win32_sendinput(text: str):
         _win32_send_key(scan_code, key_up=True)
         if needs_shift:
             _win32_send_key(LSHIFT_SCANCODE, key_up=True)
+
+    if unsupported_chars:
+        total_unsupported = sum(unsupported_chars.values())
+        top_items = sorted(unsupported_chars.items(), key=lambda item: item[1], reverse=True)[:5]
+        summary = ", ".join(f"{repr(ch)} x{count}" for ch, count in top_items)
+        remaining = len(unsupported_chars) - len(top_items)
+        extra = f" (+{remaining} more)" if remaining > 0 else ""
+        print(
+            f"Warning: Skipped {total_unsupported} unsupported character(s) "
+            f"in scan code typing: {summary}{extra}"
+        )
 
 
 def _press_key_with_scancode(key: str, key_up: bool = False):
@@ -3329,23 +3370,76 @@ async def post_keyboard_type(payload: Dict[str, str]):
     text = payload.get("text")
     if not text:
         raise HTTPException(status_code=400, detail="Missing 'text' field")
-    
-    # Ensure Caps Lock is OFF to prevent case inversion
-    await _ensure_capslock_off()
-    
-    # On Windows: use native SendInput with scan codes (Citrix-compatible)
-    # On macOS/Linux: use PyAutoGUI
-    if platform.system() == "Windows":
-        try:
-            _type_with_win32_sendinput(text)
-            await _wait_for_typing_settle(text)
+    if not isinstance(text, str):
+        text = str(text)
+
+    text_hash = _hash_keyboard_type_text(text)
+
+    typing_lock: Optional[asyncio.Lock] = getattr(app.state, "keyboard_type_lock", None)
+    if typing_lock is None:
+        typing_lock = asyncio.Lock()
+        app.state.keyboard_type_lock = typing_lock
+
+    now = time.time()
+    inflight_hash = getattr(app.state, "keyboard_type_inflight_hash", None)
+    inflight_started = float(getattr(app.state, "keyboard_type_inflight_started_at", 0.0) or 0.0)
+    if (
+        isinstance(inflight_hash, str)
+        and inflight_hash == text_hash
+        and (now - inflight_started) <= KEYBOARD_TYPE_INFLIGHT_DEDUPE_MAX_SECONDS
+    ):
+        print("Duplicate /keyboard/type payload received while identical request is in-flight; skipping retry typing")
+        return {}
+
+    async with typing_lock:
+        now = time.time()
+        # Re-check in-flight state after acquiring the lock to avoid a race where
+        # two identical requests pass the pre-lock check simultaneously.
+        inflight_hash = getattr(app.state, "keyboard_type_inflight_hash", None)
+        inflight_started = float(getattr(app.state, "keyboard_type_inflight_started_at", 0.0) or 0.0)
+        if (
+            isinstance(inflight_hash, str)
+            and inflight_hash == text_hash
+            and (now - inflight_started) <= KEYBOARD_TYPE_INFLIGHT_DEDUPE_MAX_SECONDS
+        ):
+            print("Duplicate /keyboard/type payload detected after lock acquisition; skipping retry typing")
             return {}
-        except Exception as e:
-            print(f"Warning: SendInput failed ({e}), falling back to PyAutoGUI")
-    
-    # Fallback for non-Windows or if SendInput fails
-    pyautogui.typewrite(text)
-    await _wait_for_typing_settle(text)
+
+        last_hash = getattr(app.state, "keyboard_type_last_hash", None)
+        last_completed = float(getattr(app.state, "keyboard_type_last_completed_at", 0.0) or 0.0)
+        if (
+            isinstance(last_hash, str)
+            and last_hash == text_hash
+            and (now - last_completed) <= KEYBOARD_TYPE_DEDUPE_WINDOW_SECONDS
+        ):
+            print("Duplicate /keyboard/type payload received shortly after completion; skipping retry typing")
+            return {}
+
+        app.state.keyboard_type_inflight_hash = text_hash
+        app.state.keyboard_type_inflight_started_at = now
+        try:
+            # Ensure Caps Lock is OFF to prevent case inversion
+            await _ensure_capslock_off()
+
+            # Execute typing in a worker thread so long input doesn't block
+            # tunnel I/O on the main event loop. We still await completion,
+            # so the endpoint only returns after typing is actually done.
+            if platform.system() == "Windows":
+                try:
+                    await asyncio.to_thread(_type_with_win32_sendinput, text)
+                except Exception as e:
+                    print(f"Warning: SendInput failed ({e}), falling back to PyAutoGUI")
+                    await asyncio.to_thread(pyautogui.typewrite, text)
+            else:
+                await asyncio.to_thread(pyautogui.typewrite, text)
+
+            await _wait_for_typing_settle(text)
+            app.state.keyboard_type_last_hash = text_hash
+            app.state.keyboard_type_last_completed_at = time.time()
+        finally:
+            app.state.keyboard_type_inflight_hash = None
+            app.state.keyboard_type_inflight_started_at = 0.0
+
     return {}
 
 
@@ -4817,6 +4911,7 @@ class TunnelClient:
             url += f"?{query}"
         
         # For PowerShell exec requests, extract timeout from body and use custom client
+        # For keyboard type requests, compute timeout based on text length
         # For all other requests, use the default client with 30s timeout
         use_custom_timeout = False
         request_timeout = 30.0
@@ -4828,6 +4923,15 @@ class TunnelClient:
                     # The local FastAPI will timeout the subprocess at exactly `timeout` seconds,
                     # so we need to wait slightly longer to receive that response 
                     request_timeout = float(payload["timeout"]) + 3.0  # 3s buffer for local processing
+                    use_custom_timeout = True
+            except Exception:
+                pass  # Fall back to default client if parsing fails
+        elif path == "/computer/input/keyboard/type" and body:
+            try:
+                payload = json.loads(body.decode('utf-8'))
+                text = payload.get("text")
+                if isinstance(text, str):
+                    request_timeout = _estimate_keyboard_type_timeout_seconds(text)
                     use_custom_timeout = True
             except Exception:
                 pass  # Fall back to default client if parsing fails
