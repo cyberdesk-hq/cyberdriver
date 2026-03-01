@@ -2082,6 +2082,12 @@ def _get_env_float(name: str, default: float, minimum: float = 0.0) -> float:
 # delay to reduce races with immediate follow-up actions/screenshots.
 TYPING_SETTLE_BASE_SECONDS = _get_env_float("CYBERDRIVER_TYPING_SETTLE_BASE_SECONDS", 0.05)
 TYPING_SETTLE_PER_CHAR_SECONDS = _get_env_float("CYBERDRIVER_TYPING_SETTLE_PER_CHAR_SECONDS", 0.007)
+TYPING_SETTLE_LINEAR_THRESHOLD_CHARS = int(
+    _get_env_float("CYBERDRIVER_TYPING_SETTLE_LINEAR_THRESHOLD_CHARS", 300.0, minimum=0.0)
+)
+TYPING_SETTLE_LONG_TEXT_PER_CHAR_SECONDS = _get_env_float(
+    "CYBERDRIVER_TYPING_SETTLE_LONG_TEXT_PER_CHAR_SECONDS", 0.0008
+)
 KEYBOARD_TYPE_SECONDS_PER_CHAR_ESTIMATE = _get_env_float(
     "CYBERDRIVER_KEYBOARD_TYPE_SECONDS_PER_CHAR_ESTIMATE", 0.004
 )
@@ -2098,7 +2104,17 @@ KEYBOARD_TYPE_INFLIGHT_DEDUPE_MAX_SECONDS = _get_env_float(
 
 def _compute_typing_settle_delay(text: str) -> float:
     char_count = len(text or "")
-    return max(0.0, TYPING_SETTLE_BASE_SECONDS + (char_count * TYPING_SETTLE_PER_CHAR_SECONDS))
+    linear_threshold = max(0, int(TYPING_SETTLE_LINEAR_THRESHOLD_CHARS))
+    if char_count <= linear_threshold:
+        return max(0.0, TYPING_SETTLE_BASE_SECONDS + (char_count * TYPING_SETTLE_PER_CHAR_SECONDS))
+
+    overflow_chars = char_count - linear_threshold
+    return max(
+        0.0,
+        TYPING_SETTLE_BASE_SECONDS
+        + (linear_threshold * TYPING_SETTLE_PER_CHAR_SECONDS)
+        + (overflow_chars * TYPING_SETTLE_LONG_TEXT_PER_CHAR_SECONDS),
+    )
 
 
 def _hash_keyboard_type_text(text: str) -> str:
