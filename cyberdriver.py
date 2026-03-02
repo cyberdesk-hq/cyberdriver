@@ -2100,6 +2100,26 @@ KEYBOARD_TYPE_DEDUPE_WINDOW_SECONDS = _get_env_float(
 KEYBOARD_TYPE_INFLIGHT_DEDUPE_MAX_SECONDS = _get_env_float(
     "CYBERDRIVER_KEYBOARD_TYPE_INFLIGHT_DEDUPE_MAX_SECONDS", 300.0, minimum=1.0
 )
+WINDOWS_SENDINPUT_INTER_KEY_DELAY_SECONDS = _get_env_float(
+    "CYBERDRIVER_WINDOWS_SENDINPUT_INTER_KEY_DELAY_SECONDS", 0.0015
+)
+WINDOWS_SENDINPUT_DELAY_THRESHOLD_CHARS = int(
+    _get_env_float("CYBERDRIVER_WINDOWS_SENDINPUT_DELAY_THRESHOLD_CHARS", 120.0, minimum=0.0)
+)
+
+UNICODE_TYPING_REPLACEMENTS = (
+    ("\r\n", "\n"),
+    ("\r", "\n"),
+    ("\u00A0", " "),   # non-breaking space
+    ("\u2013", "-"),   # en dash
+    ("\u2014", "-"),   # em dash
+    ("\u2212", "-"),   # unicode minus
+    ("\u2018", "'"),   # left single quote
+    ("\u2019", "'"),   # right single quote
+    ("\u201C", '"'),   # left double quote
+    ("\u201D", '"'),   # right double quote
+    ("\u2026", "..."), # ellipsis
+)
 
 
 def _compute_typing_settle_delay(text: str) -> float:
@@ -2119,6 +2139,13 @@ def _compute_typing_settle_delay(text: str) -> float:
 
 def _hash_keyboard_type_text(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8", errors="replace")).hexdigest()
+
+
+def _normalize_text_for_keyboard_typing(text: str) -> str:
+    normalized = text or ""
+    for source, target in UNICODE_TYPING_REPLACEMENTS:
+        normalized = normalized.replace(source, target)
+    return normalized
 
 
 def _estimate_keyboard_type_timeout_seconds(text: str) -> float:
@@ -3300,6 +3327,9 @@ def _type_with_win32_sendinput(text: str):
     """Type text using Windows SendInput API with hardware scan codes."""
     LSHIFT_SCANCODE = 0x2A
     unsupported_chars: Dict[str, int] = {}
+    inter_key_delay = 0.0
+    if len(text or "") >= max(0, WINDOWS_SENDINPUT_DELAY_THRESHOLD_CHARS):
+        inter_key_delay = max(0.0, WINDOWS_SENDINPUT_INTER_KEY_DELAY_SECONDS)
     
     for char in text:
         # Handle space specially when experimental mode is enabled
@@ -3338,6 +3368,8 @@ def _type_with_win32_sendinput(text: str):
         _win32_send_key(scan_code, key_up=True)
         if needs_shift:
             _win32_send_key(LSHIFT_SCANCODE, key_up=True)
+        if inter_key_delay > 0:
+            time.sleep(inter_key_delay)
 
     if unsupported_chars:
         total_unsupported = sum(unsupported_chars.values())
@@ -3389,6 +3421,7 @@ async def post_keyboard_type(payload: Dict[str, str]):
     if not isinstance(text, str):
         text = str(text)
 
+    text = _normalize_text_for_keyboard_typing(text)
     text_hash = _hash_keyboard_type_text(text)
     estimated_timeout_seconds = _estimate_keyboard_type_timeout_seconds(text)
     dedupe_window_seconds = max(
