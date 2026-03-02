@@ -3413,7 +3413,7 @@ def _press_key_with_scancode(key: str, key_up: bool = False):
 
 
 @app.post("/computer/input/keyboard/type")
-async def post_keyboard_type(payload: Dict[str, str]):
+async def post_keyboard_type(request: Request, payload: Dict[str, str]):
     """Type a string of text."""
     text = payload.get("text")
     if not text:
@@ -3423,6 +3423,12 @@ async def post_keyboard_type(payload: Dict[str, str]):
 
     text = _normalize_text_for_keyboard_typing(text)
     text_hash = _hash_keyboard_type_text(text)
+    idempotency_key_raw = request.headers.get("x-idempotency-key")
+    idempotency_key = idempotency_key_raw.strip() if isinstance(idempotency_key_raw, str) else ""
+    # Use idempotency key for retry dedupe when available; otherwise fall back to
+    # payload hash for in-flight protection only.
+    dedupe_key = f"idem:{idempotency_key}" if idempotency_key else f"text:{text_hash}"
+    post_completion_dedupe_enabled = bool(idempotency_key)
     estimated_timeout_seconds = _estimate_keyboard_type_timeout_seconds(text)
     dedupe_window_seconds = max(
         KEYBOARD_TYPE_DEDUPE_WINDOW_SECONDS,
@@ -3439,7 +3445,7 @@ async def post_keyboard_type(payload: Dict[str, str]):
     inflight_started = float(getattr(app.state, "keyboard_type_inflight_started_at", 0.0) or 0.0)
     if (
         isinstance(inflight_hash, str)
-        and inflight_hash == text_hash
+        and inflight_hash == dedupe_key
         and (now - inflight_started) <= KEYBOARD_TYPE_INFLIGHT_DEDUPE_MAX_SECONDS
     ):
         print("Duplicate /keyboard/type payload received while identical request is in-flight; skipping retry typing")
@@ -3453,7 +3459,7 @@ async def post_keyboard_type(payload: Dict[str, str]):
         inflight_started = float(getattr(app.state, "keyboard_type_inflight_started_at", 0.0) or 0.0)
         if (
             isinstance(inflight_hash, str)
-            and inflight_hash == text_hash
+            and inflight_hash == dedupe_key
             and (now - inflight_started) <= KEYBOARD_TYPE_INFLIGHT_DEDUPE_MAX_SECONDS
         ):
             print("Duplicate /keyboard/type payload detected after lock acquisition; skipping retry typing")
@@ -3462,14 +3468,15 @@ async def post_keyboard_type(payload: Dict[str, str]):
         last_hash = getattr(app.state, "keyboard_type_last_hash", None)
         last_completed = float(getattr(app.state, "keyboard_type_last_completed_at", 0.0) or 0.0)
         if (
-            isinstance(last_hash, str)
-            and last_hash == text_hash
+            post_completion_dedupe_enabled
+            and isinstance(last_hash, str)
+            and last_hash == dedupe_key
             and (now - last_completed) <= dedupe_window_seconds
         ):
             print("Duplicate /keyboard/type payload received shortly after completion; skipping retry typing")
             return {}
 
-        app.state.keyboard_type_inflight_hash = text_hash
+        app.state.keyboard_type_inflight_hash = dedupe_key
         app.state.keyboard_type_inflight_started_at = now
         try:
             # Ensure Caps Lock is OFF to prevent case inversion
@@ -3488,7 +3495,7 @@ async def post_keyboard_type(payload: Dict[str, str]):
                 await asyncio.to_thread(pyautogui.typewrite, text)
 
             await _wait_for_typing_settle(text)
-            app.state.keyboard_type_last_hash = text_hash
+            app.state.keyboard_type_last_hash = dedupe_key
             app.state.keyboard_type_last_completed_at = time.time()
         finally:
             app.state.keyboard_type_inflight_hash = None
