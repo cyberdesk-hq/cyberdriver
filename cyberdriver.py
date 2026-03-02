@@ -117,6 +117,21 @@ def _prefix_log_line_with_utc_timestamp(text: str) -> str:
     return f"{prefix}[{_utc_now_iso()}] {body}"
 
 
+def _prefix_log_text_with_utc_timestamps(text: str) -> str:
+    """Prefix each non-empty line in a text block with a UTC timestamp."""
+    if "\n" not in text:
+        return _prefix_log_line_with_utc_timestamp(text)
+
+    lines = text.split("\n")
+    prefixed_lines: List[str] = []
+    for line in lines:
+        if line == "":
+            prefixed_lines.append(line)
+            continue
+        prefixed_lines.append(_prefix_log_line_with_utc_timestamp(line))
+    return "\n".join(prefixed_lines)
+
+
 @contextmanager
 def _suppress_print_timestamps():
     """Temporarily disable timestamp prefixing for system/UX output."""
@@ -155,15 +170,15 @@ def _print_with_utc_timestamp(*args, **kwargs):
 
     # If each argument can become its own line (e.g., sep="\n"), prefix each one.
     if "\n" in sep:
-        prefixed_args = [_prefix_log_line_with_utc_timestamp(text) for text in text_args]
+        prefixed_args = [_prefix_log_text_with_utc_timestamps(text) for text in text_args]
         _ORIGINAL_PRINT(*prefixed_args, **kwargs)
         return
 
-    # Otherwise render exactly one output line and prefix it once.
+    # Otherwise render the final output and prefix each non-empty line.
     rendered = sep.join(text_args)
     kwargs_single = dict(kwargs)
     kwargs_single.pop("sep", None)
-    _ORIGINAL_PRINT(_prefix_log_line_with_utc_timestamp(rendered), **kwargs_single)
+    _ORIGINAL_PRINT(_prefix_log_text_with_utc_timestamps(rendered), **kwargs_single)
 
 
 if getattr(builtins.print, "__name__", "") != "_print_with_utc_timestamp":
@@ -2165,6 +2180,16 @@ async def _wait_for_typing_settle(text: str) -> None:
         return
     await asyncio.sleep(delay_seconds)
 
+
+def _initialize_keyboard_type_state(target_app: FastAPI) -> None:
+    """Initialize keyboard typing dedupe state and lock."""
+    target_app.state.keyboard_type_lock = asyncio.Lock()
+    target_app.state.keyboard_type_inflight_hash = None
+    target_app.state.keyboard_type_inflight_started_at = 0.0
+    target_app.state.keyboard_type_last_hash = None
+    target_app.state.keyboard_type_last_completed_at = 0.0
+
+
 # -----------------------------------------------------------------------------
 # Local API implementation
 # -----------------------------------------------------------------------------
@@ -2174,11 +2199,7 @@ async def lifespan(app: FastAPI):
     """Manage application lifespan events."""
     # Startup
     app.state.start_time = time.time()
-    app.state.keyboard_type_lock = asyncio.Lock()
-    app.state.keyboard_type_inflight_hash = None
-    app.state.keyboard_type_inflight_started_at = 0.0
-    app.state.keyboard_type_last_hash = None
-    app.state.keyboard_type_last_completed_at = 0.0
+    _initialize_keyboard_type_state(app)
     yield
     # Shutdown
     print("Shutting down...")
@@ -2188,6 +2209,7 @@ async def lifespan(app: FastAPI):
     print("Cleanup complete")
 
 app = FastAPI(title="Cyberdriver", version=VERSION, lifespan=lifespan)
+_initialize_keyboard_type_state(app)
 
 
 def _log_error_and_check_mei(error: Exception, context: str = "") -> bool:
@@ -3446,10 +3468,7 @@ async def post_keyboard_type(request: Request, payload: Dict[str, Any]):
     dedupe_key = f"idem:{idempotency_key}" if idempotency_key else None
     post_completion_window_seconds = KEYBOARD_TYPE_DEDUPE_WINDOW_SECONDS if idempotency_key else 0.0
 
-    typing_lock: Optional[asyncio.Lock] = getattr(app.state, "keyboard_type_lock", None)
-    if typing_lock is None:
-        typing_lock = asyncio.Lock()
-        app.state.keyboard_type_lock = typing_lock
+    typing_lock: asyncio.Lock = app.state.keyboard_type_lock
 
     now = time.time()
     inflight_hash = getattr(app.state, "keyboard_type_inflight_hash", None)
@@ -4189,6 +4208,21 @@ def _get_restart_count() -> int:
         return 0
 
 
+def _get_max_restarts() -> Optional[int]:
+    """Get optional max restart limit; None means unlimited retries."""
+    raw_value = str(os.environ.get("CYBERDRIVER_MAX_RESTARTS", "")).strip()
+    if not raw_value:
+        return None
+    try:
+        parsed = int(raw_value)
+    except (ValueError, TypeError):
+        print(f"Warning: Invalid CYBERDRIVER_MAX_RESTARTS={raw_value!r}; ignoring restart limit")
+        return None
+    if parsed <= 0:
+        return None
+    return parsed
+
+
 def _restart_cyberdriver_process() -> bool:
     """
     Restart cyberdriver by spawning a new process and exiting the current one.
@@ -4215,6 +4249,19 @@ def _restart_cyberdriver_process() -> bool:
     RESTART_HISTORY_MAX_BYTES = 1 * 1024 * 1024  # Cap restart-history.log at 1MB
 
     restart_count = _get_restart_count() + 1
+    max_restarts = _get_max_restarts()
+
+    if max_restarts is not None and restart_count > max_restarts:
+        print(f"\n{'='*60}")
+        print("❌ RESTART LIMIT REACHED")
+        print(f"{'='*60}")
+        print(
+            f"Configured max restarts ({max_restarts}) exceeded "
+            f"after {restart_count - 1} restart attempts."
+        )
+        print("Set CYBERDRIVER_MAX_RESTARTS=0 to allow unlimited retries.")
+        print(f"{'='*60}\n")
+        sys.exit(1)
 
     if restart_count >= RESTART_WARNING_EVERY and restart_count % RESTART_WARNING_EVERY == 0:
         print(f"\n{'='*60}")
