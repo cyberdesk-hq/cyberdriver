@@ -87,6 +87,7 @@ from datetime import datetime, timezone
 # -----------------------------------------------------------------------------
 
 _ISO_TIMESTAMP_PREFIX_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2}T")
+_IS_WINDOWS = platform.system() == "Windows"
 _ORIGINAL_PRINT = builtins.print
 _PRINT_TIMESTAMP_STATE = threading.local()
 
@@ -2157,7 +2158,7 @@ def _estimate_keyboard_type_timeout_seconds(text: str) -> float:
     # Windows long-text typing may include per-key pacing in SendInput mode.
     # Include that extra time so timeout/dedupe windows track actual duration.
     if (
-        platform.system() == "Windows"
+        _IS_WINDOWS
         and char_count >= WINDOWS_SENDINPUT_DELAY_THRESHOLD_CHARS
         and WINDOWS_SENDINPUT_INTER_KEY_DELAY_SECONDS > 0
     ):
@@ -3340,7 +3341,7 @@ def _type_with_win32_sendinput(text: str):
     unsupported_chars: Dict[str, int] = {}
     inter_key_delay = 0.0
     if len(text or "") >= WINDOWS_SENDINPUT_DELAY_THRESHOLD_CHARS:
-        inter_key_delay = max(0.0, WINDOWS_SENDINPUT_INTER_KEY_DELAY_SECONDS)
+        inter_key_delay = WINDOWS_SENDINPUT_INTER_KEY_DELAY_SECONDS
     
     for char in text:
         # Handle space specially when experimental mode is enabled
@@ -3502,7 +3503,7 @@ async def post_keyboard_type(request: Request, payload: Dict[str, str]):
             # Execute typing in a worker thread so long input doesn't block
             # tunnel I/O on the main event loop. We still await completion,
             # so the endpoint only returns after typing is actually done.
-            if platform.system() == "Windows":
+            if _IS_WINDOWS:
                 try:
                     await asyncio.to_thread(_type_with_win32_sendinput, text)
                 except Exception as e:
