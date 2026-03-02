@@ -2347,8 +2347,17 @@ async def global_exception_handler(request, exc):
 
 @app.middleware("http")
 async def disable_buffering(request, call_next):
-    """Middleware to ensure responses are not buffered."""
-    response = await call_next(request)
+    """Log every request once and ensure responses are not buffered."""
+    method = request.method
+    path = request.url.path
+    try:
+        response = await call_next(request)
+    except Exception:
+        # Keep one request outcome line even when downstream raises unexpectedly.
+        print(f"{method} {path} -> 500")
+        raise
+
+    print(f"{method} {path} -> {response.status_code}")
     # Add headers to disable any proxy buffering
     response.headers["X-Accel-Buffering"] = "no"
     response.headers["Cache-Control"] = "no-cache"
@@ -5022,7 +5031,6 @@ class TunnelClient:
                 async with httpx.AsyncClient(timeout=timeout_obj) as request_client:
                     async with request_client.stream(method, url, headers=request_headers, content=body) as response:
                         duration_ms = (time.time() - request_start) * 1000
-                        print(f"{method} {path} -> {response.status_code}")
                         debug_logger.request_forwarded(method, path, response.status_code, duration_ms)
                         
                         # Read the response body immediately to avoid buffering
@@ -5039,7 +5047,6 @@ class TunnelClient:
                 # Use default client for all other requests (30s timeout) 
                 async with client.stream(method, url, headers=request_headers, content=body) as response:
                     duration_ms = (time.time() - request_start) * 1000
-                    print(f"{method} {path} -> {response.status_code}")
                     debug_logger.request_forwarded(method, path, response.status_code, duration_ms)
                     
                     # Read the response body immediately to avoid buffering
