@@ -2200,6 +2200,11 @@ async def lifespan(app: FastAPI):
     # Startup
     app.state.start_time = time.time()
     _initialize_keyboard_type_state(app)
+    app.state.shutdown_requested = False
+    app.state.shutdown_task = None
+    # /internal/shutdown is intentionally tunnel-only; standalone server modes keep this unset.
+    if not hasattr(app.state, "tunnel_internal_token"):
+        app.state.tunnel_internal_token = None
     yield
     # Shutdown
     print("Shutting down...")
@@ -2209,7 +2214,6 @@ async def lifespan(app: FastAPI):
     print("Cleanup complete")
 
 app = FastAPI(title="Cyberdriver", version=VERSION, lifespan=lifespan)
-_initialize_keyboard_type_state(app)
 
 
 def _log_error_and_check_mei(error: Exception, context: str = "") -> bool:
@@ -2511,7 +2515,10 @@ async def post_shutdown(request: Request, payload: Optional[Dict[str, Any]] = No
             except Exception:
                 pass
             # Use a graceful interpreter exit so atexit handlers can flush buffered logs.
-            asyncio.get_running_loop().call_soon(sys.exit, 0)
+            loop = asyncio.get_running_loop()
+            loop.call_soon(sys.exit, 0)
+            # Fallback: force termination if SystemExit is intercepted by runtime wrappers.
+            loop.call_later(2.0, os._exit, 0)
 
         shutdown_task = asyncio.create_task(_delayed_shutdown())
         app.state.shutdown_task = shutdown_task
