@@ -2095,7 +2095,7 @@ KEYBOARD_TYPE_TIMEOUT_BUFFER_SECONDS = _get_env_float(
     "CYBERDRIVER_KEYBOARD_TYPE_TIMEOUT_BUFFER_SECONDS", 8.0
 )
 KEYBOARD_TYPE_DEDUPE_WINDOW_SECONDS = _get_env_float(
-    "CYBERDRIVER_KEYBOARD_TYPE_DEDUPE_WINDOW_SECONDS", 5.0
+    "CYBERDRIVER_KEYBOARD_TYPE_DEDUPE_WINDOW_SECONDS", 20.0
 )
 KEYBOARD_TYPE_INFLIGHT_DEDUPE_MAX_SECONDS = _get_env_float(
     "CYBERDRIVER_KEYBOARD_TYPE_INFLIGHT_DEDUPE_MAX_SECONDS", 300.0, minimum=1.0
@@ -3390,6 +3390,11 @@ async def post_keyboard_type(payload: Dict[str, str]):
         text = str(text)
 
     text_hash = _hash_keyboard_type_text(text)
+    estimated_timeout_seconds = _estimate_keyboard_type_timeout_seconds(text)
+    dedupe_window_seconds = max(
+        KEYBOARD_TYPE_DEDUPE_WINDOW_SECONDS,
+        min(120.0, estimated_timeout_seconds + 5.0),
+    )
 
     typing_lock: Optional[asyncio.Lock] = getattr(app.state, "keyboard_type_lock", None)
     if typing_lock is None:
@@ -3426,7 +3431,7 @@ async def post_keyboard_type(payload: Dict[str, str]):
         if (
             isinstance(last_hash, str)
             and last_hash == text_hash
-            and (now - last_completed) <= KEYBOARD_TYPE_DEDUPE_WINDOW_SECONDS
+            and (now - last_completed) <= dedupe_window_seconds
         ):
             print("Duplicate /keyboard/type payload received shortly after completion; skipping retry typing")
             return {}
