@@ -5176,12 +5176,14 @@ class TunnelClient:
 
 def run_server(port: int):
     """Run the FastAPI server."""
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    # Keep request logging single-sourced via Cyberdriver's own timestamped print lines.
+    uvicorn.run(app, host="0.0.0.0", port=port, access_log=False)
 
 
 async def run_server_async(port: int):
     """Run the FastAPI server asynchronously."""
-    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="info")
+    # Keep request logging single-sourced via Cyberdriver's own timestamped print lines.
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="info", access_log=False)
     server = uvicorn.Server(config)
     await server.serve()
 
