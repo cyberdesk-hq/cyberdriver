@@ -2097,6 +2097,9 @@ KEYBOARD_TYPE_TIMEOUT_BUFFER_SECONDS = _get_env_float(
 KEYBOARD_TYPE_DEDUPE_WINDOW_SECONDS = _get_env_float(
     "CYBERDRIVER_KEYBOARD_TYPE_DEDUPE_WINDOW_SECONDS", 20.0
 )
+KEYBOARD_TYPE_TEXT_HASH_FALLBACK_WINDOW_SECONDS = _get_env_float(
+    "CYBERDRIVER_KEYBOARD_TYPE_TEXT_HASH_FALLBACK_WINDOW_SECONDS", 5.0
+)
 KEYBOARD_TYPE_INFLIGHT_DEDUPE_MAX_SECONDS = _get_env_float(
     "CYBERDRIVER_KEYBOARD_TYPE_INFLIGHT_DEDUPE_MAX_SECONDS", 300.0, minimum=1.0
 )
@@ -3336,7 +3339,7 @@ def _type_with_win32_sendinput(text: str):
     LSHIFT_SCANCODE = 0x2A
     unsupported_chars: Dict[str, int] = {}
     inter_key_delay = 0.0
-    if len(text or "") >= max(0, WINDOWS_SENDINPUT_DELAY_THRESHOLD_CHARS):
+    if len(text or "") >= WINDOWS_SENDINPUT_DELAY_THRESHOLD_CHARS:
         inter_key_delay = max(0.0, WINDOWS_SENDINPUT_INTER_KEY_DELAY_SECONDS)
     
     for char in text:
@@ -3432,18 +3435,22 @@ async def post_keyboard_type(request: Request, payload: Dict[str, str]):
         text = str(text)
 
     text = _normalize_text_for_keyboard_typing(text)
-    text_hash = _hash_keyboard_type_text(text)
     idempotency_key_raw = request.headers.get("x-idempotency-key")
     idempotency_key = idempotency_key_raw.strip() if isinstance(idempotency_key_raw, str) else ""
-    # Use idempotency key for retry dedupe when available; otherwise fall back to
-    # payload hash for in-flight protection only.
-    dedupe_key = f"idem:{idempotency_key}" if idempotency_key else f"text:{text_hash}"
-    post_completion_dedupe_enabled = bool(idempotency_key)
-    estimated_timeout_seconds = _estimate_keyboard_type_timeout_seconds(text)
-    dedupe_window_seconds = max(
-        KEYBOARD_TYPE_DEDUPE_WINDOW_SECONDS,
-        min(120.0, estimated_timeout_seconds + 5.0),
-    )
+    # Use idempotency key for retry dedupe when available.
+    # For non-idempotent callers, keep a short text-hash fallback window so
+    # immediate HTTP-layer retries don't re-type text after completion.
+    if idempotency_key:
+        dedupe_key = f"idem:{idempotency_key}"
+        estimated_timeout_seconds = _estimate_keyboard_type_timeout_seconds(text)
+        post_completion_window_seconds = max(
+            KEYBOARD_TYPE_DEDUPE_WINDOW_SECONDS,
+            min(120.0, estimated_timeout_seconds + 5.0),
+        )
+    else:
+        text_hash = _hash_keyboard_type_text(text)
+        dedupe_key = f"text:{text_hash}"
+        post_completion_window_seconds = max(0.0, KEYBOARD_TYPE_TEXT_HASH_FALLBACK_WINDOW_SECONDS)
 
     typing_lock: Optional[asyncio.Lock] = getattr(app.state, "keyboard_type_lock", None)
     if typing_lock is None:
@@ -3478,10 +3485,10 @@ async def post_keyboard_type(request: Request, payload: Dict[str, str]):
         last_hash = getattr(app.state, "keyboard_type_last_hash", None)
         last_completed = float(getattr(app.state, "keyboard_type_last_completed_at", 0.0) or 0.0)
         if (
-            post_completion_dedupe_enabled
+            post_completion_window_seconds > 0
             and isinstance(last_hash, str)
             and last_hash == dedupe_key
-            and (now - last_completed) <= dedupe_window_seconds
+            and (now - last_completed) <= post_completion_window_seconds
         ):
             print("Duplicate /keyboard/type payload received shortly after completion; skipping retry typing")
             return {}
