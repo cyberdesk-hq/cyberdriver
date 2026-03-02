@@ -3431,7 +3431,7 @@ def _press_key_with_scancode(key: str, key_up: bool = False):
 
 
 @app.post("/computer/input/keyboard/type")
-async def post_keyboard_type(request: Request, payload: Dict[str, str]):
+async def post_keyboard_type(request: Request, payload: Dict[str, Any]):
     """Type a string of text."""
     text = payload.get("text")
     if not text:
