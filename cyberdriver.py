@@ -2350,14 +2350,17 @@ async def disable_buffering(request, call_next):
     """Log every request once and ensure responses are not buffered."""
     method = request.method
     path = request.url.path
+    request_start = time.perf_counter()
     try:
         response = await call_next(request)
     except Exception:
         # Keep one request outcome line even when downstream raises unexpectedly.
-        print(f"{method} {path} -> 500")
+        duration_ms = (time.perf_counter() - request_start) * 1000
+        print(f"{method} {path} -> 500 ({duration_ms:.1f}ms)")
         raise
 
-    print(f"{method} {path} -> {response.status_code}")
+    duration_ms = (time.perf_counter() - request_start) * 1000
+    print(f"{method} {path} -> {response.status_code} ({duration_ms:.1f}ms)")
     # Add headers to disable any proxy buffering
     response.headers["X-Accel-Buffering"] = "no"
     response.headers["Cache-Control"] = "no-cache"
@@ -5647,6 +5650,13 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
                    black_screen_check_interval: float = 30.0,
                    debug_enabled: bool = False):
     """Run both API server and tunnel client."""
+    # Ensure default transfer directory exists for file operations during join.
+    transfers_dir = pathlib.Path.home() / "CyberdeskTransfers"
+    try:
+        transfers_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"Warning: Failed to create transfer directory at {transfers_dir}: {e}")
+
     # Store connection info for use by update endpoint
     _set_connection_info(host, port)
     # Per-process marker used to gate tunnel-only internal endpoints.
