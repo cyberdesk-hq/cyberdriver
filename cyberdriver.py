@@ -2350,14 +2350,17 @@ async def disable_buffering(request, call_next):
     """Log every request once and ensure responses are not buffered."""
     method = request.method
     path = request.url.path
+    request_start = time.perf_counter()
     try:
         response = await call_next(request)
     except Exception:
         # Keep one request outcome line even when downstream raises unexpectedly.
-        print(f"{method} {path} -> 500")
+        duration_ms = (time.perf_counter() - request_start) * 1000
+        print(f"{method} {path} -> 500 ({duration_ms:.1f}ms)")
         raise
 
-    print(f"{method} {path} -> {response.status_code}")
+    duration_ms = (time.perf_counter() - request_start) * 1000
+    print(f"{method} {path} -> {response.status_code} ({duration_ms:.1f}ms)")
     # Add headers to disable any proxy buffering
     response.headers["X-Accel-Buffering"] = "no"
     response.headers["Cache-Control"] = "no-cache"
