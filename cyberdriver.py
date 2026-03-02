@@ -2124,7 +2124,7 @@ UNICODE_TYPING_REPLACEMENTS = (
 
 def _compute_typing_settle_delay(text: str) -> float:
     char_count = len(text or "")
-    linear_threshold = max(0, int(TYPING_SETTLE_LINEAR_THRESHOLD_CHARS))
+    linear_threshold = TYPING_SETTLE_LINEAR_THRESHOLD_CHARS
     if char_count <= linear_threshold:
         return max(0.0, TYPING_SETTLE_BASE_SECONDS + (char_count * TYPING_SETTLE_PER_CHAR_SECONDS))
 
@@ -2151,6 +2151,14 @@ def _normalize_text_for_keyboard_typing(text: str) -> str:
 def _estimate_keyboard_type_timeout_seconds(text: str) -> float:
     char_count = len(text or "")
     estimated_typing_seconds = char_count * KEYBOARD_TYPE_SECONDS_PER_CHAR_ESTIMATE
+    # Windows long-text typing may include per-key pacing in SendInput mode.
+    # Include that extra time so timeout/dedupe windows track actual duration.
+    if (
+        platform.system() == "Windows"
+        and char_count >= WINDOWS_SENDINPUT_DELAY_THRESHOLD_CHARS
+        and WINDOWS_SENDINPUT_INTER_KEY_DELAY_SECONDS > 0
+    ):
+        estimated_typing_seconds += char_count * WINDOWS_SENDINPUT_INTER_KEY_DELAY_SECONDS
     settle_seconds = _compute_typing_settle_delay(text)
     return max(30.0, estimated_typing_seconds + settle_seconds + KEYBOARD_TYPE_TIMEOUT_BUFFER_SECONDS)
 
@@ -3336,6 +3344,8 @@ def _type_with_win32_sendinput(text: str):
         if char == ' ' and EXPERIMENTAL_SPACE_ENABLED:
             _win32_send_vk_space(key_up=False)
             _win32_send_vk_space(key_up=True)
+            if inter_key_delay > 0:
+                time.sleep(inter_key_delay)
             continue
         
         upper_char = char.upper()
