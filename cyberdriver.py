@@ -42,7 +42,6 @@ import argparse
 import asyncio
 import base64
 import builtins
-import hashlib
 import json
 import math
 import os
@@ -87,6 +86,7 @@ from datetime import datetime, timezone
 # -----------------------------------------------------------------------------
 
 _ISO_TIMESTAMP_PREFIX_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2}T")
+_IS_WINDOWS = platform.system() == "Windows"
 _ORIGINAL_PRINT = builtins.print
 _PRINT_TIMESTAMP_STATE = threading.local()
 
@@ -2082,6 +2082,12 @@ def _get_env_float(name: str, default: float, minimum: float = 0.0) -> float:
 # delay to reduce races with immediate follow-up actions/screenshots.
 TYPING_SETTLE_BASE_SECONDS = _get_env_float("CYBERDRIVER_TYPING_SETTLE_BASE_SECONDS", 0.05)
 TYPING_SETTLE_PER_CHAR_SECONDS = _get_env_float("CYBERDRIVER_TYPING_SETTLE_PER_CHAR_SECONDS", 0.007)
+TYPING_SETTLE_LINEAR_THRESHOLD_CHARS = int(
+    _get_env_float("CYBERDRIVER_TYPING_SETTLE_LINEAR_THRESHOLD_CHARS", 300.0, minimum=0.0)
+)
+TYPING_SETTLE_LONG_TEXT_PER_CHAR_SECONDS = _get_env_float(
+    "CYBERDRIVER_TYPING_SETTLE_LONG_TEXT_PER_CHAR_SECONDS", 0.0008
+)
 KEYBOARD_TYPE_SECONDS_PER_CHAR_ESTIMATE = _get_env_float(
     "CYBERDRIVER_KEYBOARD_TYPE_SECONDS_PER_CHAR_ESTIMATE", 0.004
 )
@@ -2089,25 +2095,66 @@ KEYBOARD_TYPE_TIMEOUT_BUFFER_SECONDS = _get_env_float(
     "CYBERDRIVER_KEYBOARD_TYPE_TIMEOUT_BUFFER_SECONDS", 8.0
 )
 KEYBOARD_TYPE_DEDUPE_WINDOW_SECONDS = _get_env_float(
-    "CYBERDRIVER_KEYBOARD_TYPE_DEDUPE_WINDOW_SECONDS", 5.0
+    "CYBERDRIVER_KEYBOARD_TYPE_DEDUPE_WINDOW_SECONDS", 20.0
 )
 KEYBOARD_TYPE_INFLIGHT_DEDUPE_MAX_SECONDS = _get_env_float(
     "CYBERDRIVER_KEYBOARD_TYPE_INFLIGHT_DEDUPE_MAX_SECONDS", 300.0, minimum=1.0
+)
+WINDOWS_SENDINPUT_INTER_KEY_DELAY_SECONDS = _get_env_float(
+    "CYBERDRIVER_WINDOWS_SENDINPUT_INTER_KEY_DELAY_SECONDS", 0.0015
+)
+WINDOWS_SENDINPUT_DELAY_THRESHOLD_CHARS = int(
+    _get_env_float("CYBERDRIVER_WINDOWS_SENDINPUT_DELAY_THRESHOLD_CHARS", 120.0, minimum=0.0)
+)
+
+UNICODE_TYPING_REPLACEMENTS = (
+    ("\r\n", "\n"),
+    ("\r", "\n"),
+    ("\u00A0", " "),   # non-breaking space
+    ("\u2013", "-"),   # en dash
+    ("\u2014", "-"),   # em dash
+    ("\u2212", "-"),   # unicode minus
+    ("\u2018", "'"),   # left single quote
+    ("\u2019", "'"),   # right single quote
+    ("\u201C", '"'),   # left double quote
+    ("\u201D", '"'),   # right double quote
+    ("\u2026", "..."), # ellipsis
 )
 
 
 def _compute_typing_settle_delay(text: str) -> float:
     char_count = len(text or "")
-    return max(0.0, TYPING_SETTLE_BASE_SECONDS + (char_count * TYPING_SETTLE_PER_CHAR_SECONDS))
+    linear_threshold = TYPING_SETTLE_LINEAR_THRESHOLD_CHARS
+    if char_count <= linear_threshold:
+        return max(0.0, TYPING_SETTLE_BASE_SECONDS + (char_count * TYPING_SETTLE_PER_CHAR_SECONDS))
+
+    overflow_chars = char_count - linear_threshold
+    return max(
+        0.0,
+        TYPING_SETTLE_BASE_SECONDS
+        + (linear_threshold * TYPING_SETTLE_PER_CHAR_SECONDS)
+        + (overflow_chars * TYPING_SETTLE_LONG_TEXT_PER_CHAR_SECONDS),
+    )
 
 
-def _hash_keyboard_type_text(text: str) -> str:
-    return hashlib.sha256((text or "").encode("utf-8", errors="replace")).hexdigest()
+def _normalize_text_for_keyboard_typing(text: str) -> str:
+    normalized = text or ""
+    for source, target in UNICODE_TYPING_REPLACEMENTS:
+        normalized = normalized.replace(source, target)
+    return normalized
 
 
 def _estimate_keyboard_type_timeout_seconds(text: str) -> float:
     char_count = len(text or "")
     estimated_typing_seconds = char_count * KEYBOARD_TYPE_SECONDS_PER_CHAR_ESTIMATE
+    # Windows long-text typing may include per-key pacing in SendInput mode.
+    # Include that extra time so timeout/dedupe windows track actual duration.
+    if (
+        _IS_WINDOWS
+        and char_count >= WINDOWS_SENDINPUT_DELAY_THRESHOLD_CHARS
+        and WINDOWS_SENDINPUT_INTER_KEY_DELAY_SECONDS > 0
+    ):
+        estimated_typing_seconds += char_count * WINDOWS_SENDINPUT_INTER_KEY_DELAY_SECONDS
     settle_seconds = _compute_typing_settle_delay(text)
     return max(30.0, estimated_typing_seconds + settle_seconds + KEYBOARD_TYPE_TIMEOUT_BUFFER_SECONDS)
 
@@ -3284,12 +3331,17 @@ def _type_with_win32_sendinput(text: str):
     """Type text using Windows SendInput API with hardware scan codes."""
     LSHIFT_SCANCODE = 0x2A
     unsupported_chars: Dict[str, int] = {}
+    inter_key_delay = 0.0
+    if len(text or "") >= WINDOWS_SENDINPUT_DELAY_THRESHOLD_CHARS:
+        inter_key_delay = WINDOWS_SENDINPUT_INTER_KEY_DELAY_SECONDS
     
     for char in text:
         # Handle space specially when experimental mode is enabled
         if char == ' ' and EXPERIMENTAL_SPACE_ENABLED:
             _win32_send_vk_space(key_up=False)
             _win32_send_vk_space(key_up=True)
+            if inter_key_delay > 0:
+                time.sleep(inter_key_delay)
             continue
         
         upper_char = char.upper()
@@ -3322,6 +3374,8 @@ def _type_with_win32_sendinput(text: str):
         _win32_send_key(scan_code, key_up=True)
         if needs_shift:
             _win32_send_key(LSHIFT_SCANCODE, key_up=True)
+        if inter_key_delay > 0:
+            time.sleep(inter_key_delay)
 
     if unsupported_chars:
         total_unsupported = sum(unsupported_chars.values())
@@ -3365,7 +3419,7 @@ def _press_key_with_scancode(key: str, key_up: bool = False):
 
 
 @app.post("/computer/input/keyboard/type")
-async def post_keyboard_type(payload: Dict[str, str]):
+async def post_keyboard_type(request: Request, payload: Dict[str, str]):
     """Type a string of text."""
     text = payload.get("text")
     if not text:
@@ -3373,7 +3427,12 @@ async def post_keyboard_type(payload: Dict[str, str]):
     if not isinstance(text, str):
         text = str(text)
 
-    text_hash = _hash_keyboard_type_text(text)
+    text = _normalize_text_for_keyboard_typing(text)
+    idempotency_key_raw = request.headers.get("x-idempotency-key")
+    idempotency_key = idempotency_key_raw.strip() if isinstance(idempotency_key_raw, str) else ""
+    # Keep /keyboard/type retry dedupe simple: idempotency-key only.
+    dedupe_key = f"idem:{idempotency_key}" if idempotency_key else None
+    post_completion_window_seconds = KEYBOARD_TYPE_DEDUPE_WINDOW_SECONDS if idempotency_key else 0.0
 
     typing_lock: Optional[asyncio.Lock] = getattr(app.state, "keyboard_type_lock", None)
     if typing_lock is None:
@@ -3384,8 +3443,9 @@ async def post_keyboard_type(payload: Dict[str, str]):
     inflight_hash = getattr(app.state, "keyboard_type_inflight_hash", None)
     inflight_started = float(getattr(app.state, "keyboard_type_inflight_started_at", 0.0) or 0.0)
     if (
-        isinstance(inflight_hash, str)
-        and inflight_hash == text_hash
+        dedupe_key
+        and isinstance(inflight_hash, str)
+        and inflight_hash == dedupe_key
         and (now - inflight_started) <= KEYBOARD_TYPE_INFLIGHT_DEDUPE_MAX_SECONDS
     ):
         print("Duplicate /keyboard/type payload received while identical request is in-flight; skipping retry typing")
@@ -3398,8 +3458,9 @@ async def post_keyboard_type(payload: Dict[str, str]):
         inflight_hash = getattr(app.state, "keyboard_type_inflight_hash", None)
         inflight_started = float(getattr(app.state, "keyboard_type_inflight_started_at", 0.0) or 0.0)
         if (
-            isinstance(inflight_hash, str)
-            and inflight_hash == text_hash
+            dedupe_key
+            and isinstance(inflight_hash, str)
+            and inflight_hash == dedupe_key
             and (now - inflight_started) <= KEYBOARD_TYPE_INFLIGHT_DEDUPE_MAX_SECONDS
         ):
             print("Duplicate /keyboard/type payload detected after lock acquisition; skipping retry typing")
@@ -3408,14 +3469,16 @@ async def post_keyboard_type(payload: Dict[str, str]):
         last_hash = getattr(app.state, "keyboard_type_last_hash", None)
         last_completed = float(getattr(app.state, "keyboard_type_last_completed_at", 0.0) or 0.0)
         if (
-            isinstance(last_hash, str)
-            and last_hash == text_hash
-            and (now - last_completed) <= KEYBOARD_TYPE_DEDUPE_WINDOW_SECONDS
+            dedupe_key
+            and post_completion_window_seconds > 0
+            and isinstance(last_hash, str)
+            and last_hash == dedupe_key
+            and (now - last_completed) <= post_completion_window_seconds
         ):
             print("Duplicate /keyboard/type payload received shortly after completion; skipping retry typing")
             return {}
 
-        app.state.keyboard_type_inflight_hash = text_hash
+        app.state.keyboard_type_inflight_hash = dedupe_key if dedupe_key else None
         app.state.keyboard_type_inflight_started_at = now
         try:
             # Ensure Caps Lock is OFF to prevent case inversion
@@ -3424,7 +3487,7 @@ async def post_keyboard_type(payload: Dict[str, str]):
             # Execute typing in a worker thread so long input doesn't block
             # tunnel I/O on the main event loop. We still await completion,
             # so the endpoint only returns after typing is actually done.
-            if platform.system() == "Windows":
+            if _IS_WINDOWS:
                 try:
                     await asyncio.to_thread(_type_with_win32_sendinput, text)
                 except Exception as e:
@@ -3434,8 +3497,9 @@ async def post_keyboard_type(payload: Dict[str, str]):
                 await asyncio.to_thread(pyautogui.typewrite, text)
 
             await _wait_for_typing_settle(text)
-            app.state.keyboard_type_last_hash = text_hash
-            app.state.keyboard_type_last_completed_at = time.time()
+            if dedupe_key:
+                app.state.keyboard_type_last_hash = dedupe_key
+                app.state.keyboard_type_last_completed_at = time.time()
         finally:
             app.state.keyboard_type_inflight_hash = None
             app.state.keyboard_type_inflight_started_at = 0.0
