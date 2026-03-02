@@ -5650,6 +5650,13 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
                    black_screen_check_interval: float = 30.0,
                    debug_enabled: bool = False):
     """Run both API server and tunnel client."""
+    # Ensure default transfer directory exists for file operations during join.
+    transfers_dir = pathlib.Path.home() / "CyberdeskTransfers"
+    try:
+        transfers_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"Warning: Failed to create transfer directory at {transfers_dir}: {e}")
+
     # Store connection info for use by update endpoint
     _set_connection_info(host, port)
     # Per-process marker used to gate tunnel-only internal endpoints.
