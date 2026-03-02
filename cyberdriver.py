@@ -2321,7 +2321,7 @@ async def global_exception_handler(request, exc):
     # Immediately log that we entered this handler
     timestamp = _utc_now_iso()
     try:
-        print(f"\n[GLOBAL EXCEPTION HANDLER] {timestamp}", flush=True)
+        print(f"\n[GLOBAL EXCEPTION HANDLER]", flush=True)
         print(f"[GLOBAL EXCEPTION HANDLER] Exception type: {type(exc).__name__}", flush=True)
         print(f"[GLOBAL EXCEPTION HANDLER] Exception message: {exc}", flush=True)
         sys.stdout.flush()
@@ -2510,9 +2510,11 @@ async def post_shutdown(request: Request, payload: Optional[Dict[str, Any]] = No
                 _remove_pid_file_safely()
             except Exception:
                 pass
-            os._exit(0)
+            # Use a graceful interpreter exit so atexit handlers can flush buffered logs.
+            asyncio.get_running_loop().call_soon(sys.exit, 0)
 
-        asyncio.create_task(_delayed_shutdown())
+        shutdown_task = asyncio.create_task(_delayed_shutdown())
+        app.state.shutdown_task = shutdown_task
         return {
             "status": "shutting_down",
             "pid": pid,
@@ -3456,10 +3458,12 @@ def _press_key_with_scancode(key: str, key_up: bool = False):
 async def post_keyboard_type(request: Request, payload: Dict[str, Any]):
     """Type a string of text."""
     text = payload.get("text")
-    if not text:
+    if text is None:
         raise HTTPException(status_code=400, detail="Missing 'text' field")
     if not isinstance(text, str):
         text = str(text)
+    if not text:
+        raise HTTPException(status_code=400, detail="'text' field must not be empty")
 
     text = _normalize_text_for_keyboard_typing(text)
     idempotency_key_raw = request.headers.get("x-idempotency-key")
@@ -5119,7 +5123,7 @@ class TunnelClient:
             # Log to console with full details
             timestamp = _utc_now_iso()
             print(f"\n{'='*60}", flush=True)
-            print(f"[TUNNEL FORWARD ERROR] {timestamp}", flush=True)
+            print(f"[TUNNEL FORWARD ERROR]", flush=True)
             print(f"Error type: {error_type}", flush=True)
             print(f"Error message: {error_msg}", flush=True)
             print(f"Method: {method}", flush=True)
