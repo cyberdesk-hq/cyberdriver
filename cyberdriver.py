@@ -5039,7 +5039,7 @@ class TunnelClient:
         query = meta.get("query", "")
         headers = meta.get("headers", {})
         request_headers = dict(headers) if isinstance(headers, dict) else {}
-        if self.internal_request_token:
+        if self.internal_request_token and path == "/internal/shutdown":
             request_headers[TUNNEL_INTERNAL_REQUEST_HEADER] = self.internal_request_token
         
         # Check for idempotency key (case-insensitive header lookup)
