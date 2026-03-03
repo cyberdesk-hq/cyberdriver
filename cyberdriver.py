@@ -3928,12 +3928,13 @@ async def post_fs_write(payload: Dict[str, Any]):
         raise HTTPException(status_code=400, detail=f"Invalid base64 content: {e}")
     
     try:
-        # Resolve path - no restrictions
-        safe_path = pathlib.Path(file_path).expanduser().resolve()
-        
-        # If path doesn't specify a directory, default to CyberdeskTransfers
-        if not safe_path.parent.exists() and str(safe_path.parent) == ".":
-            safe_path = pathlib.Path.home() / "CyberdeskTransfers" / safe_path.name
+        # If path doesn't specify a directory, default to CyberdeskTransfers.
+        raw_path = pathlib.Path(file_path).expanduser()
+        if (not raw_path.is_absolute()) and str(raw_path.parent) in ("", "."):
+            safe_path = (pathlib.Path.home() / "CyberdeskTransfers" / raw_path.name).resolve()
+        else:
+            # Resolve path - no restrictions
+            safe_path = raw_path.resolve()
         
         # Create parent directories if they don't exist
         safe_path.parent.mkdir(parents=True, exist_ok=True)
