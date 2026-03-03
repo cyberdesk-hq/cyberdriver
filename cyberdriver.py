@@ -166,6 +166,11 @@ def _print_with_utc_timestamp(*args, **kwargs):
         return
 
     sep = kwargs.get("sep", " ")
+    if sep is None:
+        sep = " "
+    elif not isinstance(sep, str):
+        _ORIGINAL_PRINT(*args, **kwargs)
+        return
     text_args = [str(arg) for arg in args]
 
     # If each argument can become its own line (e.g., sep="\n"), prefix each one.
@@ -2244,7 +2249,7 @@ def _log_error_and_check_mei(error: Exception, context: str = "") -> bool:
     
     # Log to console (may not appear if stdout is captured)
     try:
-        print(f"\n[ERROR] {timestamp} - {context}", flush=True)
+        print(f"\n[ERROR] {context}", flush=True)
         print(f"[ERROR] Type: {error_type}", flush=True)
         print(f"[ERROR] Message: {error}", flush=True)
         sys.stdout.flush()
