@@ -186,7 +186,7 @@ def _print_with_utc_timestamp(*args, **kwargs):
     _ORIGINAL_PRINT(_prefix_log_text_with_utc_timestamps(rendered), **kwargs_single)
 
 
-if getattr(builtins.print, "__name__", "") != "_print_with_utc_timestamp":
+if builtins.print is not _print_with_utc_timestamp:
     builtins.print = _print_with_utc_timestamp
 
 # -----------------------------------------------------------------------------
@@ -5083,8 +5083,10 @@ class TunnelClient:
             try:
                 payload = json.loads(body.decode('utf-8'))
                 text = payload.get("text")
-                if isinstance(text, str):
-                    request_timeout = _estimate_keyboard_type_timeout_seconds(text)
+                if text is not None:
+                    text_for_timeout = text if isinstance(text, str) else str(text)
+                    normalized_for_timeout = _normalize_text_for_keyboard_typing(text_for_timeout)
+                    request_timeout = _estimate_keyboard_type_timeout_seconds(normalized_for_timeout)
                     use_custom_timeout = True
             except Exception:
                 pass  # Fall back to default client if parsing fails
