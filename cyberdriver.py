@@ -2492,7 +2492,7 @@ def _is_request_from_active_tunnel(request: Request) -> bool:
 
 
 @app.post("/internal/shutdown")
-async def post_shutdown(request: Request, payload: Optional[Dict[str, Any]] = None):
+async def post_shutdown(request: Request):
     """Request cyberdriver to terminate itself.
 
     Intended for cloud control-plane use when a machine/session is being turned off.
