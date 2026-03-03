@@ -4182,7 +4182,7 @@ async def post_powershell_exec(payload: Dict[str, Any]):
         
         # Log to console
         print(f"\n{'='*60}", flush=True)
-        print(f"[POWERSHELL EXEC ERROR] {timestamp}", flush=True)
+        print(f"[POWERSHELL EXEC ERROR]", flush=True)
         print(f"Error type: {error_type}", flush=True)
         print(f"Error message: {error_msg}", flush=True)
         print(f"Command: {command[:100]}..." if len(command) > 100 else f"Command: {command}", flush=True)
@@ -6258,7 +6258,7 @@ def check_mei_health(context: str = "") -> bool:
         
         # Print to console
         print(f"\n{'='*70}")
-        print(f"[CRITICAL] _MEI HEALTH CHECK FAILED at {timestamp}")
+        print(f"[CRITICAL] _MEI HEALTH CHECK FAILED")
         print(f"[CRITICAL] Context: {context}")
         print(f"[CRITICAL] _MEIPASS: {meipass}")
         print(f"[CRITICAL] Missing directories: {missing}")
