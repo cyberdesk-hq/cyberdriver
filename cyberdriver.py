@@ -2502,6 +2502,18 @@ async def post_shutdown(request: Request):
         if not _is_request_from_active_tunnel(request):
             raise HTTPException(status_code=403, detail="Forbidden: tunnel-only endpoint")
 
+        # Parse request JSON only after auth so unauthenticated malformed payloads
+        # cannot bypass tunnel-only checks via FastAPI body validation.
+        payload: Optional[Dict[str, Any]] = None
+        try:
+            raw_payload = await request.body()
+            if raw_payload:
+                parsed_payload = json.loads(raw_payload.decode("utf-8"))
+                if isinstance(parsed_payload, dict):
+                    payload = parsed_payload
+        except Exception:
+            payload = None
+
         pid = os.getpid()
         reason = None
         source = "unknown"
