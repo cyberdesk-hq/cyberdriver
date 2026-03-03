@@ -3504,6 +3504,8 @@ async def post_keyboard_type(request: Request, payload: Dict[str, Any]):
         raise HTTPException(status_code=400, detail="'text' field must not be empty")
 
     text = _normalize_text_for_keyboard_typing(text)
+    if not text:
+        raise HTTPException(status_code=400, detail="'text' field must not be empty after normalization")
     idempotency_key_raw = request.headers.get("x-idempotency-key")
     idempotency_key = idempotency_key_raw.strip() if isinstance(idempotency_key_raw, str) else ""
     # Keep /keyboard/type retry dedupe simple: idempotency-key only.
