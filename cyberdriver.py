@@ -2202,11 +2202,19 @@ async def lifespan(app: FastAPI):
     _initialize_keyboard_type_state(app)
     app.state.shutdown_requested = False
     app.state.shutdown_task = None
+    app.state.shutdown_force_stop_handle = None
     # /internal/shutdown is intentionally tunnel-only; standalone server modes keep this unset.
     if not hasattr(app.state, "tunnel_internal_token"):
         app.state.tunnel_internal_token = None
     yield
     # Shutdown
+    force_stop_handle = getattr(app.state, "shutdown_force_stop_handle", None)
+    if force_stop_handle is not None:
+        try:
+            force_stop_handle.cancel()
+        except Exception:
+            pass
+        app.state.shutdown_force_stop_handle = None
     print("Shutting down...")
     
     # Shutdown the thread pool executor
@@ -2517,8 +2525,14 @@ async def post_shutdown(request: Request, payload: Optional[Dict[str, Any]] = No
             # Use a graceful interpreter exit so atexit handlers can flush buffered logs.
             loop = asyncio.get_running_loop()
             loop.call_soon(sys.exit, 0)
-            # Fallback: force termination if SystemExit is intercepted by runtime wrappers.
-            loop.call_later(2.0, os._exit, 0)
+            # Fallback: stop the loop if SystemExit gets intercepted by runtime wrappers.
+            # This still allows normal Python process teardown/atexit handling.
+            def _fallback_stop_loop():
+                try:
+                    loop.stop()
+                except Exception:
+                    pass
+            app.state.shutdown_force_stop_handle = loop.call_later(2.0, _fallback_stop_loop)
 
         shutdown_task = asyncio.create_task(_delayed_shutdown())
         app.state.shutdown_task = shutdown_task
