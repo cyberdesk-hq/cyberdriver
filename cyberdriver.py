@@ -4685,11 +4685,12 @@ class TunnelClient:
                     close_code=close_code
                 )
                 
-                # Only reset failure counter if connection lasted more than 10 seconds
-                # Short-lived connections indicate an ongoing problem
+                # After a stable connection, reset all retry/backoff state.
+                # Short-lived connections indicate an ongoing problem.
                 if connection_duration > 10:
                     self._consecutive_failures = 0
                     failures_at_max_sleep = 0
+                    sleep_time = self.min_sleep
                     # Reset restart count since we had a successful long connection
                     # This clears the CYBERDRIVER_RESTART_COUNT env var
                     if "CYBERDRIVER_RESTART_COUNT" in os.environ:
@@ -4839,6 +4840,7 @@ class TunnelClient:
                 if connection_duration > 10:
                     self._consecutive_failures = 0
                     failures_at_max_sleep = 0
+                    sleep_time = self.min_sleep
                     # Reset restart count since we had a successful long connection
                     if "CYBERDRIVER_RESTART_COUNT" in os.environ:
                         del os.environ["CYBERDRIVER_RESTART_COUNT"]
