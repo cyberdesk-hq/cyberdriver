@@ -3549,11 +3549,9 @@ async def post_keyboard_type(request: Request, payload: Dict[str, Any]):
             # tunnel I/O on the main event loop. We still await completion,
             # so the endpoint only returns after typing is actually done.
             if _IS_WINDOWS:
-                try:
-                    await asyncio.to_thread(_type_with_win32_sendinput, text)
-                except Exception as e:
-                    print(f"Warning: SendInput failed ({e}), falling back to PyAutoGUI")
-                    await asyncio.to_thread(pyautogui.typewrite, text)
+                # Avoid fallback retyping the whole string after a partial
+                # SendInput failure, which can duplicate already-queued chars.
+                await asyncio.to_thread(_type_with_win32_sendinput, text)
             else:
                 await asyncio.to_thread(pyautogui.typewrite, text)
 
