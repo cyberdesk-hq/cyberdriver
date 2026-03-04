@@ -51,7 +51,7 @@ New-Item -ItemType Directory -Force -Path $toolDir
 try {
     Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.40/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe" -ErrorAction Stop
 } catch {
-    Write-Host "ERROR: Failed to download Cyberdriver. Please check your internet connection and try again." -ForegroundColor Red
+    Write-Host "ERROR: Failed to download Cyberdriver. If Cyberdriver is already running, run 'cyberdriver stop' first. Otherwise, check your internet connection and try again." -ForegroundColor Red
     return
 }
 
