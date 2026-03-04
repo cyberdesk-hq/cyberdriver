@@ -3604,6 +3604,9 @@ async def post_keyboard_type(request: Request, payload: Dict[str, Any]):
                 await asyncio.shield(typing_task)
             except asyncio.CancelledError:
                 try:
+                    # Intentional trade-off: waiting here keeps dedupe state
+                    # consistent, but holds typing_lock until typing finishes.
+                    # Queued /keyboard/type requests can stall during this window.
                     await typing_task
                 except Exception:
                     pass
@@ -6622,20 +6625,20 @@ def main():
 
     # Handle help or no command
     if not args.command or args.help:
-        if not (len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] in ['-h', '--help'])):
-            with _suppress_print_timestamps():
+        with _suppress_print_timestamps():
+            if not (len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] in ['-h', '--help'])):
                 print_banner()
-        print("Commands:")
-        print("  join --secret KEY                         Connect to Cyberdesk Cloud")
-        print("  join --secret KEY --keepalive             Enable keepalive")
-        print("  join --secret KEY --black-screen-recovery Enable black screen detection (Windows)")
-        print("  join --secret KEY --add-persistent-display Install virtual display driver (Windows)")
-        print("  join --secret KEY --debug                 Enable debug logging to ~/.cyberdriver/logs/")
-        print("  coords                                    Capture screen coordinates (for keepalive)")
-        print("  stop                                     Stop running Cyberdriver")
-        print("  logs                                     Tail Cyberdriver logs (realtime)")
-        print()
-        print("For more info: cyberdriver join -h")
+            print("Commands:")
+            print("  join --secret KEY                         Connect to Cyberdesk Cloud")
+            print("  join --secret KEY --keepalive             Enable keepalive")
+            print("  join --secret KEY --black-screen-recovery Enable black screen detection (Windows)")
+            print("  join --secret KEY --add-persistent-display Install virtual display driver (Windows)")
+            print("  join --secret KEY --debug                 Enable debug logging to ~/.cyberdriver/logs/")
+            print("  coords                                    Capture screen coordinates (for keepalive)")
+            print("  stop                                     Stop running Cyberdriver")
+            print("  logs                                     Tail Cyberdriver logs (realtime)")
+            print()
+            print("For more info: cyberdriver join -h")
         sys.exit(0)
 
     if args.command == "stop":
