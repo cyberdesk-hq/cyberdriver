@@ -2398,6 +2398,8 @@ async def global_exception_handler(request, exc):
 @app.middleware("http")
 async def disable_buffering(request, call_next):
     """Log every request once and ensure responses are not buffered."""
+    # Intentionally keep request-outcome logging enabled for all paths, including
+    # keepalive traffic, so tunnel liveliness/debugging has a single timeline.
     method = request.method
     path = request.url.path
     request_start = time.perf_counter()
@@ -3952,12 +3954,18 @@ async def post_fs_write(payload: Dict[str, Any]):
     """
     file_path = payload.get("path")
     content = payload.get("content")
-    mode = payload.get("mode", "write")
+    mode_raw = payload.get("mode", "write")
+    mode = mode_raw.strip().lower() if isinstance(mode_raw, str) else None
     
     if not file_path:
         raise HTTPException(status_code=400, detail="Missing 'path' field")
     if not content:
         raise HTTPException(status_code=400, detail="Missing 'content' field")
+    if mode not in ("write", "append"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid 'mode' value {mode_raw!r}; expected 'write' or 'append'",
+        )
     
     try:
         # Decode base64 content
