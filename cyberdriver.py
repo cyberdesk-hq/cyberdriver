@@ -2542,14 +2542,14 @@ async def post_shutdown(request: Request):
             # Use a graceful interpreter exit so atexit handlers can flush buffered logs.
             loop = asyncio.get_running_loop()
             loop.call_soon(sys.exit, 0)
-            # Fallback: stop the loop if SystemExit gets intercepted by runtime wrappers.
-            # This still allows normal Python process teardown/atexit handling.
-            def _fallback_stop_loop():
+            # Fallback: retry graceful exit. If that is intercepted again, force terminate.
+            def _fallback_exit_process():
                 try:
-                    loop.stop()
+                    loop.call_later(2.0, os._exit, 0)
                 except Exception:
-                    pass
-            app.state.shutdown_force_stop_handle = loop.call_later(2.0, _fallback_stop_loop)
+                    os._exit(0)
+                sys.exit(0)
+            app.state.shutdown_force_stop_handle = loop.call_later(2.0, _fallback_exit_process)
 
         shutdown_task = asyncio.create_task(_delayed_shutdown())
         app.state.shutdown_task = shutdown_task
@@ -3565,7 +3565,7 @@ async def post_keyboard_type(request: Request, payload: Dict[str, Any]):
             if _IS_WINDOWS:
                 # Avoid fallback retyping the whole string after a partial
                 # SendInput failure, which can duplicate already-queued chars.
-                await asyncio.to_thread(_type_with_win32_sendinput, text)
+                typing_task = asyncio.create_task(asyncio.to_thread(_type_with_win32_sendinput, text))
             else:
                 non_ascii_chars: Dict[str, int] = {}
                 for ch in text:
@@ -3581,7 +3581,18 @@ async def post_keyboard_type(request: Request, payload: Dict[str, Any]):
                         f"Warning: pyautogui.typewrite may skip {skipped_count} non-ASCII character(s): "
                         f"{summary}{extra}"
                     )
-                await asyncio.to_thread(pyautogui.typewrite, text)
+                typing_task = asyncio.create_task(asyncio.to_thread(pyautogui.typewrite, text))
+
+            # Prevent disconnect-triggered cancellation from clearing in-flight dedupe
+            # state while a background typing thread is still running.
+            try:
+                await asyncio.shield(typing_task)
+            except asyncio.CancelledError:
+                try:
+                    await typing_task
+                except Exception:
+                    pass
+                raise
 
             await _wait_for_typing_settle(text)
             if dedupe_key:
@@ -4190,7 +4201,7 @@ async def post_powershell_exec(payload: Dict[str, Any]):
     
     try:
         # Run in thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             executor,
             execute_powershell_command,
