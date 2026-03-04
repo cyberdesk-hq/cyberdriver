@@ -3610,6 +3610,12 @@ async def post_keyboard_type(request: Request, payload: Dict[str, Any]):
                     await typing_task
                 except Exception as typing_exc:
                     print(f"Warning: typing task raised during cancellation: {typing_exc}")
+                else:
+                    # If typing completed despite client disconnect, still mark
+                    # post-completion dedupe state before re-raising cancellation.
+                    if dedupe_key:
+                        app.state.keyboard_type_last_hash = dedupe_key
+                        app.state.keyboard_type_last_completed_at = time.time()
                 raise
 
             await _wait_for_typing_settle(text)
@@ -4305,12 +4311,15 @@ def _get_max_restarts() -> Optional[int]:
     raw_value = str(os.environ.get("CYBERDRIVER_MAX_RESTARTS", "")).strip()
     if not raw_value:
         return None
+    raw_value_lower = raw_value.lower()
+    if raw_value_lower in ("unlimited", "none", "inf", "infinite"):
+        return None
     try:
         parsed = int(raw_value)
     except (ValueError, TypeError):
         print(f"Warning: Invalid CYBERDRIVER_MAX_RESTARTS={raw_value!r}; ignoring restart limit")
         return None
-    if parsed <= 0:
+    if parsed < 0:
         return None
     return parsed
 
@@ -4351,7 +4360,7 @@ def _restart_cyberdriver_process() -> bool:
             f"Configured max restarts ({max_restarts}) exceeded "
             f"after {restart_count - 1} restart attempts."
         )
-        print("Set CYBERDRIVER_MAX_RESTARTS=0 to allow unlimited retries.")
+        print("Set CYBERDRIVER_MAX_RESTARTS=-1 (or unset it) to allow unlimited retries.")
         print(f"{'='*60}\n")
         sys.exit(1)
 
