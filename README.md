@@ -49,7 +49,7 @@ New-Item -ItemType Directory -Force -Path $toolDir
 
 # Download cyberdriver
 try {
-    Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.39/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe" -ErrorAction Stop
+    Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.40/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe" -ErrorAction Stop
 } catch {
     Write-Host "ERROR: Failed to download Cyberdriver. Please check your internet connection and try again." -ForegroundColor Red
     return
@@ -77,7 +77,7 @@ if (Test-Path "$toolDir\cyberdriver.exe") {
 
 ```bash
 # Choose version and target directory
-VERSION=0.0.39
+VERSION=0.0.40
 TOOL_DIR="$HOME/.cyberdriver"
 mkdir -p "$TOOL_DIR"
 

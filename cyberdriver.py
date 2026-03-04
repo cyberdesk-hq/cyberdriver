@@ -41,11 +41,15 @@ Usage:
 import argparse
 import asyncio
 import base64
+import builtins
+import contextvars
 import json
+import math
 import os
 import platform
 import pathlib
 import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -61,7 +65,7 @@ from typing import Dict, List, Optional, Tuple, Union, Any
 from enum import Enum
 from dataclasses import dataclass
 from io import BytesIO
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 import certifi
 import httpx
@@ -70,13 +74,120 @@ import numpy as np
 import pyautogui
 import pyperclip
 from PIL import Image
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from fastapi.responses import Response, JSONResponse
 import uvicorn
 import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatus
-from datetime import datetime
+from datetime import datetime, timezone
+
+# -----------------------------------------------------------------------------
+# UTC Timestamped Console Printing
+# -----------------------------------------------------------------------------
+
+_ISO_TIMESTAMP_PREFIX_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2}T")
+_IS_WINDOWS = platform.system() == "Windows"
+_ORIGINAL_PRINT = builtins.print
+_PRINT_TIMESTAMP_SUPPRESS_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "_print_timestamp_suppress_depth", default=0
+)
+
+
+def _utc_now_iso() -> str:
+    """Return current UTC timestamp in ISO 8601 format with milliseconds."""
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _prefix_log_line_with_utc_timestamp(text: str) -> str:
+    """Prefix a log line with UTC timestamp while preserving leading blank lines."""
+    if not text:
+        return f"[{_utc_now_iso()}]"
+
+    leading_newlines = len(text) - len(text.lstrip("\n"))
+    prefix = text[:leading_newlines]
+    body = text[leading_newlines:]
+
+    # Keep in-place status/countdown updates untouched.
+    if body.startswith("\r"):
+        return text
+    # Avoid double-prefixing lines that already begin with an ISO timestamp.
+    if _ISO_TIMESTAMP_PREFIX_RE.match(body):
+        return text
+
+    if not body:
+        return f"{prefix}[{_utc_now_iso()}]"
+    return f"{prefix}[{_utc_now_iso()}] {body}"
+
+
+def _prefix_log_text_with_utc_timestamps(text: str) -> str:
+    """Prefix each non-empty line in a text block with a UTC timestamp."""
+    if "\n" not in text:
+        return _prefix_log_line_with_utc_timestamp(text)
+
+    lines = text.split("\n")
+    prefixed_lines: List[str] = []
+    for line in lines:
+        if line == "":
+            prefixed_lines.append(line)
+            continue
+        prefixed_lines.append(_prefix_log_line_with_utc_timestamp(line))
+    return "\n".join(prefixed_lines)
+
+
+@contextmanager
+def _suppress_print_timestamps():
+    """Temporarily disable timestamp prefixing for system/UX output."""
+    token = _PRINT_TIMESTAMP_SUPPRESS_DEPTH.set(_PRINT_TIMESTAMP_SUPPRESS_DEPTH.get() + 1)
+    try:
+        yield
+    finally:
+        _PRINT_TIMESTAMP_SUPPRESS_DEPTH.reset(token)
+
+
+def _print_with_utc_timestamp(*args, **kwargs):
+    """Global print wrapper that adds UTC timestamps to regular log lines."""
+    if _PRINT_TIMESTAMP_SUPPRESS_DEPTH.get() > 0:
+        _ORIGINAL_PRINT(*args, **kwargs)
+        return
+
+    if kwargs.get("file") not in (None, sys.stdout):
+        _ORIGINAL_PRINT(*args, **kwargs)
+        return
+
+    end = kwargs.get("end", "\n")
+    # Preserve non-line-buffered prints used by countdown/progress output.
+    if end != "\n":
+        _ORIGINAL_PRINT(*args, **kwargs)
+        return
+
+    if not args:
+        _ORIGINAL_PRINT(f"[{_utc_now_iso()}]", **kwargs)
+        return
+
+    sep = kwargs.get("sep", " ")
+    if sep is None:
+        sep = " "
+    elif not isinstance(sep, str):
+        _ORIGINAL_PRINT(*args, **kwargs)
+        return
+    text_args = [str(arg) for arg in args]
+
+    # If each argument can become its own line (e.g., sep="\n"), prefix each one.
+    if "\n" in sep:
+        prefixed_args = [_prefix_log_text_with_utc_timestamps(text) for text in text_args]
+        _ORIGINAL_PRINT(*prefixed_args, **kwargs)
+        return
+
+    # Otherwise render the final output and prefix each non-empty line.
+    rendered = sep.join(text_args)
+    kwargs_single = dict(kwargs)
+    kwargs_single.pop("sep", None)
+    _ORIGINAL_PRINT(_prefix_log_text_with_utc_timestamps(rendered), **kwargs_single)
+
+
+if builtins.print is not _print_with_utc_timestamp:
+    builtins.print = _print_with_utc_timestamp
 
 # -----------------------------------------------------------------------------
 # Debug Logging System
@@ -118,7 +229,7 @@ class DebugLogger:
     
     def _get_log_file(self) -> pathlib.Path:
         """Get the current log file path, rotating by day."""
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if self._current_date != today:
             self._current_date = today
             self._log_file = self.log_dir / f"cyberdriver-{today}.log"
@@ -126,7 +237,7 @@ class DebugLogger:
     
     def _format_timestamp(self) -> str:
         """Get formatted timestamp for log entries."""
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        return _utc_now_iso()
     
     def _write(self, level: str, category: str, message: str, **context):
         """Write a log entry."""
@@ -774,7 +885,7 @@ def _setup_detached_stdio_if_configured():
             try:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
                 with open(self._path, "w", encoding=self._encoding) as f:
-                    f.write(f"[{datetime.now().isoformat()}] Log truncated (max 10MB)\n")
+                    f.write(f"[{_utc_now_iso()}] Log truncated (max 10MB)\n")
                     f.flush()
             except Exception:
                 # If truncation fails, fall back to append to whatever exists.
@@ -820,7 +931,7 @@ def _setup_detached_stdio_if_configured():
                     try:
                         if encoded is None:
                             encoded = text.encode(self._encoding, errors="replace")
-                        marker_str = f"\n[{datetime.now().isoformat()}] Log chunk truncated to fit 10MB cap\n"
+                        marker_str = f"\n[{_utc_now_iso()}] Log chunk truncated to fit 10MB cap\n"
                         marker_b = marker_str.encode(self._encoding, errors="replace")
                         if len(marker_b) >= remaining:
                             tail_b = encoded[-remaining:]
@@ -879,7 +990,7 @@ def _setup_detached_stdio_if_configured():
         atexit.register(lambda: writer.close())
         sys.stdout = writer  # type: ignore[assignment]
         sys.stderr = writer  # type: ignore[assignment]
-        print(f"\n[{datetime.now().isoformat()}] Cyberdriver detached logging started")
+        print("\nCyberdriver detached logging started")
         sys.stdout.flush()
     except Exception:
         # If we can't redirect logs, just continue silently.
@@ -1379,7 +1490,7 @@ async def connect_with_headers(uri, headers_dict):
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
 PID_FILE = "cyberdriver.pid.json"
-VERSION = "0.0.39"
+VERSION = "0.0.40"
 
 @dataclass
 class Config:
@@ -1480,7 +1591,7 @@ def write_pid_info(info: Dict[str, Any]) -> None:
         payload = dict(info)
         payload.setdefault("pid", os.getpid())
         payload.setdefault("version", VERSION)
-        payload.setdefault("started_at", datetime.now().isoformat())
+        payload.setdefault("started_at", _utc_now_iso())
         payload.setdefault("frozen", bool(getattr(sys, "frozen", False)))
         payload.setdefault("argv", sys.argv[:])
 
@@ -1965,6 +2076,125 @@ pyautogui.PAUSE = 0
 # where display changes can trigger false positives
 pyautogui.FAILSAFE = False
 
+
+def _get_env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    """Parse a float env var with safe fallback and clamping."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        print(f"Warning: invalid {name}={raw!r}; using default {default}")
+        return default
+    if not math.isfinite(value):
+        print(f"Warning: non-finite {name}={raw!r}; using default {default}")
+        return default
+    if value < minimum:
+        print(f"Warning: {name}={raw!r} is below minimum {minimum}; clamping to {minimum}")
+        return minimum
+    return value
+
+
+# Post-type settle delay:
+# Remote desktops (Citrix/RDP/VDI) can render injected keystrokes slightly after
+# key events are queued. We apply a fixed base delay plus a char-count-based
+# delay to reduce races with immediate follow-up actions/screenshots.
+TYPING_SETTLE_BASE_SECONDS = _get_env_float("CYBERDRIVER_TYPING_SETTLE_BASE_SECONDS", 0.05)
+TYPING_SETTLE_PER_CHAR_SECONDS = _get_env_float("CYBERDRIVER_TYPING_SETTLE_PER_CHAR_SECONDS", 0.007)
+TYPING_SETTLE_LINEAR_THRESHOLD_CHARS = int(
+    _get_env_float("CYBERDRIVER_TYPING_SETTLE_LINEAR_THRESHOLD_CHARS", 300.0, minimum=0.0)
+)
+TYPING_SETTLE_LONG_TEXT_PER_CHAR_SECONDS = _get_env_float(
+    "CYBERDRIVER_TYPING_SETTLE_LONG_TEXT_PER_CHAR_SECONDS", 0.0008
+)
+KEYBOARD_TYPE_SECONDS_PER_CHAR_ESTIMATE = _get_env_float(
+    "CYBERDRIVER_KEYBOARD_TYPE_SECONDS_PER_CHAR_ESTIMATE", 0.004
+)
+KEYBOARD_TYPE_TIMEOUT_BUFFER_SECONDS = _get_env_float(
+    "CYBERDRIVER_KEYBOARD_TYPE_TIMEOUT_BUFFER_SECONDS", 8.0
+)
+KEYBOARD_TYPE_DEDUPE_WINDOW_SECONDS = _get_env_float(
+    "CYBERDRIVER_KEYBOARD_TYPE_DEDUPE_WINDOW_SECONDS", 20.0
+)
+KEYBOARD_TYPE_INFLIGHT_DEDUPE_MAX_SECONDS = _get_env_float(
+    "CYBERDRIVER_KEYBOARD_TYPE_INFLIGHT_DEDUPE_MAX_SECONDS", 300.0, minimum=1.0
+)
+WINDOWS_SENDINPUT_INTER_KEY_DELAY_SECONDS = _get_env_float(
+    "CYBERDRIVER_WINDOWS_SENDINPUT_INTER_KEY_DELAY_SECONDS", 0.0015
+)
+WINDOWS_SENDINPUT_DELAY_THRESHOLD_CHARS = int(
+    _get_env_float("CYBERDRIVER_WINDOWS_SENDINPUT_DELAY_THRESHOLD_CHARS", 120.0, minimum=0.0)
+)
+
+UNICODE_TYPING_REPLACEMENTS = (
+    ("\r\n", "\n"),
+    ("\r", "\n"),
+    ("\u00A0", " "),   # non-breaking space
+    ("\u2013", "-"),   # en dash
+    ("\u2014", "-"),   # em dash
+    ("\u2212", "-"),   # unicode minus
+    ("\u2018", "'"),   # left single quote
+    ("\u2019", "'"),   # right single quote
+    ("\u201C", '"'),   # left double quote
+    ("\u201D", '"'),   # right double quote
+    ("\u2026", "..."), # ellipsis
+)
+
+
+def _compute_typing_settle_delay(text: str) -> float:
+    char_count = len(text or "")
+    linear_threshold = TYPING_SETTLE_LINEAR_THRESHOLD_CHARS
+    if char_count <= linear_threshold:
+        return max(0.0, TYPING_SETTLE_BASE_SECONDS + (char_count * TYPING_SETTLE_PER_CHAR_SECONDS))
+
+    overflow_chars = char_count - linear_threshold
+    return max(
+        0.0,
+        TYPING_SETTLE_BASE_SECONDS
+        + (linear_threshold * TYPING_SETTLE_PER_CHAR_SECONDS)
+        + (overflow_chars * TYPING_SETTLE_LONG_TEXT_PER_CHAR_SECONDS),
+    )
+
+
+def _normalize_text_for_keyboard_typing(text: str) -> str:
+    normalized = text or ""
+    for source, target in UNICODE_TYPING_REPLACEMENTS:
+        normalized = normalized.replace(source, target)
+    return normalized
+
+
+def _estimate_keyboard_type_timeout_seconds(text: str) -> float:
+    char_count = len(text or "")
+    estimated_typing_seconds = char_count * KEYBOARD_TYPE_SECONDS_PER_CHAR_ESTIMATE
+    # Windows long-text typing may include per-key pacing in SendInput mode.
+    # Include that extra time so timeout/dedupe windows track actual duration.
+    if (
+        _IS_WINDOWS
+        and char_count >= WINDOWS_SENDINPUT_DELAY_THRESHOLD_CHARS
+        and WINDOWS_SENDINPUT_INTER_KEY_DELAY_SECONDS > 0
+    ):
+        estimated_typing_seconds += char_count * WINDOWS_SENDINPUT_INTER_KEY_DELAY_SECONDS
+    settle_seconds = _compute_typing_settle_delay(text)
+    return max(30.0, estimated_typing_seconds + settle_seconds + KEYBOARD_TYPE_TIMEOUT_BUFFER_SECONDS)
+
+
+async def _wait_for_typing_settle(text: str) -> None:
+    delay_seconds = _compute_typing_settle_delay(text)
+    if delay_seconds <= 0:
+        return
+    await asyncio.sleep(delay_seconds)
+
+
+def _initialize_keyboard_type_state(target_app: FastAPI) -> None:
+    """Initialize keyboard typing dedupe state and lock."""
+    target_app.state.keyboard_type_lock = asyncio.Lock()
+    target_app.state.keyboard_type_inflight_hash = None
+    target_app.state.keyboard_type_inflight_started_at = 0.0
+    target_app.state.keyboard_type_last_hash = None
+    target_app.state.keyboard_type_last_completed_at = 0.0
+
+
 # -----------------------------------------------------------------------------
 # Local API implementation
 # -----------------------------------------------------------------------------
@@ -1974,8 +2204,33 @@ async def lifespan(app: FastAPI):
     """Manage application lifespan events."""
     # Startup
     app.state.start_time = time.time()
+    _initialize_keyboard_type_state(app)
+    app.state.shutdown_requested = False
+    app.state.shutdown_task = None
+    app.state.shutdown_force_stop_handle = None
+    # /internal/shutdown is intentionally tunnel-only; standalone server modes keep this unset.
+    if not hasattr(app.state, "tunnel_internal_token"):
+        app.state.tunnel_internal_token = None
     yield
     # Shutdown
+    shutdown_task_ref = getattr(app.state, "shutdown_task", None)
+    if isinstance(shutdown_task_ref, asyncio.Task) and not shutdown_task_ref.done():
+        shutdown_task_ref.cancel()
+        try:
+            await shutdown_task_ref
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+    app.state.shutdown_task = None
+
+    force_stop_handle = getattr(app.state, "shutdown_force_stop_handle", None)
+    if force_stop_handle is not None:
+        try:
+            force_stop_handle.cancel()
+        except Exception:
+            pass
+        app.state.shutdown_force_stop_handle = None
     print("Shutting down...")
     
     # Shutdown the thread pool executor
@@ -2001,11 +2256,10 @@ def _log_error_and_check_mei(error: Exception, context: str = "") -> bool:
     error_type = type(error).__name__
     
     # Always log the error - use both print and direct file logging
-    timestamp = datetime.now().isoformat()
     
     # Log to console (may not appear if stdout is captured)
     try:
-        print(f"\n[ERROR] {timestamp} - {context}", flush=True)
+        print(f"\n[ERROR] {context}", flush=True)
         print(f"[ERROR] Type: {error_type}", flush=True)
         print(f"[ERROR] Message: {error}", flush=True)
         sys.stdout.flush()
@@ -2016,7 +2270,7 @@ def _log_error_and_check_mei(error: Exception, context: str = "") -> bool:
     try:
         log_path = get_config_dir() / "api-errors.log"
         with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"\n[{timestamp}] {context}\n")
+            f.write(f"\n[{_utc_now_iso()}] {context}\n")
             f.write(f"Type: {error_type}\n")
             f.write(f"Message: {error}\n")
     except Exception:
@@ -2092,9 +2346,8 @@ async def global_exception_handler(request, exc):
     from fastapi.responses import JSONResponse
     
     # Immediately log that we entered this handler
-    timestamp = datetime.now().isoformat()
     try:
-        print(f"\n[GLOBAL EXCEPTION HANDLER] {timestamp}", flush=True)
+        print(f"\n[GLOBAL EXCEPTION HANDLER]", flush=True)
         print(f"[GLOBAL EXCEPTION HANDLER] Exception type: {type(exc).__name__}", flush=True)
         print(f"[GLOBAL EXCEPTION HANDLER] Exception message: {exc}", flush=True)
         sys.stdout.flush()
@@ -2105,7 +2358,7 @@ async def global_exception_handler(request, exc):
     try:
         log_path = get_config_dir() / "global-exception-handler.log"
         with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"\n[{timestamp}] GLOBAL EXCEPTION HANDLER INVOKED\n")
+            f.write(f"\n[{_utc_now_iso()}] GLOBAL EXCEPTION HANDLER INVOKED\n")
             f.write(f"Exception type: {type(exc).__name__}\n")
             f.write(f"Exception message: {exc}\n")
     except Exception:
@@ -2135,15 +2388,29 @@ async def global_exception_handler(request, exc):
         content={
             "error": type(exc).__name__,
             "message": error_msg,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": _utc_now_iso()
         }
     )
 
 
 @app.middleware("http")
 async def disable_buffering(request, call_next):
-    """Middleware to ensure responses are not buffered."""
-    response = await call_next(request)
+    """Log every request once and ensure responses are not buffered."""
+    # Intentionally keep request-outcome logging enabled for all paths, including
+    # keepalive traffic, so tunnel liveliness/debugging has a single timeline.
+    method = request.method
+    path = request.url.path
+    request_start = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        # Keep one request outcome line even when downstream raises unexpectedly.
+        duration_ms = (time.perf_counter() - request_start) * 1000
+        print(f"{method} {path} -> ERR ({duration_ms:.1f}ms)")
+        raise
+
+    duration_ms = (time.perf_counter() - request_start) * 1000
+    print(f"{method} {path} -> {response.status_code} ({duration_ms:.1f}ms)")
     # Add headers to disable any proxy buffering
     response.headers["X-Accel-Buffering"] = "no"
     response.headers["Cache-Control"] = "no-cache"
@@ -2217,6 +2484,96 @@ async def post_remote_keepalive_disable():
                 pass
             print("RemoteKeepalive: disabled")
         return Response(status_code=204)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+TUNNEL_INTERNAL_REQUEST_HEADER = "x-cyberdesk-tunnel-token"
+
+
+def _is_request_from_active_tunnel(request: Request) -> bool:
+    """Return True if request carries the active in-process tunnel marker."""
+    expected = getattr(app.state, "tunnel_internal_token", None)
+    if not isinstance(expected, str) or not expected:
+        return False
+    provided = request.headers.get(TUNNEL_INTERNAL_REQUEST_HEADER)
+    if not provided:
+        return False
+    return secrets.compare_digest(provided, expected)
+
+
+@app.post("/internal/shutdown")
+async def post_shutdown(request: Request):
+    """Request cyberdriver to terminate itself.
+
+    Intended for cloud control-plane use when a machine/session is being turned off.
+    Returns immediately, then exits the process shortly after the response is sent.
+    """
+    try:
+        if not _is_request_from_active_tunnel(request):
+            raise HTTPException(status_code=403, detail="Forbidden: tunnel-only endpoint")
+
+        # Parse request JSON only after auth so unauthenticated malformed payloads
+        # cannot bypass tunnel-only checks via FastAPI body validation.
+        payload: Optional[Dict[str, Any]] = None
+        try:
+            raw_payload = await request.body()
+            if raw_payload:
+                parsed_payload = json.loads(raw_payload.decode("utf-8"))
+                if isinstance(parsed_payload, dict):
+                    payload = parsed_payload
+        except Exception:
+            payload = None
+
+        pid = os.getpid()
+        reason = None
+        source = "unknown"
+        if isinstance(payload, dict):
+            reason = payload.get("reason")
+            source = str(payload.get("source") or source)
+
+        if getattr(app.state, "shutdown_requested", False):
+            return {
+                "status": "already_shutting_down",
+                "pid": pid,
+                "reason": reason,
+                "source": source,
+            }
+
+        app.state.shutdown_requested = True
+        print(f"Shutdown requested via API (pid={pid}, source={source}, reason={reason or 'none'})")
+
+        async def _delayed_shutdown():
+            # Small delay gives HTTP response time to flush through tunnel/proxy.
+            await asyncio.sleep(0.25)
+            try:
+                _remove_pid_file_safely()
+            except Exception:
+                pass
+            # Use a graceful interpreter exit so atexit handlers can flush buffered logs.
+            loop = asyncio.get_running_loop()
+            loop.call_soon(sys.exit, 0)
+            # Fallback: retry graceful exit. If that is intercepted again, force terminate.
+            def _fallback_exit_process():
+                try:
+                    inner_handle = loop.call_later(2.0, os._exit, 0)
+                    # Track the final-resort handle so lifespan shutdown can cancel it.
+                    app.state.shutdown_force_stop_handle = inner_handle
+                except Exception:
+                    os._exit(0)
+                sys.exit(0)
+            app.state.shutdown_force_stop_handle = loop.call_later(2.0, _fallback_exit_process)
+
+        shutdown_task = asyncio.create_task(_delayed_shutdown())
+        app.state.shutdown_task = shutdown_task
+        return {
+            "status": "shutting_down",
+            "pid": pid,
+            "reason": reason,
+            "source": source,
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
@@ -3060,12 +3417,18 @@ def _win32_send_key(scan_code: int, key_up: bool = False):
 def _type_with_win32_sendinput(text: str):
     """Type text using Windows SendInput API with hardware scan codes."""
     LSHIFT_SCANCODE = 0x2A
+    unsupported_chars: Dict[str, int] = {}
+    inter_key_delay = 0.0
+    if len(text or "") >= WINDOWS_SENDINPUT_DELAY_THRESHOLD_CHARS:
+        inter_key_delay = WINDOWS_SENDINPUT_INTER_KEY_DELAY_SECONDS
     
     for char in text:
         # Handle space specially when experimental mode is enabled
         if char == ' ' and EXPERIMENTAL_SPACE_ENABLED:
             _win32_send_vk_space(key_up=False)
             _win32_send_vk_space(key_up=True)
+            if inter_key_delay > 0:
+                time.sleep(inter_key_delay)
             continue
         
         upper_char = char.upper()
@@ -3088,7 +3451,7 @@ def _type_with_win32_sendinput(text: str):
             scan_code = SYMBOL_SCANCODES[char]
         
         if scan_code is None:
-            print(f"Warning: Character '{char}' not supported by scan code method, skipping")
+            unsupported_chars[char] = unsupported_chars.get(char, 0) + 1
             continue
         
         # Send key events
@@ -3098,6 +3461,19 @@ def _type_with_win32_sendinput(text: str):
         _win32_send_key(scan_code, key_up=True)
         if needs_shift:
             _win32_send_key(LSHIFT_SCANCODE, key_up=True)
+        if inter_key_delay > 0:
+            time.sleep(inter_key_delay)
+
+    if unsupported_chars:
+        total_unsupported = sum(unsupported_chars.values())
+        top_items = sorted(unsupported_chars.items(), key=lambda item: item[1], reverse=True)[:5]
+        summary = ", ".join(f"{repr(ch)} x{count}" for ch, count in top_items)
+        remaining = len(unsupported_chars) - len(top_items)
+        extra = f" (+{remaining} more)" if remaining > 0 else ""
+        print(
+            f"Warning: Skipped {total_unsupported} unsupported character(s) "
+            f"in scan code typing: {summary}{extra}"
+        )
 
 
 def _press_key_with_scancode(key: str, key_up: bool = False):
@@ -3130,26 +3506,124 @@ def _press_key_with_scancode(key: str, key_up: bool = False):
 
 
 @app.post("/computer/input/keyboard/type")
-async def post_keyboard_type(payload: Dict[str, str]):
+async def post_keyboard_type(request: Request, payload: Dict[str, Any]):
     """Type a string of text."""
     text = payload.get("text")
-    if not text:
+    if text is None:
         raise HTTPException(status_code=400, detail="Missing 'text' field")
-    
-    # Ensure Caps Lock is OFF to prevent case inversion
-    await _ensure_capslock_off()
-    
-    # On Windows: use native SendInput with scan codes (Citrix-compatible)
-    # On macOS/Linux: use PyAutoGUI
-    if platform.system() == "Windows":
-        try:
-            _type_with_win32_sendinput(text)
+    if not isinstance(text, str):
+        text = str(text)
+    if not text:
+        raise HTTPException(status_code=400, detail="'text' field must not be empty")
+
+    text = _normalize_text_for_keyboard_typing(text)
+    if not text:
+        raise HTTPException(status_code=400, detail="'text' field must not be empty after normalization")
+    idempotency_key_raw = request.headers.get("x-idempotency-key")
+    idempotency_key = idempotency_key_raw.strip() if isinstance(idempotency_key_raw, str) else ""
+    # Keep /keyboard/type retry dedupe simple: idempotency-key only.
+    dedupe_key = f"idem:{idempotency_key}" if idempotency_key else None
+    post_completion_window_seconds = KEYBOARD_TYPE_DEDUPE_WINDOW_SECONDS if idempotency_key else 0.0
+
+    typing_lock: asyncio.Lock = app.state.keyboard_type_lock
+
+    now = time.monotonic()
+    inflight_hash = getattr(app.state, "keyboard_type_inflight_hash", None)
+    inflight_started = float(getattr(app.state, "keyboard_type_inflight_started_at", 0.0) or 0.0)
+    if (
+        dedupe_key
+        and isinstance(inflight_hash, str)
+        and inflight_hash == dedupe_key
+        and (now - inflight_started) <= KEYBOARD_TYPE_INFLIGHT_DEDUPE_MAX_SECONDS
+    ):
+        print("Duplicate /keyboard/type payload received while identical request is in-flight; skipping retry typing")
+        return {}
+
+    async with typing_lock:
+        now = time.monotonic()
+        # Re-check in-flight state after acquiring the lock to avoid a race where
+        # two identical requests pass the pre-lock check simultaneously.
+        inflight_hash = getattr(app.state, "keyboard_type_inflight_hash", None)
+        inflight_started = float(getattr(app.state, "keyboard_type_inflight_started_at", 0.0) or 0.0)
+        if (
+            dedupe_key
+            and isinstance(inflight_hash, str)
+            and inflight_hash == dedupe_key
+            and (now - inflight_started) <= KEYBOARD_TYPE_INFLIGHT_DEDUPE_MAX_SECONDS
+        ):
+            print("Duplicate /keyboard/type payload detected after lock acquisition; skipping retry typing")
             return {}
-        except Exception as e:
-            print(f"Warning: SendInput failed ({e}), falling back to PyAutoGUI")
-    
-    # Fallback for non-Windows or if SendInput fails
-    pyautogui.typewrite(text)
+
+        last_hash = getattr(app.state, "keyboard_type_last_hash", None)
+        last_completed = float(getattr(app.state, "keyboard_type_last_completed_at", 0.0) or 0.0)
+        if (
+            dedupe_key
+            and post_completion_window_seconds > 0
+            and isinstance(last_hash, str)
+            and last_hash == dedupe_key
+            and (now - last_completed) <= post_completion_window_seconds
+        ):
+            print("Duplicate /keyboard/type payload received shortly after completion; skipping retry typing")
+            return {}
+
+        app.state.keyboard_type_inflight_hash = dedupe_key if dedupe_key else None
+        app.state.keyboard_type_inflight_started_at = now
+        try:
+            # Ensure Caps Lock is OFF to prevent case inversion
+            await _ensure_capslock_off()
+
+            # Execute typing in a worker thread so long input doesn't block
+            # tunnel I/O on the main event loop. We still await completion,
+            # so the endpoint only returns after typing is actually done.
+            if _IS_WINDOWS:
+                # Avoid fallback retyping the whole string after a partial
+                # SendInput failure, which can duplicate already-queued chars.
+                typing_task = asyncio.create_task(asyncio.to_thread(_type_with_win32_sendinput, text))
+            else:
+                non_ascii_chars: Dict[str, int] = {}
+                for ch in text:
+                    if ord(ch) > 127:
+                        non_ascii_chars[ch] = non_ascii_chars.get(ch, 0) + 1
+                if non_ascii_chars:
+                    skipped_count = sum(non_ascii_chars.values())
+                    top_items = sorted(non_ascii_chars.items(), key=lambda item: item[1], reverse=True)[:5]
+                    summary = ", ".join(f"{repr(ch)} x{count}" for ch, count in top_items)
+                    remaining = len(non_ascii_chars) - len(top_items)
+                    extra = f" (+{remaining} more)" if remaining > 0 else ""
+                    print(
+                        f"Warning: pyautogui.typewrite may skip {skipped_count} non-ASCII character(s): "
+                        f"{summary}{extra}"
+                    )
+                typing_task = asyncio.create_task(asyncio.to_thread(pyautogui.typewrite, text))
+
+            # Prevent disconnect-triggered cancellation from clearing in-flight dedupe
+            # state while a background typing thread is still running.
+            try:
+                await asyncio.shield(typing_task)
+            except asyncio.CancelledError:
+                try:
+                    # Intentional trade-off: waiting here keeps dedupe state
+                    # consistent, but holds typing_lock until typing finishes.
+                    # Queued /keyboard/type requests can stall during this window.
+                    await typing_task
+                except Exception as typing_exc:
+                    print(f"Warning: typing task raised during cancellation: {typing_exc}")
+                else:
+                    # If typing completed despite client disconnect, still mark
+                    # post-completion dedupe state before re-raising cancellation.
+                    if dedupe_key:
+                        app.state.keyboard_type_last_hash = dedupe_key
+                        app.state.keyboard_type_last_completed_at = time.monotonic()
+                raise
+
+            await _wait_for_typing_settle(text)
+            if dedupe_key:
+                app.state.keyboard_type_last_hash = dedupe_key
+                app.state.keyboard_type_last_completed_at = time.monotonic()
+        finally:
+            app.state.keyboard_type_inflight_hash = None
+            app.state.keyboard_type_inflight_started_at = 0.0
+
     return {}
 
 
@@ -3487,12 +3961,18 @@ async def post_fs_write(payload: Dict[str, Any]):
     """
     file_path = payload.get("path")
     content = payload.get("content")
-    mode = payload.get("mode", "write")
+    mode_raw = payload.get("mode", "write")
+    mode = mode_raw.strip().lower() if isinstance(mode_raw, str) else None
     
     if not file_path:
         raise HTTPException(status_code=400, detail="Missing 'path' field")
     if not content:
         raise HTTPException(status_code=400, detail="Missing 'content' field")
+    if mode not in ("write", "append"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid 'mode' value {mode_raw!r}; expected 'write' or 'append'",
+        )
     
     try:
         # Decode base64 content
@@ -3501,12 +3981,13 @@ async def post_fs_write(payload: Dict[str, Any]):
         raise HTTPException(status_code=400, detail=f"Invalid base64 content: {e}")
     
     try:
-        # Resolve path - no restrictions
-        safe_path = pathlib.Path(file_path).expanduser().resolve()
-        
-        # If path doesn't specify a directory, default to CyberdeskTransfers
-        if not safe_path.parent.exists() and str(safe_path.parent) == ".":
-            safe_path = pathlib.Path.home() / "CyberdeskTransfers" / safe_path.name
+        # If path doesn't specify a directory, default to CyberdeskTransfers.
+        raw_path = pathlib.Path(file_path).expanduser()
+        if (not raw_path.is_absolute()) and str(raw_path.parent) in ("", "."):
+            safe_path = (pathlib.Path.home() / "CyberdeskTransfers" / raw_path.name).resolve()
+        else:
+            # Resolve path - no restrictions
+            safe_path = raw_path.resolve()
         
         # Create parent directories if they don't exist
         safe_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3748,7 +4229,7 @@ async def post_powershell_exec(payload: Dict[str, Any]):
     
     try:
         # Run in thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             executor,
             execute_powershell_command,
@@ -3761,13 +4242,12 @@ async def post_powershell_exec(payload: Dict[str, Any]):
         return result
     except Exception as e:
         # Log the error with full details
-        timestamp = datetime.now().isoformat()
         error_type = type(e).__name__
         error_msg = str(e)
         
         # Log to console
         print(f"\n{'='*60}", flush=True)
-        print(f"[POWERSHELL EXEC ERROR] {timestamp}", flush=True)
+        print(f"[POWERSHELL EXEC ERROR]", flush=True)
         print(f"Error type: {error_type}", flush=True)
         print(f"Error message: {error_msg}", flush=True)
         print(f"Command: {command[:100]}..." if len(command) > 100 else f"Command: {command}", flush=True)
@@ -3777,7 +4257,7 @@ async def post_powershell_exec(payload: Dict[str, Any]):
         try:
             log_path = get_config_dir() / "powershell-errors.log"
             with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"\n[{timestamp}] POWERSHELL EXEC ERROR\n")
+                f.write(f"\n[{_utc_now_iso()}] POWERSHELL EXEC ERROR\n")
                 f.write(f"Type: {error_type}\n")
                 f.write(f"Message: {error_msg}\n")
                 f.write(f"Command: {command}\n")
@@ -3823,6 +4303,24 @@ def _get_restart_count() -> int:
         return 0
 
 
+def _get_max_restarts() -> Optional[int]:
+    """Get optional max restart limit; None means unlimited retries."""
+    raw_value = str(os.environ.get("CYBERDRIVER_MAX_RESTARTS", "")).strip()
+    if not raw_value:
+        return None
+    raw_value_lower = raw_value.lower()
+    if raw_value_lower in ("unlimited", "none", "inf", "infinite"):
+        return None
+    try:
+        parsed = int(raw_value)
+    except (ValueError, TypeError):
+        print(f"Warning: Invalid CYBERDRIVER_MAX_RESTARTS={raw_value!r}; ignoring restart limit")
+        return None
+    if parsed <= 0:
+        return None
+    return parsed
+
+
 def _restart_cyberdriver_process() -> bool:
     """
     Restart cyberdriver by spawning a new process and exiting the current one.
@@ -3839,35 +4337,43 @@ def _restart_cyberdriver_process() -> bool:
     2. Spawns a new cyberdriver process with the exact same command-line arguments
     3. Exits the current process
     
-    Safety: After MAX_RESTARTS consecutive restarts without a successful long connection,
-    the process will exit rather than restart again to prevent infinite loops.
-    
     Returns:
         True if we're about to exit (new process spawned successfully)
         False if spawn failed and we should continue in current process
         
     Note: If successful, this function exits the process and never returns.
     """
-    MAX_RESTARTS = 5  # Maximum consecutive restarts before giving up
-    
+    RESTART_WARNING_EVERY = 50
+    RESTART_HISTORY_MAX_BYTES = 1 * 1024 * 1024  # Cap restart-history.log at 1MB
+
     restart_count = _get_restart_count() + 1
-    
-    # Check if we've exceeded max restarts
-    if restart_count > MAX_RESTARTS:
+    max_restarts = _get_max_restarts()
+
+    if max_restarts is not None and restart_count > max_restarts:
         print(f"\n{'='*60}")
-        print(f"❌ RESTART LIMIT REACHED")
+        print("❌ RESTART LIMIT REACHED")
         print(f"{'='*60}")
-        print(f"\nCyberdriver has restarted {restart_count - 1} times without establishing")
-        print(f"a stable connection. This may indicate:")
-        print(f"   1. The Cyberdesk API is down for extended maintenance")
-        print(f"   2. Network connectivity issues")
-        print(f"   3. Persistent _MEI folder corruption (try reinstalling)")
-        print(f"\nTo restart manually, run: cyberdriver join --secret YOUR_KEY")
+        print(
+            f"Configured max restarts ({max_restarts}) exceeded "
+            f"after {restart_count - 1} restart attempts."
+        )
+        print("Set CYBERDRIVER_MAX_RESTARTS=0 (or any negative value, or unset it) to allow unlimited retries.")
         print(f"{'='*60}\n")
         sys.exit(1)
-    
+
+    if restart_count >= RESTART_WARNING_EVERY and restart_count % RESTART_WARNING_EVERY == 0:
+        print(f"\n{'='*60}")
+        print("⚠️  High restart count detected")
+        print(f"{'='*60}")
+        print(f"Cyberdriver has restarted {restart_count} times in this recovery chain.")
+        print("The process will keep retrying, but this usually indicates a persistent issue:")
+        print("  1. API/network connectivity problems")
+        print("  2. Persistent local environment corruption")
+        print("  3. Invalid machine configuration")
+        print(f"{'='*60}\n")
+
     print(f"\n{'='*60}")
-    print(f"🔄 RESTARTING CYBERDRIVER (attempt {restart_count}/{MAX_RESTARTS})")
+    print(f"🔄 RESTARTING CYBERDRIVER (attempt #{restart_count})")
     print(f"{'='*60}")
     print(f"Spawning fresh process to recover from potential _MEI issues...")
     print(f"This is equivalent to: cyberdriver stop && cyberdriver join ...")
@@ -3884,8 +4390,17 @@ def _restart_cyberdriver_process() -> bool:
     # Log the restart for debugging
     try:
         log_path = get_config_dir() / "restart-history.log"
+        try:
+            if log_path.exists() and log_path.stat().st_size > RESTART_HISTORY_MAX_BYTES:
+                with open(log_path, "w", encoding="utf-8") as f:
+                    f.write(
+                        f"[{_utc_now_iso()}] restart-history.log truncated "
+                        f"(exceeded {RESTART_HISTORY_MAX_BYTES} bytes)\n"
+                    )
+        except Exception:
+            pass
         with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"\n[{datetime.now().isoformat()}] Restarting cyberdriver (attempt {restart_count}/{MAX_RESTARTS})\n")
+            f.write(f"\n[{_utc_now_iso()}] Restarting cyberdriver (attempt #{restart_count})\n")
             f.write(f"Command: {' '.join(cmd)}\n")
             f.write(f"PID (old): {os.getpid()}\n")
             f.write(f"_MEIPASS: {getattr(sys, '_MEIPASS', 'N/A')}\n")
@@ -4078,7 +4593,7 @@ class TunnelClient:
     IDEMPOTENCY_CACHE_TTL = 60.0  # Seconds to keep cached responses
     IDEMPOTENCY_CACHE_MAX_SIZE = 1000  # Maximum number of cached responses
     
-    def __init__(self, host: str, port: int, secret: str, target_port: int, config: Config, keepalive_manager: Optional["KeepAliveManager"] = None, remote_keepalive_for_main_id: Optional[str] = None):
+    def __init__(self, host: str, port: int, secret: str, target_port: int, config: Config, keepalive_manager: Optional["KeepAliveManager"] = None, remote_keepalive_for_main_id: Optional[str] = None, internal_request_token: Optional[str] = None):
         self.host = host
         self.port = port
         self.secret = secret
@@ -4090,6 +4605,7 @@ class TunnelClient:
         self._consecutive_failures = 0  # Track consecutive short-lived connections for diagnostics
         self.keepalive_manager = keepalive_manager
         self.remote_keepalive_for_main_id = remote_keepalive_for_main_id
+        self.internal_request_token = internal_request_token
         
         # Idempotency cache: key -> (timestamp, response)
         # Used to prevent duplicate execution of actions when retries occur
@@ -4224,11 +4740,12 @@ class TunnelClient:
                     close_code=close_code
                 )
                 
-                # Only reset failure counter if connection lasted more than 10 seconds
-                # Short-lived connections indicate an ongoing problem
+                # After a stable connection, reset all retry/backoff state.
+                # Short-lived connections indicate an ongoing problem.
                 if connection_duration > 10:
                     self._consecutive_failures = 0
                     failures_at_max_sleep = 0
+                    sleep_time = self.min_sleep
                     # Reset restart count since we had a successful long connection
                     # This clears the CYBERDRIVER_RESTART_COUNT env var
                     if "CYBERDRIVER_RESTART_COUNT" in os.environ:
@@ -4378,6 +4895,7 @@ class TunnelClient:
                 if connection_duration > 10:
                     self._consecutive_failures = 0
                     failures_at_max_sleep = 0
+                    sleep_time = self.min_sleep
                     # Reset restart count since we had a successful long connection
                     if "CYBERDRIVER_RESTART_COUNT" in os.environ:
                         del os.environ["CYBERDRIVER_RESTART_COUNT"]
@@ -4590,6 +5108,9 @@ class TunnelClient:
         path = meta["path"]
         query = meta.get("query", "")
         headers = meta.get("headers", {})
+        request_headers = dict(headers) if isinstance(headers, dict) else {}
+        if self.internal_request_token and path == "/internal/shutdown":
+            request_headers[TUNNEL_INTERNAL_REQUEST_HEADER] = self.internal_request_token
         
         # Check for idempotency key (case-insensitive header lookup)
         idempotency_key: Optional[str] = None
@@ -4613,6 +5134,7 @@ class TunnelClient:
             url += f"?{query}"
         
         # For PowerShell exec requests, extract timeout from body and use custom client
+        # For keyboard type requests, compute timeout based on text length
         # For all other requests, use the default client with 30s timeout
         use_custom_timeout = False
         request_timeout = 30.0
@@ -4624,6 +5146,17 @@ class TunnelClient:
                     # The local FastAPI will timeout the subprocess at exactly `timeout` seconds,
                     # so we need to wait slightly longer to receive that response 
                     request_timeout = float(payload["timeout"]) + 3.0  # 3s buffer for local processing
+                    use_custom_timeout = True
+            except Exception:
+                pass  # Fall back to default client if parsing fails
+        elif path == "/computer/input/keyboard/type" and body:
+            try:
+                payload = json.loads(body.decode('utf-8'))
+                text = payload.get("text")
+                if text is not None:
+                    text_for_timeout = text if isinstance(text, str) else str(text)
+                    normalized_for_timeout = _normalize_text_for_keyboard_typing(text_for_timeout)
+                    request_timeout = _estimate_keyboard_type_timeout_seconds(normalized_for_timeout)
                     use_custom_timeout = True
             except Exception:
                 pass  # Fall back to default client if parsing fails
@@ -4648,9 +5181,8 @@ class TunnelClient:
                     pool=30.0
                 )
                 async with httpx.AsyncClient(timeout=timeout_obj) as request_client:
-                    async with request_client.stream(method, url, headers=headers, content=body) as response:
+                    async with request_client.stream(method, url, headers=request_headers, content=body) as response:
                         duration_ms = (time.time() - request_start) * 1000
-                        print(f"{method} {path} -> {response.status_code}")
                         debug_logger.request_forwarded(method, path, response.status_code, duration_ms)
                         
                         # Read the response body immediately to avoid buffering
@@ -4665,9 +5197,8 @@ class TunnelClient:
                         }
             else:
                 # Use default client for all other requests (30s timeout) 
-                async with client.stream(method, url, headers=headers, content=body) as response:
+                async with client.stream(method, url, headers=request_headers, content=body) as response:
                     duration_ms = (time.time() - request_start) * 1000
-                    print(f"{method} {path} -> {response.status_code}")
                     debug_logger.request_forwarded(method, path, response.status_code, duration_ms)
                     
                     # Read the response body immediately to avoid buffering
@@ -4688,9 +5219,8 @@ class TunnelClient:
             debug_logger.error("REQUEST", f"Request failed: {error_msg}", method=method, path=path, duration_ms=f"{duration_ms:.1f}ms")
             
             # Log to console with full details
-            timestamp = datetime.now().isoformat()
             print(f"\n{'='*60}", flush=True)
-            print(f"[TUNNEL FORWARD ERROR] {timestamp}", flush=True)
+            print(f"[TUNNEL FORWARD ERROR]", flush=True)
             print(f"Error type: {error_type}", flush=True)
             print(f"Error message: {error_msg}", flush=True)
             print(f"Method: {method}", flush=True)
@@ -4702,7 +5232,7 @@ class TunnelClient:
             try:
                 log_path = get_config_dir() / "tunnel-forward-errors.log"
                 with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(f"\n[{timestamp}] TUNNEL FORWARD ERROR\n")
+                    f.write(f"\n[{_utc_now_iso()}] TUNNEL FORWARD ERROR\n")
                     f.write(f"Type: {error_type}\n")
                     f.write(f"Message: {error_msg}\n")
                     f.write(f"Method: {method}\n")
@@ -4804,12 +5334,14 @@ class TunnelClient:
 
 def run_server(port: int):
     """Run the FastAPI server."""
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    # Keep request logging single-sourced via Cyberdriver's own timestamped print lines.
+    uvicorn.run(app, host="0.0.0.0", port=port, access_log=False)
 
 
 async def run_server_async(port: int):
     """Run the FastAPI server asynchronously."""
-    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="info")
+    # Keep request logging single-sourced via Cyberdriver's own timestamped print lines.
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="info", access_log=False)
     server = uvicorn.Server(config)
     await server.serve()
 
@@ -5266,8 +5798,18 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
                    black_screen_check_interval: float = 30.0,
                    debug_enabled: bool = False):
     """Run both API server and tunnel client."""
+    # Ensure default transfer directory exists for file operations during join.
+    transfers_dir = pathlib.Path.home() / "CyberdeskTransfers"
+    try:
+        transfers_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"Warning: Failed to create transfer directory at {transfers_dir}: {e}")
+
     # Store connection info for use by update endpoint
     _set_connection_info(host, port)
+    # Per-process marker used to gate tunnel-only internal endpoints.
+    tunnel_internal_token = secrets.token_hex(32)
+    app.state.tunnel_internal_token = tunnel_internal_token
     
     config = get_config()
     
@@ -5366,7 +5908,8 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
         return TunnelClient(
             host, port, secret, actual_target_port, config,
             keepalive_manager=keepalive_manager if keepalive_enabled else None,
-            remote_keepalive_for_main_id=register_as_keepalive_for
+            remote_keepalive_for_main_id=register_as_keepalive_for,
+            internal_request_token=tunnel_internal_token,
         )
 
     async def start_tunnel():
@@ -5774,9 +6317,6 @@ def check_mei_health(context: str = "") -> bool:
             missing.append(d)
     
     if missing:
-        from datetime import datetime
-        timestamp = datetime.now().isoformat()
-        
         # Get list of existing directories for debugging
         existing = []
         try:
@@ -5786,7 +6326,7 @@ def check_mei_health(context: str = "") -> bool:
         
         # Print to console
         print(f"\n{'='*70}")
-        print(f"[CRITICAL] _MEI HEALTH CHECK FAILED at {timestamp}")
+        print(f"[CRITICAL] _MEI HEALTH CHECK FAILED")
         print(f"[CRITICAL] Context: {context}")
         print(f"[CRITICAL] _MEIPASS: {meipass}")
         print(f"[CRITICAL] Missing directories: {missing}")
@@ -5798,7 +6338,7 @@ def check_mei_health(context: str = "") -> bool:
             log_path = get_config_dir() / "mei-health-failures.log"
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"\n{'='*70}\n")
-                f.write(f"Timestamp: {timestamp}\n")
+                f.write(f"Timestamp: {_utc_now_iso()}\n")
                 f.write(f"Context: {context}\n")
                 f.write(f"_MEIPASS: {meipass}\n")
                 f.write(f"Missing directories: {missing}\n")
@@ -5918,7 +6458,7 @@ def add_defender_exclusion() -> bool:
                 try:
                     log_path = get_config_dir() / "defender-exclusion.log"
                     with open(log_path, "a", encoding="utf-8") as f:
-                        f.write(f"\n[{datetime.now().isoformat()}] Failed to add Defender exclusion\n")
+                        f.write(f"\n[{_utc_now_iso()}] Failed to add Defender exclusion\n")
                         f.write(f"Path: {mei_parent}\n")
                         f.write(f"Error: {add_result.stderr}\n")
                 except:
@@ -5960,7 +6500,8 @@ def main():
     
     # Print banner if no arguments or help requested
     if len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] in ['-h', '--help']):
-        print_banner()
+        with _suppress_print_timestamps():
+            print_banner()
     
     parser = argparse.ArgumentParser(
         description="Remote computer control via Cyberdesk",
@@ -6087,19 +6628,20 @@ def main():
 
     # Handle help or no command
     if not args.command or args.help:
-        if not (len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] in ['-h', '--help'])):
-            print_banner()
-        print("Commands:")
-        print("  join --secret KEY                         Connect to Cyberdesk Cloud")
-        print("  join --secret KEY --keepalive             Enable keepalive")
-        print("  join --secret KEY --black-screen-recovery Enable black screen detection (Windows)")
-        print("  join --secret KEY --add-persistent-display Install virtual display driver (Windows)")
-        print("  join --secret KEY --debug                 Enable debug logging to ~/.cyberdriver/logs/")
-        print("  coords                                    Capture screen coordinates (for keepalive)")
-        print("  stop                                     Stop running Cyberdriver")
-        print("  logs                                     Tail Cyberdriver logs (realtime)")
-        print()
-        print("For more info: cyberdriver join -h")
+        with _suppress_print_timestamps():
+            if not (len(sys.argv) == 1 or (len(sys.argv) == 2 and sys.argv[1] in ['-h', '--help'])):
+                print_banner()
+            print("Commands:")
+            print("  join --secret KEY                         Connect to Cyberdesk Cloud")
+            print("  join --secret KEY --keepalive             Enable keepalive")
+            print("  join --secret KEY --black-screen-recovery Enable black screen detection (Windows)")
+            print("  join --secret KEY --add-persistent-display Install virtual display driver (Windows)")
+            print("  join --secret KEY --debug                 Enable debug logging to ~/.cyberdriver/logs/")
+            print("  coords                                    Capture screen coordinates (for keepalive)")
+            print("  stop                                     Stop running Cyberdriver")
+            print("  logs                                     Tail Cyberdriver logs (realtime)")
+            print()
+            print("For more info: cyberdriver join -h")
         sys.exit(0)
 
     if args.command == "stop":
@@ -6130,9 +6672,10 @@ def main():
         if info:
             old_pid = int(info.get("pid", -1))
             old_argv = info.get("argv", [])
-            timestamp = datetime.now().isoformat()
+            timestamp = _utc_now_iso()
             
-            print_banner(mode="connecting")
+            with _suppress_print_timestamps():
+                print_banner(mode="connecting")
             # Use yellow/warning color for visibility (if terminal supports it)
             if _should_use_color():
                 print(f"\033[93mCyberdriver is already running (PID {old_pid}).\033[0m")
@@ -6213,13 +6756,14 @@ def main():
             child_argv.append(f"--_stdio-log={stdio_log_path}")
 
             # Show the nice banner in the *current* terminal (this is not the detached child).
-            print_banner(mode="connecting")
-            print("Cyberdriver is now running in the background.")
-            print("You can close PowerShell.")
-            print(f"Logs: {stdio_log_path}")
-            _print_prominent_stop_hint()
-            print("(You can also end cyberdriver.exe in Task Manager.)")
-            print()
+            with _suppress_print_timestamps():
+                print_banner(mode="connecting")
+                print("Cyberdriver is now running in the background.")
+                print("You can close PowerShell.")
+                print(f"Logs: {stdio_log_path}")
+                _print_prominent_stop_hint()
+                print("(You can also end cyberdriver.exe in Task Manager.)")
+                print()
             _windows_relaunch_detached(child_argv, stdio_log_path)
 
             # Default UX: return immediately. If the user wants logs in this terminal,
@@ -6238,7 +6782,8 @@ def main():
     
     # Show banner for join command
     if args.command == "join":
-        print_banner(mode="connecting")
+        with _suppress_print_timestamps():
+            print_banner(mode="connecting")
     
     # Check for admin privileges if black screen recovery or persistent display is enabled
     needs_admin = False
