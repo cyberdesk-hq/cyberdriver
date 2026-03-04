@@ -2213,6 +2213,17 @@ async def lifespan(app: FastAPI):
         app.state.tunnel_internal_token = None
     yield
     # Shutdown
+    shutdown_task_ref = getattr(app.state, "shutdown_task", None)
+    if isinstance(shutdown_task_ref, asyncio.Task) and not shutdown_task_ref.done():
+        shutdown_task_ref.cancel()
+        try:
+            await shutdown_task_ref
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+    app.state.shutdown_task = None
+
     force_stop_handle = getattr(app.state, "shutdown_force_stop_handle", None)
     if force_stop_handle is not None:
         try:
@@ -2545,7 +2556,9 @@ async def post_shutdown(request: Request):
             # Fallback: retry graceful exit. If that is intercepted again, force terminate.
             def _fallback_exit_process():
                 try:
-                    loop.call_later(2.0, os._exit, 0)
+                    inner_handle = loop.call_later(2.0, os._exit, 0)
+                    # Track the final-resort handle so lifespan shutdown can cancel it.
+                    app.state.shutdown_force_stop_handle = inner_handle
                 except Exception:
                     os._exit(0)
                 sys.exit(0)
