@@ -3527,7 +3527,7 @@ async def post_keyboard_type(request: Request, payload: Dict[str, Any]):
 
     typing_lock: asyncio.Lock = app.state.keyboard_type_lock
 
-    now = time.time()
+    now = time.monotonic()
     inflight_hash = getattr(app.state, "keyboard_type_inflight_hash", None)
     inflight_started = float(getattr(app.state, "keyboard_type_inflight_started_at", 0.0) or 0.0)
     if (
@@ -3540,7 +3540,7 @@ async def post_keyboard_type(request: Request, payload: Dict[str, Any]):
         return {}
 
     async with typing_lock:
-        now = time.time()
+        now = time.monotonic()
         # Re-check in-flight state after acquiring the lock to avoid a race where
         # two identical requests pass the pre-lock check simultaneously.
         inflight_hash = getattr(app.state, "keyboard_type_inflight_hash", None)
@@ -3613,13 +3613,13 @@ async def post_keyboard_type(request: Request, payload: Dict[str, Any]):
                     # post-completion dedupe state before re-raising cancellation.
                     if dedupe_key:
                         app.state.keyboard_type_last_hash = dedupe_key
-                        app.state.keyboard_type_last_completed_at = time.time()
+                        app.state.keyboard_type_last_completed_at = time.monotonic()
                 raise
 
             await _wait_for_typing_settle(text)
             if dedupe_key:
                 app.state.keyboard_type_last_hash = dedupe_key
-                app.state.keyboard_type_last_completed_at = time.time()
+                app.state.keyboard_type_last_completed_at = time.monotonic()
         finally:
             app.state.keyboard_type_inflight_hash = None
             app.state.keyboard_type_inflight_started_at = 0.0
