@@ -42,6 +42,7 @@ import argparse
 import asyncio
 import base64
 import builtins
+import contextvars
 import json
 import math
 import os
@@ -88,7 +89,9 @@ from datetime import datetime, timezone
 _ISO_TIMESTAMP_PREFIX_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2}T")
 _IS_WINDOWS = platform.system() == "Windows"
 _ORIGINAL_PRINT = builtins.print
-_PRINT_TIMESTAMP_STATE = threading.local()
+_PRINT_TIMESTAMP_SUPPRESS_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "_print_timestamp_suppress_depth", default=0
+)
 
 
 def _utc_now_iso() -> str:
@@ -135,23 +138,20 @@ def _prefix_log_text_with_utc_timestamps(text: str) -> str:
 @contextmanager
 def _suppress_print_timestamps():
     """Temporarily disable timestamp prefixing for system/UX output."""
-    previous_depth = int(getattr(_PRINT_TIMESTAMP_STATE, "suppress_depth", 0))
-    _PRINT_TIMESTAMP_STATE.suppress_depth = previous_depth + 1
+    token = _PRINT_TIMESTAMP_SUPPRESS_DEPTH.set(_PRINT_TIMESTAMP_SUPPRESS_DEPTH.get() + 1)
     try:
         yield
     finally:
-        if previous_depth <= 0:
-            try:
-                delattr(_PRINT_TIMESTAMP_STATE, "suppress_depth")
-            except Exception:
-                pass
-        else:
-            _PRINT_TIMESTAMP_STATE.suppress_depth = previous_depth
+        _PRINT_TIMESTAMP_SUPPRESS_DEPTH.reset(token)
 
 
 def _print_with_utc_timestamp(*args, **kwargs):
     """Global print wrapper that adds UTC timestamps to regular log lines."""
-    if int(getattr(_PRINT_TIMESTAMP_STATE, "suppress_depth", 0)) > 0:
+    if _PRINT_TIMESTAMP_SUPPRESS_DEPTH.get() > 0:
+        _ORIGINAL_PRINT(*args, **kwargs)
+        return
+
+    if kwargs.get("file") not in (None, sys.stdout):
         _ORIGINAL_PRINT(*args, **kwargs)
         return
 
