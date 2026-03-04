@@ -5219,7 +5219,6 @@ class TunnelClient:
             debug_logger.error("REQUEST", f"Request failed: {error_msg}", method=method, path=path, duration_ms=f"{duration_ms:.1f}ms")
             
             # Log to console with full details
-            timestamp = _utc_now_iso()
             print(f"\n{'='*60}", flush=True)
             print(f"[TUNNEL FORWARD ERROR]", flush=True)
             print(f"Error type: {error_type}", flush=True)
@@ -5233,7 +5232,7 @@ class TunnelClient:
             try:
                 log_path = get_config_dir() / "tunnel-forward-errors.log"
                 with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(f"\n[{timestamp}] TUNNEL FORWARD ERROR\n")
+                    f.write(f"\n[{_utc_now_iso()}] TUNNEL FORWARD ERROR\n")
                     f.write(f"Type: {error_type}\n")
                     f.write(f"Message: {error_msg}\n")
                     f.write(f"Method: {method}\n")
