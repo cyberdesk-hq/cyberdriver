@@ -4316,7 +4316,7 @@ def _get_max_restarts() -> Optional[int]:
     except (ValueError, TypeError):
         print(f"Warning: Invalid CYBERDRIVER_MAX_RESTARTS={raw_value!r}; ignoring restart limit")
         return None
-    if parsed < 0:
+    if parsed <= 0:
         return None
     return parsed
 
@@ -4357,7 +4357,7 @@ def _restart_cyberdriver_process() -> bool:
             f"Configured max restarts ({max_restarts}) exceeded "
             f"after {restart_count - 1} restart attempts."
         )
-        print("Set CYBERDRIVER_MAX_RESTARTS=-1 (or unset it) to allow unlimited retries.")
+        print("Set CYBERDRIVER_MAX_RESTARTS=0 (or any negative value, or unset it) to allow unlimited retries.")
         print(f"{'='*60}\n")
         sys.exit(1)
 
