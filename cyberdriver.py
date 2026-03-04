@@ -3608,8 +3608,8 @@ async def post_keyboard_type(request: Request, payload: Dict[str, Any]):
                     # consistent, but holds typing_lock until typing finishes.
                     # Queued /keyboard/type requests can stall during this window.
                     await typing_task
-                except Exception:
-                    pass
+                except Exception as typing_exc:
+                    print(f"Warning: typing task raised during cancellation: {typing_exc}")
                 raise
 
             await _wait_for_typing_settle(text)
