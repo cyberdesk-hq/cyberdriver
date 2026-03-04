@@ -2395,7 +2395,7 @@ async def disable_buffering(request, call_next):
     except Exception:
         # Keep one request outcome line even when downstream raises unexpectedly.
         duration_ms = (time.perf_counter() - request_start) * 1000
-        print(f"{method} {path} -> 500 ({duration_ms:.1f}ms)")
+        print(f"{method} {path} -> ERR ({duration_ms:.1f}ms)")
         raise
 
     duration_ms = (time.perf_counter() - request_start) * 1000
@@ -3567,6 +3567,20 @@ async def post_keyboard_type(request: Request, payload: Dict[str, Any]):
                 # SendInput failure, which can duplicate already-queued chars.
                 await asyncio.to_thread(_type_with_win32_sendinput, text)
             else:
+                non_ascii_chars: Dict[str, int] = {}
+                for ch in text:
+                    if ord(ch) > 127:
+                        non_ascii_chars[ch] = non_ascii_chars.get(ch, 0) + 1
+                if non_ascii_chars:
+                    skipped_count = sum(non_ascii_chars.values())
+                    top_items = sorted(non_ascii_chars.items(), key=lambda item: item[1], reverse=True)[:5]
+                    summary = ", ".join(f"{repr(ch)} x{count}" for ch, count in top_items)
+                    remaining = len(non_ascii_chars) - len(top_items)
+                    extra = f" (+{remaining} more)" if remaining > 0 else ""
+                    print(
+                        f"Warning: pyautogui.typewrite may skip {skipped_count} non-ASCII character(s): "
+                        f"{summary}{extra}"
+                    )
                 await asyncio.to_thread(pyautogui.typewrite, text)
 
             await _wait_for_typing_settle(text)
@@ -6263,7 +6277,6 @@ def check_mei_health(context: str = "") -> bool:
             missing.append(d)
     
     if missing:
-        from datetime import datetime
         timestamp = _utc_now_iso()
         
         # Get list of existing directories for debugging
