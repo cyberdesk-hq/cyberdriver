@@ -2256,7 +2256,6 @@ def _log_error_and_check_mei(error: Exception, context: str = "") -> bool:
     error_type = type(error).__name__
     
     # Always log the error - use both print and direct file logging
-    timestamp = _utc_now_iso()
     
     # Log to console (may not appear if stdout is captured)
     try:
@@ -2271,7 +2270,7 @@ def _log_error_and_check_mei(error: Exception, context: str = "") -> bool:
     try:
         log_path = get_config_dir() / "api-errors.log"
         with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"\n[{timestamp}] {context}\n")
+            f.write(f"\n[{_utc_now_iso()}] {context}\n")
             f.write(f"Type: {error_type}\n")
             f.write(f"Message: {error}\n")
     except Exception:
@@ -2347,7 +2346,6 @@ async def global_exception_handler(request, exc):
     from fastapi.responses import JSONResponse
     
     # Immediately log that we entered this handler
-    timestamp = _utc_now_iso()
     try:
         print(f"\n[GLOBAL EXCEPTION HANDLER]", flush=True)
         print(f"[GLOBAL EXCEPTION HANDLER] Exception type: {type(exc).__name__}", flush=True)
@@ -2360,7 +2358,7 @@ async def global_exception_handler(request, exc):
     try:
         log_path = get_config_dir() / "global-exception-handler.log"
         with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"\n[{timestamp}] GLOBAL EXCEPTION HANDLER INVOKED\n")
+            f.write(f"\n[{_utc_now_iso()}] GLOBAL EXCEPTION HANDLER INVOKED\n")
             f.write(f"Exception type: {type(exc).__name__}\n")
             f.write(f"Exception message: {exc}\n")
     except Exception:
@@ -4244,7 +4242,6 @@ async def post_powershell_exec(payload: Dict[str, Any]):
         return result
     except Exception as e:
         # Log the error with full details
-        timestamp = _utc_now_iso()
         error_type = type(e).__name__
         error_msg = str(e)
         
@@ -4260,7 +4257,7 @@ async def post_powershell_exec(payload: Dict[str, Any]):
         try:
             log_path = get_config_dir() / "powershell-errors.log"
             with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"\n[{timestamp}] POWERSHELL EXEC ERROR\n")
+                f.write(f"\n[{_utc_now_iso()}] POWERSHELL EXEC ERROR\n")
                 f.write(f"Type: {error_type}\n")
                 f.write(f"Message: {error_msg}\n")
                 f.write(f"Command: {command}\n")
@@ -6321,8 +6318,6 @@ def check_mei_health(context: str = "") -> bool:
             missing.append(d)
     
     if missing:
-        timestamp = _utc_now_iso()
-        
         # Get list of existing directories for debugging
         existing = []
         try:
@@ -6344,7 +6339,7 @@ def check_mei_health(context: str = "") -> bool:
             log_path = get_config_dir() / "mei-health-failures.log"
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"\n{'='*70}\n")
-                f.write(f"Timestamp: {timestamp}\n")
+                f.write(f"Timestamp: {_utc_now_iso()}\n")
                 f.write(f"Context: {context}\n")
                 f.write(f"_MEIPASS: {meipass}\n")
                 f.write(f"Missing directories: {missing}\n")
