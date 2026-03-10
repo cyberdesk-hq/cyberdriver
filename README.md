@@ -49,7 +49,7 @@ New-Item -ItemType Directory -Force -Path $toolDir
 
 # Download cyberdriver
 try {
-    Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.40/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe" -ErrorAction Stop
+    Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.41/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe" -ErrorAction Stop
 } catch {
     Write-Host "ERROR: Failed to download Cyberdriver. If Cyberdriver is already running, run 'cyberdriver stop' first. Otherwise, check your internet connection and try again." -ForegroundColor Red
     return
@@ -77,7 +77,7 @@ if (Test-Path "$toolDir\cyberdriver.exe") {
 
 ```bash
 # Choose version and target directory
-VERSION=0.0.40
+VERSION=0.0.41
 TOOL_DIR="$HOME/.cyberdriver"
 mkdir -p "$TOOL_DIR"
 
@@ -188,7 +188,7 @@ Invoke-RestMethod -Method Post -Uri "http://localhost:3000/internal/update" -Con
 Or specify a specific version:
 
 ```powershell
-Invoke-RestMethod -Method Post -Uri "http://localhost:3000/internal/update" -ContentType "application/json" -Body '{"version":"0.0.34","restart":true}'
+Invoke-RestMethod -Method Post -Uri "http://localhost:3000/internal/update" -ContentType "application/json" -Body '{"version":"0.0.41","restart":true}'
 ```
 
 ### Via Cyberdesk API

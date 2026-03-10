@@ -1490,7 +1490,7 @@ async def connect_with_headers(uri, headers_dict):
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
 PID_FILE = "cyberdriver.pid.json"
-VERSION = "0.0.40"
+VERSION = "0.0.41"
 
 @dataclass
 class Config:
@@ -1994,20 +1994,168 @@ class KeyEvent:
         self.down = down
 
 
+XDO_MODIFIER_KEYS = {'ctrl', 'alt', 'shift', 'win'}
+
+# Normalize common multi-word key names before tokenization so model outputs like
+# "ctrl + arrow right" or "page down" still parse as a single key.
+XDO_MULTIWORD_KEY_ALIASES = (
+    (r"\barrow\s+up\b", "arrow_up"),
+    (r"\barrow\s+down\b", "arrow_down"),
+    (r"\barrow\s+left\b", "arrow_left"),
+    (r"\barrow\s+right\b", "arrow_right"),
+    (r"\bup\s+arrow\b", "up_arrow"),
+    (r"\bdown\s+arrow\b", "down_arrow"),
+    (r"\bleft\s+arrow\b", "left_arrow"),
+    (r"\bright\s+arrow\b", "right_arrow"),
+    (r"\bpage\s+up\b", "page_up"),
+    (r"\bpage\s+down\b", "page_down"),
+    (r"\bcaps\s+lock\b", "caps_lock"),
+    (r"\bspace\s+bar\b", "spacebar"),
+    (r"\bback\s+space\b", "backspace"),
+)
+
+# Canonical key aliases shared across parsing and backend dispatch so Windows
+# SendInput and the PyAutoGUI fallback accept the same model-generated names.
+XDO_KEY_ALIASES = {
+    # Modifiers
+    'control': 'ctrl',
+    'ctl': 'ctrl',
+    'leftcontrol': 'ctrl',
+    'controlleft': 'ctrl',
+    'leftctrl': 'ctrl',
+    'ctrlleft': 'ctrl',
+    'lcontrol': 'ctrl',
+    'lctrl': 'ctrl',
+    'rightcontrol': 'ctrl',
+    'controlright': 'ctrl',
+    'rightctrl': 'ctrl',
+    'ctrlright': 'ctrl',
+    'rcontrol': 'ctrl',
+    'rctrl': 'ctrl',
+    'alternate': 'alt',
+    'option': 'alt',
+    'opt': 'alt',
+    'leftalt': 'alt',
+    'altleft': 'alt',
+    'lalt': 'alt',
+    'rightalt': 'alt',
+    'altright': 'alt',
+    'ralt': 'alt',
+    'leftshift': 'shift',
+    'shiftleft': 'shift',
+    'lshift': 'shift',
+    'rightshift': 'shift',
+    'shiftright': 'shift',
+    'rshift': 'shift',
+    'command': 'win',
+    'cmd': 'win',
+    'meta': 'win',
+    'super': 'win',
+    'windows': 'win',
+    'window': 'win',
+    'leftcommand': 'win',
+    'commandleft': 'win',
+    'leftcmd': 'win',
+    'cmdleft': 'win',
+    'rightcommand': 'win',
+    'commandright': 'win',
+    'rightcmd': 'win',
+    'cmdright': 'win',
+    'leftwindows': 'win',
+    'windowsleft': 'win',
+    'leftwin': 'win',
+    'winleft': 'win',
+    'lwin': 'win',
+    'rightwindows': 'win',
+    'windowsright': 'win',
+    'rightwin': 'win',
+    'winright': 'win',
+    'rwin': 'win',
+    # Navigation and editing keys
+    'escape': 'esc',
+    'return': 'enter',
+    'spacebar': 'space',
+    'space_bar': 'space',
+    'back_space': 'backspace',
+    'bksp': 'backspace',
+    'del': 'delete',
+    'ins': 'insert',
+    'page_up': 'pageup',
+    'pgup': 'pageup',
+    'page_down': 'pagedown',
+    'pgdn': 'pagedown',
+    'pgdown': 'pagedown',
+    'caps_lock': 'capslock',
+    # Arrow key variants often emitted by models
+    'arrowup': 'up',
+    'arrow_up': 'up',
+    'uparrow': 'up',
+    'up_arrow': 'up',
+    'arrowdown': 'down',
+    'arrow_down': 'down',
+    'downarrow': 'down',
+    'down_arrow': 'down',
+    'arrowleft': 'left',
+    'arrow_left': 'left',
+    'leftarrow': 'left',
+    'left_arrow': 'left',
+    'arrowright': 'right',
+    'arrow_right': 'right',
+    'rightarrow': 'right',
+    'right_arrow': 'right',
+}
+
+
+def _normalize_xdo_sequence(sequence: str) -> str:
+    """Normalize an XDO-style sequence before tokenization."""
+    normalized = (sequence or "").strip()
+    normalized = re.sub(r"\s*\+\s*", "+", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    for pattern, replacement in XDO_MULTIWORD_KEY_ALIASES:
+        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+    return normalized
+
+
+def _canonicalize_keyboard_key(key: str) -> str:
+    """Collapse common aliases to one canonical key name."""
+    raw = (key or "").strip().lower()
+    if not raw:
+        return ""
+
+    variants = [raw]
+    if len(raw) > 1:
+        underscored = raw.replace("-", "_").replace(" ", "_")
+        variants.append(underscored)
+        variants.append(underscored.replace("_", ""))
+
+    seen = set()
+    for variant in variants:
+        if variant in seen:
+            continue
+        seen.add(variant)
+        canonical = XDO_KEY_ALIASES.get(variant)
+        if canonical:
+            return canonical
+
+    if len(raw) > 1:
+        return raw.replace("-", "_").replace(" ", "_").replace("_", "")
+    return raw
+
+
 class XDOParser:
     """Parse XDO-style keyboard sequences like 'ctrl+c ctrl+v'."""
     
-    MODIFIERS = {'ctrl', 'alt', 'shift', 'win', 'cmd', 'super', 'meta'}
+    MODIFIERS = XDO_MODIFIER_KEYS
     
     @staticmethod
     def parse(sequence: str) -> List[List[KeyEvent]]:
         """Parse XDO sequence into a list of key event groups."""
-        commands = sequence.strip().split()
+        commands = _normalize_xdo_sequence(sequence).split()
         result = []
         
         for command in commands:
             events = []
-            parts = [p.lower() for p in command.split('+')]
+            parts = [_canonicalize_keyboard_key(p) for p in command.split('+') if p.strip()]
             
             # Separate modifiers from regular keys
             modifiers = [p for p in parts if p in XDOParser.MODIFIERS]
@@ -2044,11 +2192,7 @@ def execute_xdo_sequence(sequence: str):
         try:
             for group in command_groups:
                 for event in group:
-                    key = event.key
-                    if key == 'cmd':
-                        key = 'win'
-                    
-                    _press_key_with_scancode(key, key_up=not event.down)
+                    _press_key_with_scancode(event.key, key_up=not event.down)
             return
         except Exception as e:
             print(f"Warning: SendInput failed ({e}), falling back to PyAutoGUI")
@@ -2056,14 +2200,10 @@ def execute_xdo_sequence(sequence: str):
     # Fallback: use PyAutoGUI (for macOS/Linux or if SendInput fails)
     for group in command_groups:
         for event in group:
-            key = event.key
-            if key == 'cmd':
-                key = 'win'
-            
             if event.down:
-                pyautogui.keyDown(key)
+                pyautogui.keyDown(event.key)
             else:
-                pyautogui.keyUp(key)
+                pyautogui.keyUp(event.key)
 
 
 # -----------------------------------------------------------------------------
@@ -2750,7 +2890,7 @@ async def _resolve_latest_version() -> Optional[str]:
 
 
 class UpdateRequest(BaseModel):
-    version: str = Field(default="latest", description="Target version (e.g. '0.0.34') or 'latest'")
+    version: str = Field(default="latest", description="Target version (e.g. '0.0.41') or 'latest'")
     restart: bool = Field(default=True, description="Whether to restart Cyberdriver after update")
 
 
@@ -2767,16 +2907,16 @@ async def post_update(payload: UpdateRequest = UpdateRequest()):
     
     Request body (optional):
     {
-        "version": "0.0.34",  // Target version (without 'v' prefix), or "latest" (default)
+        "version": "0.0.41",  // Target version (without 'v' prefix), or "latest" (default)
         "restart": true       // Whether to restart after update (default: true)
     }
     
     Returns:
     {
         "status": "update_initiated",
-        "current_version": "0.0.34",
-        "target_version": "0.0.34",
-        "message": "Updating to v0.0.34. Cyberdriver will restart automatically."
+        "current_version": "0.0.41",
+        "target_version": "0.0.41",
+        "message": "Updating to v0.0.41. Cyberdriver will restart automatically."
     }
     """
     if platform.system() != "Windows":
@@ -3483,9 +3623,7 @@ def _press_key_with_scancode(key: str, key_up: bool = False):
         key: Key name (e.g., 'tab', 'ctrl', 'a')
         key_up: True to release, False to press
     """
-    # Normalize key name: lowercase and remove underscores
-    # This allows both "Page_Down" and "pagedown" to work
-    key_lower = key.lower().replace('_', '')
+    key_lower = _canonicalize_keyboard_key(key)
     
     # Handle space specially when experimental mode is enabled
     if key_lower == 'space' and EXPERIMENTAL_SPACE_ENABLED:
@@ -3495,9 +3633,9 @@ def _press_key_with_scancode(key: str, key_up: bool = False):
     # Check all scan code maps
     scan_code = (MODIFIER_SCANCODES.get(key_lower) or 
                  SPECIAL_KEY_SCANCODES.get(key_lower) or
-                 LETTER_SCANCODES.get(key.upper()) or
-                 NUMBER_SCANCODES.get(key) or
-                 SYMBOL_SCANCODES.get(key))
+                 LETTER_SCANCODES.get(key_lower.upper()) or
+                 NUMBER_SCANCODES.get(key_lower) or
+                 SYMBOL_SCANCODES.get(key_lower))
     
     if scan_code is None:
         raise ValueError(f"Unknown key: {key}")
