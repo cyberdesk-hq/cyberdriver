@@ -1490,7 +1490,7 @@ async def connect_with_headers(uri, headers_dict):
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
 PID_FILE = "cyberdriver.pid.json"
-VERSION = "0.0.40"
+VERSION = "0.0.41"
 
 @dataclass
 class Config:
@@ -2890,7 +2890,7 @@ async def _resolve_latest_version() -> Optional[str]:
 
 
 class UpdateRequest(BaseModel):
-    version: str = Field(default="latest", description="Target version (e.g. '0.0.34') or 'latest'")
+    version: str = Field(default="latest", description="Target version (e.g. '0.0.41') or 'latest'")
     restart: bool = Field(default=True, description="Whether to restart Cyberdriver after update")
 
 
@@ -2907,16 +2907,16 @@ async def post_update(payload: UpdateRequest = UpdateRequest()):
     
     Request body (optional):
     {
-        "version": "0.0.34",  // Target version (without 'v' prefix), or "latest" (default)
+        "version": "0.0.41",  // Target version (without 'v' prefix), or "latest" (default)
         "restart": true       // Whether to restart after update (default: true)
     }
     
     Returns:
     {
         "status": "update_initiated",
-        "current_version": "0.0.34",
-        "target_version": "0.0.34",
-        "message": "Updating to v0.0.34. Cyberdriver will restart automatically."
+        "current_version": "0.0.41",
+        "target_version": "0.0.41",
+        "message": "Updating to v0.0.41. Cyberdriver will restart automatically."
     }
     """
     if platform.system() != "Windows":
