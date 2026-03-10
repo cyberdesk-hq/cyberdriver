@@ -3623,7 +3623,42 @@ def _press_key_with_scancode(key: str, key_up: bool = False):
         key: Key name (e.g., 'tab', 'ctrl', 'a')
         key_up: True to release, False to press
     """
+    raw_key = (key or "").strip().lower()
     key_lower = _canonicalize_keyboard_key(key)
+    modifier_aliases = {
+        'leftcontrol': 'lcontrol',
+        'controlleft': 'lcontrol',
+        'leftctrl': 'lcontrol',
+        'ctrlleft': 'lcontrol',
+        'rightcontrol': 'rcontrol',
+        'controlright': 'rcontrol',
+        'rightctrl': 'rcontrol',
+        'ctrlright': 'rcontrol',
+        'leftalt': 'lalt',
+        'altleft': 'lalt',
+        'rightalt': 'ralt',
+        'altright': 'ralt',
+        'leftshift': 'lshift',
+        'shiftleft': 'lshift',
+        'rightshift': 'rshift',
+        'shiftright': 'rshift',
+        'leftcommand': 'lwin',
+        'commandleft': 'lwin',
+        'leftcmd': 'lwin',
+        'cmdleft': 'lwin',
+        'rightcommand': 'rwin',
+        'commandright': 'rwin',
+        'rightcmd': 'rwin',
+        'cmdright': 'rwin',
+        'leftwindows': 'lwin',
+        'windowsleft': 'lwin',
+        'leftwin': 'lwin',
+        'winleft': 'lwin',
+        'rightwindows': 'rwin',
+        'windowsright': 'rwin',
+        'rightwin': 'rwin',
+        'winright': 'rwin',
+    }
     
     # Handle space specially when experimental mode is enabled
     if key_lower == 'space' and EXPERIMENTAL_SPACE_ENABLED:
@@ -3631,11 +3666,23 @@ def _press_key_with_scancode(key: str, key_up: bool = False):
         return
     
     # Check all scan code maps
-    scan_code = (MODIFIER_SCANCODES.get(key_lower) or 
-                 SPECIAL_KEY_SCANCODES.get(key_lower) or
-                 LETTER_SCANCODES.get(key_lower.upper()) or
-                 NUMBER_SCANCODES.get(key_lower) or
-                 SYMBOL_SCANCODES.get(key_lower))
+    scan_code = None
+    raw_variants = [raw_key]
+    if len(raw_key) > 1:
+        underscored = raw_key.replace("-", "_").replace(" ", "_")
+        raw_variants.extend([underscored, underscored.replace("_", "")])
+
+    for raw_variant in dict.fromkeys(raw_variants):
+        modifier_key = modifier_aliases.get(raw_variant, raw_variant)
+        scan_code = MODIFIER_SCANCODES.get(modifier_key)
+        if scan_code is not None:
+            break
+
+    if scan_code is None:
+        scan_code = (SPECIAL_KEY_SCANCODES.get(key_lower) or
+                     LETTER_SCANCODES.get(key_lower.upper()) or
+                     NUMBER_SCANCODES.get(key_lower) or
+                     SYMBOL_SCANCODES.get(key_lower))
     
     if scan_code is None:
         raise ValueError(f"Unknown key: {key}")

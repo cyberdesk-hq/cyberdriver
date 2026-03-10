@@ -134,6 +134,29 @@ class KeyboardAliasTests(unittest.TestCase):
             ],
         )
 
+    def test_scan_code_path_preserves_right_side_modifier_scan_codes(self):
+        namespace = _load_keyboard_namespace()
+        recorded_calls = []
+
+        namespace["_win32_send_key"] = lambda scan_code, key_up=False: recorded_calls.append(
+            (scan_code, key_up)
+        )
+
+        namespace["_press_key_with_scancode"]("rshift")
+        namespace["_press_key_with_scancode"]("Right-Control")
+        namespace["_press_key_with_scancode"]("right alt", key_up=True)
+        namespace["_press_key_with_scancode"]("RightWin")
+
+        self.assertEqual(
+            recorded_calls,
+            [
+                (0x36, False),
+                (0xE01D, False),
+                (0xE038, True),
+                (0xE05C, False),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
