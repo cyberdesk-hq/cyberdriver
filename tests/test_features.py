@@ -1,133 +1,165 @@
-#!/usr/bin/env python3
-"""
-Test script to demonstrate Cyberdriver enhanced features.
-Run this after starting the server with: python cyberdriver.py start --port 3000
-"""
-
-import requests
-import json
+import ast
+import asyncio
+import copy
+import secrets
 import time
+import types
+import unittest
+from pathlib import Path
+from typing import Any, Dict, Optional
 
-BASE_URL = "http://localhost:3000"
-
-def test_screenshot_scaling():
-    """Test different screenshot scaling modes."""
-    print("Testing screenshot scaling modes...")
-    
-    # Test exact scaling
-    response = requests.get(f"{BASE_URL}/computer/display/screenshot", 
-                          params={"width": 800, "height": 600, "mode": "exact"})
-    print(f"  Exact mode (800x600): {response.status_code}, size: {len(response.content)} bytes")
-    
-    # Test aspect fit
-    response = requests.get(f"{BASE_URL}/computer/display/screenshot", 
-                          params={"width": 1024, "height": 768, "mode": "aspect_fit"})
-    print(f"  Aspect fit mode: {response.status_code}, size: {len(response.content)} bytes")
-    
-    # Test aspect fill
-    response = requests.get(f"{BASE_URL}/computer/display/screenshot", 
-                          params={"width": 1920, "height": 1080, "mode": "aspect_fill"})
-    print(f"  Aspect fill mode: {response.status_code}, size: {len(response.content)} bytes")
+from fastapi.responses import JSONResponse
 
 
-def test_xdo_keyboard():
-    """Test XDO keyboard sequences."""
-    print("\nTesting XDO keyboard input...")
-    
-    # Test simple key combo
-    response = requests.post(f"{BASE_URL}/computer/input/keyboard/key",
-                           json={"text": "ctrl+a"})
-    print(f"  ctrl+a: {response.status_code}")
-    time.sleep(0.5)
-    
-    # Test complex sequence
-    response = requests.post(f"{BASE_URL}/computer/input/keyboard/key",
-                           json={"text": "ctrl+shift+home"})
-    print(f"  ctrl+shift+home: {response.status_code}")
-    time.sleep(0.5)
-    
-    # Test multiple commands
-    response = requests.post(f"{BASE_URL}/computer/input/keyboard/key",
-                           json={"text": "alt+tab alt+tab"})
-    print(f"  alt+tab alt+tab: {response.status_code}")
+SOURCE_PATH = Path(__file__).resolve().parents[1] / "cyberdriver.py"
+
+TARGET_ASSIGNMENTS = {
+    "TUNNEL_INTERNAL_REQUEST_HEADER",
+    "TUNNEL_PROTECTED_ROUTE_PREFIXES",
+}
+TARGET_FUNCTIONS = {
+    "_is_tunnel_protected_path",
+    "_build_local_forward_headers",
+    "_is_request_from_active_tunnel",
+    "disable_buffering",
+}
 
 
-def test_mouse_features():
-    """Test enhanced mouse features."""
-    print("\nTesting mouse features...")
-    
-    # Get current position
-    response = requests.get(f"{BASE_URL}/computer/input/mouse/position")
-    pos = response.json()
-    print(f"  Current position: {pos}")
-    
-    # Test smooth movement
-    print("  Testing smooth movement...")
-    response = requests.post(f"{BASE_URL}/computer/input/mouse/move",
-                           json={"x": 500, "y": 500})
-    print(f"    Move to (500,500): {response.status_code}")
-    time.sleep(1)
-    
-    # Test mouse down/up separately
-    print("  Testing separate press/release...")
-    response = requests.post(f"{BASE_URL}/computer/input/mouse/click",
-                           json={"button": "left", "down": True})
-    print(f"    Mouse down: {response.status_code}")
-    time.sleep(0.5)
-    
-    response = requests.post(f"{BASE_URL}/computer/input/mouse/click",
-                           json={"button": "left", "down": False})
-    print(f"    Mouse up: {response.status_code}")
+def _load_route_protection_namespace():
+    source = SOURCE_PATH.read_text(encoding="utf-8")
+    module = ast.parse(source, filename=str(SOURCE_PATH))
+    selected_nodes = []
+
+    for node in module.body:
+        if isinstance(node, ast.Assign):
+            target_names = {
+                target.id
+                for target in node.targets
+                if isinstance(target, ast.Name)
+            }
+            if target_names & TARGET_ASSIGNMENTS:
+                selected_nodes.append(copy.deepcopy(node))
+        elif isinstance(node, ast.FunctionDef) and node.name in TARGET_FUNCTIONS:
+            node_copy = copy.deepcopy(node)
+            node_copy.decorator_list = []
+            selected_nodes.append(node_copy)
+        elif isinstance(node, ast.AsyncFunctionDef) and node.name in TARGET_FUNCTIONS:
+            node_copy = copy.deepcopy(node)
+            node_copy.decorator_list = []
+            selected_nodes.append(node_copy)
+
+    fake_app = types.SimpleNamespace(
+        state=types.SimpleNamespace(tunnel_internal_token="test-internal-token")
+    )
+    extracted_module = ast.Module(body=selected_nodes, type_ignores=[])
+    namespace = {
+        "Any": Any,
+        "Dict": Dict,
+        "Optional": Optional,
+        "JSONResponse": JSONResponse,
+        "Request": object,
+        "app": fake_app,
+        "print": lambda *args, **kwargs: None,
+        "secrets": secrets,
+        "time": time,
+    }
+    exec(compile(extracted_module, str(SOURCE_PATH), "exec"), namespace)
+    return namespace
 
 
-def test_not_implemented():
-    """Test that filesystem and shell endpoints return 501."""
-    print("\nTesting not-implemented endpoints...")
-    
-    # File system
-    response = requests.get(f"{BASE_URL}/computer/fs/list", params={"path": "."})
-    print(f"  fs/list: {response.status_code} (expected 501)")
-    
-    response = requests.get(f"{BASE_URL}/computer/fs/read", params={"path": "test.txt"})
-    print(f"  fs/read: {response.status_code} (expected 501)")
-    
-    response = requests.post(f"{BASE_URL}/computer/fs/write", 
-                           json={"path": "test.txt", "content": "test"})
-    print(f"  fs/write: {response.status_code} (expected 501)")
-    
-    # Shell
-    response = requests.post(f"{BASE_URL}/computer/shell/cmd/exec",
-                           json={"command": "echo test"})
-    print(f"  shell/cmd/exec: {response.status_code} (expected 501)")
-    
-    response = requests.post(f"{BASE_URL}/computer/shell/powershell/exec",
-                           json={"command": "echo test"})
-    print(f"  shell/powershell/exec: {response.status_code} (expected 501)")
+class _FakeRequest:
+    def __init__(self, path: str, headers: Optional[Dict[str, str]] = None, method: str = "GET"):
+        self.method = method
+        self.headers = headers or {}
+        self.url = types.SimpleNamespace(path=path)
 
 
-def main():
-    """Run all tests."""
-    print("Cyberdriver Feature Tests")
-    print("===========================")
-    
-    try:
-        # Test connection
-        response = requests.get(f"{BASE_URL}/computer/display/dimensions")
-        response.raise_for_status()
-        dims = response.json()
-        print(f"Connected! Screen dimensions: {dims['width']}x{dims['height']}")
-    except Exception as e:
-        print(f"Failed to connect to server: {e}")
-        print("Make sure server is running: python cyberdriver.py start --port 3000")
-        return
-    
-    test_screenshot_scaling()
-    test_xdo_keyboard()
-    test_mouse_features()
-    test_not_implemented()
-    
-    print("\nAll tests completed!")
+class TunnelProtectionTests(unittest.TestCase):
+    def test_protected_path_helper_matches_expected_prefixes(self):
+        namespace = _load_route_protection_namespace()
+
+        self.assertTrue(namespace["_is_tunnel_protected_path"]("/computer/display/screenshot"))
+        self.assertTrue(namespace["_is_tunnel_protected_path"]("/internal/update"))
+        self.assertFalse(namespace["_is_tunnel_protected_path"]("/docs"))
+        self.assertFalse(namespace["_is_tunnel_protected_path"]("/tunnel/ws"))
+
+    def test_forward_headers_add_internal_token_for_protected_routes(self):
+        namespace = _load_route_protection_namespace()
+
+        headers = namespace["_build_local_forward_headers"](
+            {"x-idempotency-key": "abc123"},
+            "/computer/fs/read",
+            "secret-token",
+        )
+
+        self.assertEqual(headers["x-idempotency-key"], "abc123")
+        self.assertEqual(
+            headers[namespace["TUNNEL_INTERNAL_REQUEST_HEADER"]],
+            "secret-token",
+        )
+
+    def test_forward_headers_leave_unprotected_routes_unchanged(self):
+        namespace = _load_route_protection_namespace()
+
+        headers = namespace["_build_local_forward_headers"](
+            {"x-idempotency-key": "abc123"},
+            "/docs",
+            "secret-token",
+        )
+
+        self.assertEqual(headers, {"x-idempotency-key": "abc123"})
+
+    def test_middleware_blocks_direct_requests_without_tunnel_token(self):
+        namespace = _load_route_protection_namespace()
+        call_next_called = False
+
+        async def call_next(_request):
+            nonlocal call_next_called
+            call_next_called = True
+            return JSONResponse(status_code=200, content={"ok": True})
+
+        response = asyncio.run(
+            namespace["disable_buffering"](
+                _FakeRequest("/computer/input/mouse/click"),
+                call_next,
+            )
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(call_next_called)
+
+    def test_middleware_allows_requests_with_valid_tunnel_token(self):
+        namespace = _load_route_protection_namespace()
+        call_next_called = False
+        header_name = namespace["TUNNEL_INTERNAL_REQUEST_HEADER"]
+
+        async def call_next(_request):
+            nonlocal call_next_called
+            call_next_called = True
+            return JSONResponse(status_code=200, content={"ok": True})
+
+        response = asyncio.run(
+            namespace["disable_buffering"](
+                _FakeRequest(
+                    "/internal/update",
+                    headers={header_name: "test-internal-token"},
+                    method="POST",
+                ),
+                call_next,
+            )
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(call_next_called)
+
+    def test_source_no_longer_contains_legacy_start_command(self):
+        source = SOURCE_PATH.read_text(encoding="utf-8")
+
+        self.assertNotIn('start_parser = subparsers.add_parser(', source)
+        self.assertNotIn('if args.command == "start":', source)
+        self.assertNotIn("cyberdriver start [--port 3000]", source)
+        self.assertNotIn("0.0.0.0", source)
 
 
 if __name__ == "__main__":
-    main() 
+    unittest.main()

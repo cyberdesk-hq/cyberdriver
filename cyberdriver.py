@@ -34,7 +34,6 @@ Install dependencies:
     pip install fastapi uvicorn[standard] websockets httpx mss pyautogui pillow numpy
 
 Usage:
-    cyberdriver start [--port 3000]
     cyberdriver join --secret YOUR_API_KEY [--host example.com] [--port 443]
 """
 
@@ -1490,7 +1489,7 @@ async def connect_with_headers(uri, headers_dict):
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
 PID_FILE = "cyberdriver.pid.json"
-VERSION = "0.0.41"
+VERSION = "0.0.42"
 
 @dataclass
 class Config:
@@ -2541,6 +2540,16 @@ async def disable_buffering(request, call_next):
     method = request.method
     path = request.url.path
     request_start = time.perf_counter()
+    if _is_tunnel_protected_path(path) and not _is_request_from_active_tunnel(request):
+        response = JSONResponse(
+            status_code=403,
+            content={"error": "Forbidden: tunnel-only endpoint"},
+        )
+        duration_ms = (time.perf_counter() - request_start) * 1000
+        print(f"{method} {path} -> {response.status_code} ({duration_ms:.1f}ms)")
+        response.headers["X-Accel-Buffering"] = "no"
+        response.headers["Cache-Control"] = "no-cache"
+        return response
     try:
         response = await call_next(request)
     except Exception:
@@ -2629,6 +2638,24 @@ async def post_remote_keepalive_disable():
 
 
 TUNNEL_INTERNAL_REQUEST_HEADER = "x-cyberdesk-tunnel-token"
+TUNNEL_PROTECTED_ROUTE_PREFIXES = ("/computer/", "/internal/")
+
+
+def _is_tunnel_protected_path(path: str) -> bool:
+    """Return True if the route must only be reachable via the authenticated tunnel."""
+    if not isinstance(path, str):
+        return False
+    return path.startswith(TUNNEL_PROTECTED_ROUTE_PREFIXES)
+
+
+def _build_local_forward_headers(
+    headers: Any, path: str, internal_request_token: Optional[str]
+) -> Dict[str, Any]:
+    """Clone request headers and attach the internal tunnel token when required."""
+    request_headers = dict(headers) if isinstance(headers, dict) else {}
+    if internal_request_token and _is_tunnel_protected_path(path):
+        request_headers[TUNNEL_INTERNAL_REQUEST_HEADER] = internal_request_token
+    return request_headers
 
 
 def _is_request_from_active_tunnel(request: Request) -> bool:
@@ -2650,11 +2677,8 @@ async def post_shutdown(request: Request):
     Returns immediately, then exits the process shortly after the response is sent.
     """
     try:
-        if not _is_request_from_active_tunnel(request):
-            raise HTTPException(status_code=403, detail="Forbidden: tunnel-only endpoint")
-
-        # Parse request JSON only after auth so unauthenticated malformed payloads
-        # cannot bypass tunnel-only checks via FastAPI body validation.
+        # Parse request JSON after the middleware-auth check so malformed payloads
+        # cannot bypass tunnel-only access control via FastAPI body validation.
         payload: Optional[Dict[str, Any]] = None
         try:
             raw_payload = await request.body()
@@ -2890,7 +2914,7 @@ async def _resolve_latest_version() -> Optional[str]:
 
 
 class UpdateRequest(BaseModel):
-    version: str = Field(default="latest", description="Target version (e.g. '0.0.41') or 'latest'")
+    version: str = Field(default="latest", description="Target version (e.g. '0.0.42') or 'latest'")
     restart: bool = Field(default=True, description="Whether to restart Cyberdriver after update")
 
 
@@ -2907,16 +2931,16 @@ async def post_update(payload: UpdateRequest = UpdateRequest()):
     
     Request body (optional):
     {
-        "version": "0.0.41",  // Target version (without 'v' prefix), or "latest" (default)
+        "version": "0.0.42",  // Target version (without 'v' prefix), or "latest" (default)
         "restart": true       // Whether to restart after update (default: true)
     }
     
     Returns:
     {
         "status": "update_initiated",
-        "current_version": "0.0.41",
-        "target_version": "0.0.41",
-        "message": "Updating to v0.0.41. Cyberdriver will restart automatically."
+        "current_version": "0.0.42",
+        "target_version": "0.0.42",
+        "message": "Updating to v0.0.42. Cyberdriver will restart automatically."
     }
     """
     if platform.system() != "Windows":
@@ -5293,9 +5317,9 @@ class TunnelClient:
         path = meta["path"]
         query = meta.get("query", "")
         headers = meta.get("headers", {})
-        request_headers = dict(headers) if isinstance(headers, dict) else {}
-        if self.internal_request_token and path == "/internal/shutdown":
-            request_headers[TUNNEL_INTERNAL_REQUEST_HEADER] = self.internal_request_token
+        request_headers = _build_local_forward_headers(
+            headers, path, self.internal_request_token
+        )
         
         # Check for idempotency key (case-insensitive header lookup)
         idempotency_key: Optional[str] = None
@@ -5516,12 +5540,6 @@ class TunnelClient:
 # -----------------------------------------------------------------------------
 # Main entry point
 # -----------------------------------------------------------------------------
-
-def run_server(port: int):
-    """Run the FastAPI server."""
-    # Keep request logging single-sourced via Cyberdriver's own timestamped print lines.
-    uvicorn.run(app, host="0.0.0.0", port=port, access_log=False)
-
 
 async def run_server_async(port: int):
     """Run the FastAPI server asynchronously."""
@@ -6707,14 +6725,6 @@ def main():
     
     subparsers = parser.add_subparsers(dest="command", metavar="")
     
-    # start command
-    start_parser = subparsers.add_parser(
-        "start", 
-        help="Start local server",
-        description="Start Cyberdriver API server locally for testing"
-    )
-    start_parser.add_argument("--port", type=int, default=3000, help="Port (default: 3000)")
-    
     # join command
     join_parser = subparsers.add_parser(
         "join", 
@@ -7035,28 +7045,7 @@ def main():
         print("✓ Experimental space mode enabled (using VK code instead of scan code)")
     
     try:
-        if args.command == "start":
-            actual_port = find_available_port("0.0.0.0", args.port)
-            if actual_port is None:
-                print(f"Error: Could not find an available port starting from {args.port}.")
-                sys.exit(1)
-
-            write_pid_info({"command": "start", "local_port": actual_port})
-            
-            # Try to print with checkmark
-            if platform.system() == "Windows":
-                try:
-                    import ctypes
-                    kernel32 = ctypes.windll.kernel32
-                    kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
-                    print(f"✓ Cyberdriver server starting on http://0.0.0.0:{actual_port}")
-                except:
-                    print(f"√ Cyberdriver server starting on http://0.0.0.0:{actual_port}")
-            else:
-                print(f"✓ Cyberdriver server starting on http://0.0.0.0:{actual_port} ")
-            run_server(actual_port)
-        
-        elif args.command == "coords":
+        if args.command == "coords":
             run_coords_capture()
 
         elif args.command == "join":

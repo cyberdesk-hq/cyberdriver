@@ -75,7 +75,9 @@ or similar low-level APIs.
 
 
 if __name__ == "__main__":
-    print("Make sure the server is running: python cyberdriver.py start --port 3000")
+    print("Legacy manual diagnostic script.")
+    print("Privileged localhost routes are now tunnel-only and direct local access is blocked.")
+    print("Use authenticated tunnel integration testing for supported verification.")
     print()
     
     try:

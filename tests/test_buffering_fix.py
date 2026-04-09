@@ -124,7 +124,9 @@ async def main():
     print("Cyberdriver Buffering Test")
     print("=" * 60)
     print(f"Testing server at: {BASE_URL}")
-    print("Make sure cyberdriver is running with: python cyberdriver.py start")
+    print("Legacy manual diagnostic script.")
+    print("Privileged localhost routes are now tunnel-only and direct local access is blocked.")
+    print("Use authenticated tunnel integration testing for supported verification.")
     print("=" * 60)
     
     # Give user time to see the message
