@@ -57,7 +57,7 @@ def main():
             size = os.path.getsize(executable_path) / (1024 * 1024)
             print(f"\nExecutable created: {executable_path}")
             print(f"Size: {size:.1f} MB")
-            print("\nTo run: ./dist/cyberdriver start --port 3000")
+            print("\nTo run: ./dist/cyberdriver join --secret YOUR_API_KEY")
         else:
             print(f"\n❌ Executable not found at {executable_path}")
             

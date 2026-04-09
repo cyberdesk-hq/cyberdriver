@@ -65,14 +65,12 @@ pyinstaller \
 chmod +x dist/cyberdriver
 
 # Run it
-./dist/cyberdriver start --port 3000
-# or
 ./dist/cyberdriver join --secret YOUR_API_KEY
 ```
 
 ### Windows
 ```cmd
-dist\cyberdriver.exe start --port 3000
+dist\cyberdriver.exe join --secret YOUR_API_KEY
 ```
 
 ## Platform-Specific Notes

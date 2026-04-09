@@ -5,7 +5,7 @@ A comprehensive remote computer control tool with all major features for remote 
 ## Features
 
 ### Complete Feature Set
-- ✅ **HTTP API Server** - All endpoints for display, keyboard, and mouse control 
+- ✅ **HTTP API Server** - Local control server used behind the authenticated Cyberdesk tunnel
 - ✅ **WebSocket Tunnel** - Connect to remote control servers with proper protocol
 - ✅ **XDO Keyboard Input** - Support for complex key sequences like `ctrl+c ctrl+v`
 - ✅ **Screenshot Scaling** - Three modes: Exact, AspectFit, AspectFill
@@ -32,9 +32,10 @@ A comprehensive remote computer control tool with all major features for remote 
 - `POST /computer/input/mouse/move` - Move to position (smooth interpolation)
 - `POST /computer/input/mouse/click` - Click with optional press/release control
 
-#### Not Implemented (matching original)
-- File system endpoints (list, read, write)
-- Shell command execution (cmd, powershell)
+#### Protected Operational Routes
+- File system endpoints (`/computer/fs/*`) are available through authenticated tunnel requests only
+- PowerShell endpoints (`/computer/shell/powershell/*`) are available through authenticated tunnel requests only
+- Internal operational routes (`/internal/*`) are tunnel-only
 
 ## Installation
 
@@ -49,7 +50,7 @@ New-Item -ItemType Directory -Force -Path $toolDir
 
 # Download cyberdriver
 try {
-    Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.41/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe" -ErrorAction Stop
+    Invoke-WebRequest -Uri "https://github.com/cyberdesk-hq/cyberdriver/releases/download/v0.0.42/cyberdriver.exe" -OutFile "$toolDir\cyberdriver.exe" -ErrorAction Stop
 } catch {
     Write-Host "ERROR: Failed to download Cyberdriver. If Cyberdriver is already running, run 'cyberdriver stop' first. Otherwise, check your internet connection and try again." -ForegroundColor Red
     return
@@ -77,7 +78,7 @@ if (Test-Path "$toolDir\cyberdriver.exe") {
 
 ```bash
 # Choose version and target directory
-VERSION=0.0.41
+VERSION=0.0.42
 TOOL_DIR="$HOME/.cyberdriver"
 mkdir -p "$TOOL_DIR"
 
@@ -113,21 +114,17 @@ echo "- Screen Recording"
 
 1. Right-click on PowerShell and select "Run as Administrator"
 2. Navigate to your desired directory
-3. Run `cyberdriver start` or `cyberdriver join --secret YOUR_KEY`
+3. Run `cyberdriver join --secret YOUR_KEY`
 
 This ensures cyberdriver has the necessary permissions to interact with elevated applications. If you're only automating regular user-level applications, you can run cyberdriver normally without admin privileges.
 
-Cyberdriver can then be started with:
-
-```bash
-cyberdriver start
-```
-
-Or subscribed for remote use via Cyberdesk cloud:
+Cyberdriver is started by connecting it to Cyberdesk:
 
 ```bash
 cyberdriver join --secret SK-YOUR-SECRET-KEY
 ```
+
+The legacy standalone `cyberdriver start` mode has been removed. Privileged local routes are only accessible through the authenticated `cyberdriver join` tunnel path.
 
 ## Agent Protection (Preventing Accidental Termination)
 
@@ -177,23 +174,9 @@ Cyberdriver can update itself remotely, even while running. This is useful for:
 - Keeping all your machines on the latest version without manual intervention
 - Zero-downtime updates (machine is only offline for ~10 seconds)
 
-### Via execute_terminal_command
-
-Run this PowerShell command through `execute_terminal_command`:
-
-```powershell
-Invoke-RestMethod -Method Post -Uri "http://localhost:3000/internal/update" -ContentType "application/json" -Body '{"version":"latest","restart":true}'
-```
-
-Or specify a specific version:
-
-```powershell
-Invoke-RestMethod -Method Post -Uri "http://localhost:3000/internal/update" -ContentType "application/json" -Body '{"version":"0.0.41","restart":true}'
-```
-
 ### Via Cyberdesk API
 
-You can also call the update endpoint directly through the Cyberdesk API:
+Trigger self-update through an authenticated Cyberdesk workflow or API call:
 
 ```bash
 curl -X POST "https://api.cyberdesk.io/v1/computer/{machine_id}/internal/update" \
@@ -201,6 +184,8 @@ curl -X POST "https://api.cyberdesk.io/v1/computer/{machine_id}/internal/update"
   -H "Content-Type: application/json" \
   -d '{"version": "latest", "restart": true}'
 ```
+
+Direct localhost calls to `/internal/update` are intentionally blocked. The route is available only through the authenticated tunnel path.
 
 ### How It Works
 
@@ -239,11 +224,6 @@ pip install -r requirements.txt
 ```
 
 ## Usage
-
-### Start Local Server
-```bash
-python cyberdriver.py start --port 3000
-```
 
 ### Join Remote Control Server
 ```bash
@@ -366,7 +346,7 @@ The executable will be in the `dist/` directory.
 ## Key Features
 
 1. **Cross-platform cursor overlay** - Uses tkinter on Windows, prints warning on other platforms
-2. **Filesystem/Shell endpoints** - Return 501 Not Implemented
+2. **Filesystem/Shell endpoints** - Protected behind the authenticated tunnel path
 3. **Smooth mouse movement** - Configurable steps and duration
 4. **Enhanced error handling** - Better error messages and recovery
 
