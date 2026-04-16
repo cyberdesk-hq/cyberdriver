@@ -50,34 +50,47 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        include:
+          - os: windows-latest
+            requirements: requirements-windows.txt
+          - os: macos-latest
+            requirements: requirements.txt
+          - os: ubuntu-latest
+            requirements: requirements-linux.txt
+          - os: ubuntu-24.04-arm
+            requirements: requirements-linux.txt
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v3
-      
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
-          
-      - name: Install dependencies (Windows)
-        if: runner.os == 'Windows'
+
+      # Linux PyAutoGUI imports python-xlib at module-load time, which links
+      # against libX11. Install the X libs (and python3-tk for PyMsgBox) so the
+      # PyInstaller analysis pass can `import pyautogui` cleanly.
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3-tk python3-dev \
+            libx11-6 libxext6 libxrender1 libxtst6 libxinerama1 libxi6 libxrandr2 \
+            scrot xdotool
+
+      - name: Install Python dependencies
+        shell: bash
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-windows.txt
+          pip install -r ${{ matrix.requirements }}
           pip install pyinstaller
-          
-      - name: Install dependencies (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
-          
+
       - name: Build executable
         run: |
           pyinstaller cyberdriver.spec
-          
+
       - name: Prepare artifact
         id: artifact
         shell: bash
@@ -85,13 +98,25 @@ jobs:
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             echo "asset_path=dist/cyberdriver.exe" >> $GITHUB_OUTPUT
             echo "asset_name=cyberdriver.exe" >> $GITHUB_OUTPUT
+          elif [[ "${{ runner.os }}" == "Linux" ]]; then
+            UNAME_M=$(uname -m)
+            case "$UNAME_M" in
+              x86_64)  ARCH=amd64 ;;
+              aarch64) ARCH=arm64 ;;
+              *)       ARCH="$UNAME_M" ;;
+            esac
+            ASSET="cyberdriver-test-linux-${ARCH}"
+            mv dist/cyberdriver "dist/${ASSET}"
+            chmod +x "dist/${ASSET}"
+            echo "asset_path=dist/${ASSET}" >> $GITHUB_OUTPUT
+            echo "asset_name=${ASSET}" >> $GITHUB_OUTPUT
           else
             ARCH=$(uname -m)
             (cd dist && zip -9 "cyberdriver-test-macos-${ARCH}.zip" cyberdriver)
             echo "asset_path=dist/cyberdriver-test-macos-${ARCH}.zip" >> $GITHUB_OUTPUT
             echo "asset_name=cyberdriver-test-macos-${ARCH}.zip" >> $GITHUB_OUTPUT
           fi
-          
+
       - name: Upload to Test Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

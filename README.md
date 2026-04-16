@@ -108,6 +108,67 @@ echo "- Screen Recording"
 "$TOOL_DIR/cyberdriver" join --secret YOUR_API_KEY
 ```
 
+### Linux Installation (Bash)
+
+Cyberdriver ships standalone binaries for `linux-amd64` and `linux-arm64`. The
+target environment is a desktop session backed by an X11 display - that means
+Xvfb (or Xorg) must be running and the `DISPLAY` env var must be set before you
+start `cyberdriver join`. Wayland is not supported.
+
+```bash
+# 1. Install runtime system deps (Debian / Ubuntu).
+#    - xvfb + a window manager (xfce4 or icewm) provide the X session
+#    - scrot / xdotool back PyAutoGUI's screenshot + input on X11
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends \
+  ca-certificates curl xvfb xfce4 chromium-browser scrot xdotool python3-tk
+
+# 2. Download the matching binary (auto-detects amd64 vs arm64).
+TOOL_DIR="$HOME/.cyberdriver"
+mkdir -p "$TOOL_DIR"
+case "$(uname -m)" in
+  x86_64)  ARCH=amd64 ;;
+  aarch64) ARCH=arm64 ;;
+  *) echo "Unsupported architecture: $(uname -m)"; exit 1 ;;
+esac
+curl -fsSL -o "$TOOL_DIR/cyberdriver" \
+  "https://github.com/cyberdesk-hq/cyberdriver/releases/latest/download/cyberdriver-linux-${ARCH}"
+chmod +x "$TOOL_DIR/cyberdriver"
+export PATH="$TOOL_DIR:$PATH"
+
+# 3. Start an X session (skip if you already have one).
+Xvfb :99 -screen 0 1280x720x24 &
+sleep 1
+DISPLAY=:99 startxfce4 &
+sleep 2
+
+# 4. Connect.
+DISPLAY=:99 cyberdriver join --secret YOUR_API_KEY
+```
+
+**Headless container example.** Useful for Cursor Cloud sandboxes / CI / Docker:
+
+```dockerfile
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive DISPLAY=:99
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl xvfb xfce4 chromium-browser scrot xdotool \
+      python3 python3-tk \
+    && rm -rf /var/lib/apt/lists/*
+ARG TARGETARCH=amd64
+RUN curl -fsSL -o /usr/local/bin/cyberdriver \
+      "https://github.com/cyberdesk-hq/cyberdriver/releases/latest/download/cyberdriver-linux-${TARGETARCH}" \
+    && chmod +x /usr/local/bin/cyberdriver
+CMD Xvfb :99 -screen 0 1280x720x24 & \
+    sleep 2 && startxfce4 & \
+    sleep 2 && cyberdriver join --secret "$SECRET" --host https://api.cyberdesk.io
+```
+
+**Notes (Linux):**
+- The screenshot, mouse, and keyboard endpoints all go through the X server, so anything you can `xdotool` / `scrot` against will work. Wayland sessions are not supported - use Xvfb or Xorg.
+- The Windows-specific features (background detach, persistent display via Amyuni, console close-button protection) are no-ops on Linux. If you need to keep `cyberdriver join` running across SSH disconnects, wrap it in `nohup`, `tmux`, `systemd`, or your container's entrypoint.
+- The `/computer/shell/*` endpoints execute via `pwsh` (PowerShell Core). Install it with `sudo apt-get install -y powershell` if you need them; otherwise they'll error out, which is fine for the typical screenshot/mouse/keyboard workflow.
+
 **Note (Windows):** Cyberdriver automatically disables PowerShell's QuickEdit Mode on startup. PowerShell has this dumb quirk where focusing your mouse on a running executable can stall the outputs until you unfocus it (it's called "QuickEdit Mode"). 
 
 **Important - Admin Privileges:** If the desktop application you want to automate requires administrator privileges to start (such as many legacy enterprise applications), you must also run cyberdriver from an Administrator PowerShell terminal:
