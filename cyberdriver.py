@@ -1526,7 +1526,7 @@ def _wait_for_child_connected(
                             last_failure_state = "tls_failed"
                     for m in _CHILD_FATAL_FAILURE_MARKERS:
                         if m in line:
-                            last_failure_state = "unknown_error"
+                            return ("unknown_error", "\n".join(seen_lines[-30:]))
 
             # Periodically verify the child process is still alive. If it died
             # before connecting, we should stop waiting and surface the error.
