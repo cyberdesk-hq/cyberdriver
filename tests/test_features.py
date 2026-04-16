@@ -346,8 +346,8 @@ class UrlBuilderTests(unittest.TestCase):
 
     def test_wss_scheme_is_preserved(self):
         self.assertEqual(
-            self.build_tunnel_url("wss://staging.cyberdesk.io", 443),
-            "wss://staging.cyberdesk.io/tunnel/ws",
+            self.build_tunnel_url("wss://example.com", 443),
+            "wss://example.com/tunnel/ws",
         )
 
     def test_bare_host_with_non_default_port_includes_port(self):
@@ -363,7 +363,7 @@ class UrlBuilderTests(unittest.TestCase):
         for host in (
             "https://localhost:8443",
             "http://localhost:8080",
-            "wss://api.cyberdesk.io",
+            "wss://example.com",
             "ws://localhost:9000",
             "https://api.cyberdesk.io",
         ):
