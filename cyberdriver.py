@@ -1019,7 +1019,7 @@ def _build_relaunch_command(child_argv: List[str]) -> List[str]:
     return [sys.executable, os.path.abspath(__file__)] + child_argv
 
 
-def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Path) -> None:
+def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Path) -> int:
     """Relaunch Cyberdriver as a detached/background process on Windows.
 
     This ensures Cyberdriver keeps running even if the launching terminal window
@@ -1093,6 +1093,18 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
     config_dir = get_config_dir()
     config_dir.mkdir(parents=True, exist_ok=True)
     
+    child_pid_path = config_dir / "launch-hidden.pid"
+    try:
+        child_pid_path.unlink(missing_ok=True)  # type: ignore[arg-type]
+    except TypeError:
+        try:
+            if child_pid_path.exists():
+                child_pid_path.unlink()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
     # Build PowerShell script that sets env vars and launches cyberdriver hidden
     # We use Start-Process -WindowStyle Hidden for a truly hidden window
     ps_script_path = config_dir / "launch-hidden.ps1"
@@ -1104,6 +1116,8 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
     # Build argument string for Start-Process
     args_for_ps = subprocess.list2cmdline(exe_args)
     
+    child_pid_path_escaped = str(child_pid_path)
+
     ps_content = f'''# Use .NET ProcessStartInfo for explicit control over environment variables
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = "{exe_path}"
@@ -1120,7 +1134,11 @@ $psi.EnvironmentVariables.Remove("_PYI_PARENT_PROCESS_LEVEL")
 $psi.EnvironmentVariables["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
 
 # Start the process
-[System.Diagnostics.Process]::Start($psi) | Out-Null
+$child = [System.Diagnostics.Process]::Start($psi)
+if ($null -eq $child) {{
+    throw "Failed to start detached Cyberdriver child process."
+}}
+[System.IO.File]::WriteAllText("{child_pid_path_escaped}", [string]$child.Id)
 '''
     
     try:
@@ -1170,35 +1188,30 @@ WshShell.Run "powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{ps
         import time as _time
         _time.sleep(1.0)
         
-        # Check if the child process is running
-        # When frozen (PyInstaller), it's cyberdriver.exe; when running from source, it's python.exe
-        is_frozen = getattr(sys, "frozen", False)
-        expected_image = "cyberdriver.exe" if is_frozen else "python.exe"
-        
-        try:
-            check = subprocess.run(
-                ["tasklist", "/FI", f"IMAGENAME eq {expected_image}", "/FO", "CSV", "/NH"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                creationflags=CREATE_NO_WINDOW,
-            )
-            if expected_image.lower() not in check.stdout.lower():
-                # Child didn't start - check if log file has any errors
-                if stdio_log_path.exists():
-                    try:
-                        log_content = stdio_log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
-                        if log_content.strip():
-                            raise RuntimeError(f"Child process failed to stay running. Log:\n{log_content}")
-                    except Exception:
-                        pass
-                raise RuntimeError(f"Child process did not start ({expected_image} not found in tasklist)")
-        except subprocess.TimeoutExpired:
-            pass  # tasklist timed out, assume it's fine
-        except RuntimeError:
-            raise
-        except Exception:
-            pass  # Other errors checking, assume it's fine
+        child_pid = None
+        for _ in range(10):
+            try:
+                raw_child_pid = child_pid_path.read_text(encoding="utf-8").strip()
+                if raw_child_pid:
+                    child_pid = int(raw_child_pid)
+                    break
+            except Exception:
+                pass
+            _time.sleep(0.1)
+
+        if child_pid is None:
+            raise RuntimeError("Child process started but its PID could not be determined")
+
+        if not _pid_is_running(child_pid):
+            # Child didn't start - check if log file has any errors
+            if stdio_log_path.exists():
+                try:
+                    log_content = stdio_log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+                    if log_content.strip():
+                        raise RuntimeError(f"Child process failed to stay running. Log:\n{log_content}")
+                except Exception:
+                    pass
+            raise RuntimeError(f"Child process did not stay running (PID {child_pid})")
         
     except Exception as e:
         # Don't delete VBS on error so user can debug
@@ -1209,6 +1222,13 @@ WshShell.Run "powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{ps
         vbs_path.unlink(missing_ok=True)
     except Exception:
         pass
+
+    try:
+        child_pid_path.unlink(missing_ok=True)  # type: ignore[arg-type]
+    except Exception:
+        pass
+
+    return child_pid
 
 
 def _windows_try_enable_ansi() -> bool:
@@ -1410,7 +1430,7 @@ _CHILD_FATAL_FAILURE_MARKERS = (
 def _wait_for_child_connected(
     log_path: pathlib.Path,
     start_offset: int,
-    expected_image: str,
+    child_pid: int,
     timeout_seconds: float = 30.0,
 ) -> Tuple[str, str]:
     """Tail a detached child's log until we know whether it connected.
@@ -1420,8 +1440,7 @@ def _wait_for_child_connected(
         start_offset: Byte offset in the log at which the child began writing.
             Everything before this offset is pre-existing history that must be
             ignored so stale markers from a previous run don't trick us.
-        expected_image: Process image name we expect the child to run under
-            (e.g. "cyberdriver.exe" / "python.exe"). Used to detect a crash.
+        child_pid: PID of the detached child process. Used to detect a crash.
         timeout_seconds: How long to wait for the connected marker before
             giving up and returning "timeout".
 
@@ -1439,7 +1458,7 @@ def _wait_for_child_connected(
     seen_lines: List[str] = []
     last_failure_state: Optional[str] = None
     poll_interval = 0.15
-    # Re-check the child's process image every 1.5s to detect hard crashes.
+    # Re-check the child's PID every 1.5s to detect hard crashes.
     process_check_interval = 1.5
     last_process_check = 0.0
 
@@ -1516,16 +1535,7 @@ def _wait_for_child_connected(
                 last_process_check = now
                 if platform.system() == "Windows":
                     try:
-                        CREATE_NO_WINDOW = 0x08000000
-                        check = subprocess.run(
-                            ["tasklist", "/FI", f"IMAGENAME eq {expected_image}",
-                             "/FO", "CSV", "/NH"],
-                            capture_output=True,
-                            text=True,
-                            timeout=3,
-                            creationflags=CREATE_NO_WINDOW,
-                        )
-                        if expected_image.lower() not in (check.stdout or "").lower():
+                        if not _pid_is_running(child_pid):
                             return ("child_exited", "\n".join(seen_lines[-30:]))
                     except Exception:
                         pass
@@ -7275,12 +7285,7 @@ def main():
             except Exception:
                 start_offset = 0
 
-            _windows_relaunch_detached(child_argv, stdio_log_path)
-
-            # Determine which process image the child runs under so we can
-            # detect hard crashes while waiting.
-            is_frozen = getattr(sys, "frozen", False)
-            expected_image = "cyberdriver.exe" if is_frozen else "python.exe"
+            child_pid = _windows_relaunch_detached(child_argv, stdio_log_path)
 
             with _suppress_print_timestamps():
                 print("Waiting for Cyberdriver to connect to Cyberdesk Cloud...")
@@ -7289,7 +7294,7 @@ def main():
             state, excerpt = _wait_for_child_connected(
                 stdio_log_path,
                 start_offset=start_offset,
-                expected_image=expected_image,
+                child_pid=child_pid,
                 timeout_seconds=30.0,
             )
 
