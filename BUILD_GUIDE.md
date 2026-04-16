@@ -4,7 +4,7 @@ This guide walks you through creating a standalone executable from Cyberdriver.
 
 ## Prerequisites
 
-- Python 3.9 or later (on macOS, prefer using the system Python via `pyenv` or a venv)
+- Python 3.10 or later (required by `truststore`; 3.11+ recommended to match CI)
 - All dependencies installed (`pip install -r requirements.txt`)
 - PyInstaller (`pip install pyinstaller`)
 
