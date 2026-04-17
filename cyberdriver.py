@@ -2503,6 +2503,67 @@ def execute_xdo_sequence(sequence: str):
                 pyautogui.keyUp(event.key)
 
 
+def execute_xdo_sequence_state_change(sequence: str, down: bool):
+    """Press down or release the keys in a single XDO-style key group.
+
+    Unlike ``execute_xdo_sequence`` — which performs a full press-and-release
+    for each group — this sends only the key-down half (``down=True``) or only
+    the key-up half (``down=False``), leaving the OS in a "held" state in
+    between. This lets callers hold a modifier (or any key) across multiple
+    HTTP requests, e.g. press Shift down, take other actions, then release.
+
+    Press order follows the user's sequence, with modifiers first, then
+    regular keys (matching ``XDOParser`` convention so shortcuts register
+    correctly if the caller presses a combo). Release order is reversed.
+
+    Only a single key group is accepted; space-separated multi-group
+    sequences (e.g. ``"ctrl+c ctrl+v"``) are rejected because the
+    press/release semantics are ambiguous for multi-group holds.
+
+    Args:
+        sequence: XDO-style key group, e.g. ``'shift'``, ``'ctrl+shift'``,
+                  ``'a'``, ``'ctrl+c'``.
+        down: ``True`` to press and hold; ``False`` to release.
+
+    Raises:
+        ValueError: if the sequence parses to zero or multiple groups, or
+                    contains no valid keys.
+    """
+    command_groups = XDOParser.parse(sequence)
+
+    if len(command_groups) != 1:
+        raise ValueError(
+            f"'down' requires a single key group; got {len(command_groups)} "
+            f"in {sequence!r}"
+        )
+
+    events = command_groups[0]
+    if not events:
+        raise ValueError(f"No valid keys in sequence: {sequence!r}")
+
+    # XDOParser emits a full press-then-release for each group:
+    #   modifiers down (in order), keys down+up, modifiers up (reversed).
+    # Filtering by event.down gives us exactly the half we want, already in
+    # the right order (user order for presses, reversed for releases).
+    target_events = [event for event in events if event.down == down]
+    if not target_events:
+        raise ValueError(f"No keys to {'press' if down else 'release'} in sequence: {sequence!r}")
+
+    if platform.system() == "Windows":
+        try:
+            for event in target_events:
+                _press_key_with_scancode(event.key, key_up=not event.down)
+            return
+        except Exception as e:
+            print(f"Warning: SendInput failed ({e}), falling back to PyAutoGUI")
+
+    for event in target_events:
+        if event.down:
+            pyautogui.keyDown(event.key)
+        else:
+            pyautogui.keyUp(event.key)
+
+
 # -----------------------------------------------------------------------------
 # PyAutoGUI Configuration
 # -----------------------------------------------------------------------------
@@ -4187,13 +4248,38 @@ async def post_mouse_scroll(payload: Dict[str, Any]):
     return {}
 
 @app.post("/computer/input/keyboard/key")
-async def post_keyboard_key(payload: Dict[str, str]):
-    """Execute XDO-style key sequence (e.g., 'ctrl+c', 'alt+tab')."""
+async def post_keyboard_key(payload: Dict[str, Any]):
+    """Execute XDO-style key sequence (e.g., 'ctrl+c', 'alt+tab').
+
+    Payload:
+        - text (str, required): XDO-style key sequence.
+        - down (bool, optional): Controls press/release state.
+            * omitted / null -> full press-and-release (default)
+            * true           -> press keys down and leave them held
+            * false          -> release keys that are currently held
+
+        When 'down' is provided, 'text' must describe a single key group
+        (no space-separated multi-group sequences like 'ctrl+c ctrl+v').
+    """
     sequence = payload.get("text")
     if not sequence:
         raise HTTPException(status_code=400, detail="Missing 'text' field")
-    
-    execute_xdo_sequence(sequence)
+
+    down = payload.get("down")
+    if down is None:
+        execute_xdo_sequence(sequence)
+        return {}
+
+    if not isinstance(down, bool):
+        raise HTTPException(
+            status_code=400,
+            detail="'down' must be a boolean (true/false) or omitted",
+        )
+
+    try:
+        execute_xdo_sequence_state_change(sequence, down)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return {}
 
 

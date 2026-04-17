@@ -25,7 +25,7 @@ A comprehensive remote computer control tool with all major features for remote 
 
 #### Keyboard
 - `POST /computer/input/keyboard/type` - Type text string
-- `POST /computer/input/keyboard/key` - Execute XDO key sequence
+- `POST /computer/input/keyboard/key` - Execute XDO key sequence (optional `down`: `true`/`false` to hold/release a single key group, e.g. `{"text": "shift", "down": true}`)
 
 #### Mouse
 - `GET /computer/input/mouse/position` - Get current position
