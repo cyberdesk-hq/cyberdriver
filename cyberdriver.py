@@ -1116,7 +1116,7 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
     # Build argument string for Start-Process
     args_for_ps = subprocess.list2cmdline(exe_args)
     
-    child_pid_path_escaped = str(child_pid_path)
+    child_pid_path_escaped = str(child_pid_path).replace("'", "''")
 
     ps_content = f'''# Use .NET ProcessStartInfo for explicit control over environment variables
 $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -1138,7 +1138,7 @@ $child = [System.Diagnostics.Process]::Start($psi)
 if ($null -eq $child) {{
     throw "Failed to start detached Cyberdriver child process."
 }}
-[System.IO.File]::WriteAllText("{child_pid_path_escaped}", [string]$child.Id)
+[System.IO.File]::WriteAllText('{child_pid_path_escaped}', [string]$child.Id)
 '''
     
     try:
