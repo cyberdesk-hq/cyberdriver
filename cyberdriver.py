@@ -1544,8 +1544,6 @@ def _wait_for_child_connected(
 
         if last_failure_state == "tls_failed":
             return ("tls_failed", "\n".join(seen_lines[-30:]))
-        if last_failure_state == "unknown_error":
-            return ("unknown_error", "\n".join(seen_lines[-30:]))
         return ("timeout", "\n".join(seen_lines[-30:]))
     finally:
         try:
