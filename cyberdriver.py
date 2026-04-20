@@ -7465,10 +7465,11 @@ def main():
                         print("  " + "\n  ".join(excerpt.splitlines()[-12:]))
 
                     _print_founder_support_hint()
-                    print("")
-                    print(f"{bold}If the issue is transient, Cyberdriver will keep retrying on its own.{reset}")
-                    print(f"Stop it anytime with: {bold}cyberdriver stop{reset}")
-                    print("")
+                    if state in ("tls_failed", "timeout"):
+                        print("")
+                        print(f"{bold}If the issue is transient, Cyberdriver will keep retrying on its own.{reset}")
+                        print(f"Stop it anytime with: {bold}cyberdriver stop{reset}")
+                        print("")
 
             # Default UX: return immediately. If the user wants logs in this terminal,
             # they can opt-in with --tail.
