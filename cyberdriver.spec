@@ -10,15 +10,21 @@ datas = []
 binaries = []
 hiddenimports = []
 
-# Include certifi's CA bundle so TLS works on Windows machines missing root certs
-for package in ['fastapi', 'uvicorn', 'mss', 'certifi']:
+# Include certifi's CA bundle so TLS works on Windows machines missing root certs.
+# Include truststore so Python's ssl module bridges to the OS trust store
+# (macOS Keychain, Windows cert store, Linux system store) - lets users who
+# install a local CA via `mkcert -install` connect to https://localhost:8443
+# without setting SSL_CERT_FILE manually.
+for package in ['fastapi', 'uvicorn', 'mss', 'certifi', 'truststore']:
     tmp_datas, tmp_binaries, tmp_hiddens = collect_all(package)
     datas += tmp_datas
     binaries += tmp_binaries
     hiddenimports += tmp_hiddens
 
-# Bundle Amyuni virtual display driver files (Windows only, but harmless on other platforms)
-if os.path.exists('amyuni_driver'):
+# Bundle Amyuni virtual display driver files (Windows-only).
+# Skipped on macOS/Linux to keep the binary lean - the driver is a Windows .sys/.dll
+# blob that's never loaded on other OSes.
+if sys.platform == 'win32' and os.path.exists('amyuni_driver'):
     datas.append(('amyuni_driver', 'amyuni_driver'))
 
 # Add macOS-specific CoreGraphics framework if on Darwin

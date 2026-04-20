@@ -65,6 +65,22 @@ from enum import Enum
 from dataclasses import dataclass
 from io import BytesIO
 from contextlib import asynccontextmanager, contextmanager
+from urllib.parse import urlparse
+
+# Bridge Python's ssl module to the OS trust store (macOS Keychain, Windows cert
+# store, Linux system store). Without this, users who install a local CA via
+# `mkcert -install` still have to set SSL_CERT_FILE manually because Homebrew /
+# python.org Python ships with the Mozilla bundle (via certifi), not the OS
+# store. `truststore.inject_into_ssl()` is the standard fix for exactly this
+# problem and has zero downside in production.
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except Exception:
+    # truststore is optional at runtime: if the package is unavailable (e.g. an
+    # older build), we simply fall back to certifi+system defaults. Errors here
+    # must never prevent cyberdriver from starting.
+    pass
 
 import certifi
 import httpx
@@ -1003,7 +1019,7 @@ def _build_relaunch_command(child_argv: List[str]) -> List[str]:
     return [sys.executable, os.path.abspath(__file__)] + child_argv
 
 
-def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Path) -> None:
+def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Path) -> int:
     """Relaunch Cyberdriver as a detached/background process on Windows.
 
     This ensures Cyberdriver keeps running even if the launching terminal window
@@ -1077,6 +1093,18 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
     config_dir = get_config_dir()
     config_dir.mkdir(parents=True, exist_ok=True)
     
+    child_pid_path = config_dir / "launch-hidden.pid"
+    try:
+        child_pid_path.unlink(missing_ok=True)  # type: ignore[arg-type]
+    except TypeError:
+        try:
+            if child_pid_path.exists():
+                child_pid_path.unlink()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
     # Build PowerShell script that sets env vars and launches cyberdriver hidden
     # We use Start-Process -WindowStyle Hidden for a truly hidden window
     ps_script_path = config_dir / "launch-hidden.ps1"
@@ -1088,6 +1116,8 @@ def _windows_relaunch_detached(child_argv: List[str], stdio_log_path: pathlib.Pa
     # Build argument string for Start-Process
     args_for_ps = subprocess.list2cmdline(exe_args)
     
+    child_pid_path_escaped = str(child_pid_path).replace("'", "''")
+
     ps_content = f'''# Use .NET ProcessStartInfo for explicit control over environment variables
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = "{exe_path}"
@@ -1104,7 +1134,11 @@ $psi.EnvironmentVariables.Remove("_PYI_PARENT_PROCESS_LEVEL")
 $psi.EnvironmentVariables["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
 
 # Start the process
-[System.Diagnostics.Process]::Start($psi) | Out-Null
+$child = [System.Diagnostics.Process]::Start($psi)
+if ($null -eq $child) {{
+    throw "Failed to start detached Cyberdriver child process."
+}}
+[System.IO.File]::WriteAllText('{child_pid_path_escaped}', [string]$child.Id)
 '''
     
     try:
@@ -1154,35 +1188,30 @@ WshShell.Run "powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{ps
         import time as _time
         _time.sleep(1.0)
         
-        # Check if the child process is running
-        # When frozen (PyInstaller), it's cyberdriver.exe; when running from source, it's python.exe
-        is_frozen = getattr(sys, "frozen", False)
-        expected_image = "cyberdriver.exe" if is_frozen else "python.exe"
-        
-        try:
-            check = subprocess.run(
-                ["tasklist", "/FI", f"IMAGENAME eq {expected_image}", "/FO", "CSV", "/NH"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                creationflags=CREATE_NO_WINDOW,
-            )
-            if expected_image.lower() not in check.stdout.lower():
-                # Child didn't start - check if log file has any errors
-                if stdio_log_path.exists():
-                    try:
-                        log_content = stdio_log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
-                        if log_content.strip():
-                            raise RuntimeError(f"Child process failed to stay running. Log:\n{log_content}")
-                    except Exception:
-                        pass
-                raise RuntimeError(f"Child process did not start ({expected_image} not found in tasklist)")
-        except subprocess.TimeoutExpired:
-            pass  # tasklist timed out, assume it's fine
-        except RuntimeError:
-            raise
-        except Exception:
-            pass  # Other errors checking, assume it's fine
+        child_pid = None
+        for _ in range(10):
+            try:
+                raw_child_pid = child_pid_path.read_text(encoding="utf-8").strip()
+                if raw_child_pid:
+                    child_pid = int(raw_child_pid)
+                    break
+            except Exception:
+                pass
+            _time.sleep(0.1)
+
+        if child_pid is None:
+            raise RuntimeError("Child process started but its PID could not be determined")
+
+        if not _pid_is_running(child_pid):
+            # Child didn't start - check if log file has any errors
+            if stdio_log_path.exists():
+                try:
+                    log_content = stdio_log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+                    if log_content.strip():
+                        raise RuntimeError(f"Child process failed to stay running. Log:\n{log_content}")
+                except Exception:
+                    pass
+            raise RuntimeError(f"Child process did not stay running (PID {child_pid})")
         
     except Exception as e:
         # Don't delete VBS on error so user can debug
@@ -1193,6 +1222,13 @@ WshShell.Run "powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{ps
         vbs_path.unlink(missing_ok=True)
     except Exception:
         pass
+
+    try:
+        child_pid_path.unlink(missing_ok=True)  # type: ignore[arg-type]
+    except Exception:
+        pass
+
+    return child_pid
 
 
 def _windows_try_enable_ansi() -> bool:
@@ -1362,6 +1398,160 @@ def _print_prominent_stop_hint() -> None:
         print("(Optional): view logs with cyberdriver logs")
 
 
+def _print_founder_support_hint() -> None:
+    """Tell the user they can reach out to the Cyberdesk founders for help.
+
+    Used whenever we surface a connection error so nobody is left stuck.
+    """
+    if _should_use_color():
+        bold = "\033[1m"
+        reset = "\033[0m"
+        print(f"\n{bold}Still stuck? Reach out to the Cyberdesk founders - we'll help you unblock this immediately.{reset}")
+    else:
+        print("\nStill stuck? Reach out to the Cyberdesk founders - we'll help you unblock this immediately.")
+
+
+# Markers the detached child prints to its log file. The parent watches for
+# these to decide whether to show the success UI or surface an error.
+_CHILD_CONNECTED_MARKER = "Connected! Forwarding to"
+_CHILD_AUTH_FAILURE_MARKERS = (
+    "Authentication Failed",
+    "Invalid API Key",
+)
+_CHILD_TLS_FAILURE_MARKERS = (
+    "TLS/SSL Certificate Error Detected",
+)
+_CHILD_FATAL_FAILURE_MARKERS = (
+    "An unexpected error occurred",
+    "Failed to start background process",
+)
+
+
+def _wait_for_child_connected(
+    log_path: pathlib.Path,
+    start_offset: int,
+    child_pid: int,
+    timeout_seconds: float = 30.0,
+) -> Tuple[str, str]:
+    """Tail a detached child's log until we know whether it connected.
+
+    Args:
+        log_path: Path to the child's stdio log file.
+        start_offset: Byte offset in the log at which the child began writing.
+            Everything before this offset is pre-existing history that must be
+            ignored so stale markers from a previous run don't trick us.
+        child_pid: PID of the detached child process. Used to detect a crash.
+        timeout_seconds: How long to wait for the connected marker before
+            giving up and returning "timeout".
+
+    Returns:
+        (state, excerpt) where state is one of:
+            "connected"     - saw the connected marker (success)
+            "auth_failed"   - saw auth failure (terminal, child will exit)
+            "tls_failed"    - saw TLS error (may still retry, but worth warning)
+            "child_exited"  - child process died before we saw a marker
+            "unknown_error" - saw an unexpected error line
+            "timeout"       - nothing conclusive after `timeout_seconds`
+        `excerpt` is the tail of what the child printed, for the user to see.
+    """
+    deadline = time.time() + max(timeout_seconds, 1.0)
+    seen_lines: List[str] = []
+    last_failure_state: Optional[str] = None
+    poll_interval = 0.15
+    # Re-check the child's PID every 1.5s to detect hard crashes.
+    process_check_interval = 1.5
+    last_process_check = 0.0
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Open read-only; create-if-missing via touch so we can always open.
+    if not log_path.exists():
+        try:
+            log_path.touch()
+        except Exception:
+            pass
+
+    try:
+        f = open(log_path, "r", encoding="utf-8", errors="replace")
+    except Exception:
+        return ("timeout", "")
+
+    try:
+        # Start reading from where the child began writing. If the child (or
+        # our size-capped writer) truncated the log at startup, the current
+        # file may be smaller than our recorded offset - in that case we read
+        # from the new beginning.
+        try:
+            current_size = log_path.stat().st_size
+        except Exception:
+            current_size = 0
+        effective_start = start_offset if current_size >= start_offset else 0
+        try:
+            f.seek(effective_start, os.SEEK_SET)
+        except Exception:
+            f.seek(0, os.SEEK_END)
+
+        buffer = ""
+        while time.time() < deadline:
+            # Detect truncation mid-wait: if file shrank below our read head,
+            # re-open from the new top to avoid reading garbage / EOF forever.
+            try:
+                cur = log_path.stat().st_size
+                if f.tell() > cur:
+                    f.seek(0, os.SEEK_SET)
+                    buffer = ""
+            except Exception:
+                pass
+
+            chunk = f.read()
+            if chunk:
+                buffer += chunk
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    if not line.strip():
+                        continue
+                    seen_lines.append(line)
+                    # Keep the excerpt bounded so we don't hold megabytes in RAM.
+                    if len(seen_lines) > 200:
+                        seen_lines = seen_lines[-200:]
+
+                    if _CHILD_CONNECTED_MARKER in line:
+                        return ("connected", "\n".join(seen_lines[-20:]))
+
+                    for m in _CHILD_AUTH_FAILURE_MARKERS:
+                        if m in line:
+                            return ("auth_failed", "\n".join(seen_lines[-30:]))
+                    for m in _CHILD_TLS_FAILURE_MARKERS:
+                        if m in line:
+                            last_failure_state = "tls_failed"
+                    for m in _CHILD_FATAL_FAILURE_MARKERS:
+                        if m in line:
+                            return ("unknown_error", "\n".join(seen_lines[-30:]))
+
+            # Periodically verify the child process is still alive. If it died
+            # before connecting, we should stop waiting and surface the error.
+            now = time.time()
+            if now - last_process_check >= process_check_interval:
+                last_process_check = now
+                if platform.system() == "Windows":
+                    try:
+                        if not _pid_is_running(child_pid):
+                            return ("child_exited", "\n".join(seen_lines[-30:]))
+                    except Exception:
+                        pass
+
+            time.sleep(poll_interval)
+
+        if last_failure_state == "tls_failed":
+            return ("tls_failed", "\n".join(seen_lines[-30:]))
+        return ("timeout", "\n".join(seen_lines[-30:]))
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
+
+
 def _get_running_instance_pid_info() -> Optional[Dict[str, Any]]:
     """Return pidfile info if a running Cyberdriver instance is detected."""
     pid_path = get_pid_file_path()
@@ -1397,50 +1587,126 @@ def _get_running_instance_pid_info() -> Optional[Dict[str, Any]]:
     return info
 
 
+# -----------------------------------------------------------------------------
+# Host / URL parsing
+# -----------------------------------------------------------------------------
+
+# Map URL schemes a user might type on the CLI to the scheme we actually dial.
+_WS_SCHEME_MAP = {"http": "ws", "https": "wss", "ws": "ws", "wss": "wss"}
+_HTTP_SCHEME_MAP = {"http": "http", "https": "https", "ws": "http", "wss": "https"}
+
+
+def _parse_host(host: str):
+    """Parse a user-supplied host string, tolerating bare hostnames.
+
+    Accepts inputs like:
+        "api.cyberdesk.io"
+        "https://api.cyberdesk.io"
+        "https://localhost:8443"
+        "http://localhost:8080"
+        "ws://localhost:8080"
+    """
+    raw = host if "://" in host else f"https://{host}"
+    return urlparse(raw)
+
+
+def _is_default_port(scheme: str, port: Optional[int]) -> bool:
+    if port is None:
+        return True
+    if scheme in ("https", "wss") and port == 443:
+        return True
+    if scheme in ("http", "ws") and port == 80:
+        return True
+    return False
+
+
+def build_tunnel_url(host: str, port: Optional[int] = None) -> str:
+    """Build the WebSocket tunnel URL from a user-supplied host and optional port.
+
+    Scheme handling:
+        https:// or bare host  -> wss://   (TLS)
+        http://                -> ws://    (plain, no TLS)
+        ws:// / wss://         -> preserved
+
+    Port handling (in priority order):
+        1. Explicit port in the host URL (e.g. https://localhost:8443)
+        2. `port` argument (e.g. --port 443)
+        3. Scheme default (443 for wss/https, 80 for ws/http)
+
+    If the effective port matches the scheme default, it is omitted from the
+    output URL to keep it clean.
+
+    Examples:
+        build_tunnel_url("api.cyberdesk.io", 443)       -> wss://api.cyberdesk.io/tunnel/ws
+        build_tunnel_url("https://localhost:8443", 443) -> wss://localhost:8443/tunnel/ws
+        build_tunnel_url("http://localhost:8080", 443)  -> ws://localhost:8080/tunnel/ws
+        build_tunnel_url("api.cyberdesk.io", 8443)      -> wss://api.cyberdesk.io:8443/tunnel/ws
+    """
+    u = _parse_host(host)
+    scheme = _WS_SCHEME_MAP.get((u.scheme or "").lower(), "wss")
+    hostname = u.hostname or ""
+
+    effective_port: Optional[int]
+    if u.port is not None:
+        effective_port = u.port
+    else:
+        effective_port = port
+
+    if _is_default_port(scheme, effective_port):
+        netloc = hostname
+    else:
+        netloc = f"{hostname}:{effective_port}"
+
+    return f"{scheme}://{netloc}/tunnel/ws"
+
+
+def build_api_base_url(host: str, port: Optional[int] = None) -> str:
+    """Build the HTTP(S) base URL for API calls from a host string and optional port.
+
+    Mirrors `build_tunnel_url` but returns an http(s) URL with no path.
+    """
+    u = _parse_host(host)
+    scheme = _HTTP_SCHEME_MAP.get((u.scheme or "").lower(), "https")
+    hostname = u.hostname or ""
+
+    effective_port: Optional[int]
+    if u.port is not None:
+        effective_port = u.port
+    else:
+        effective_port = port
+
+    if _is_default_port(scheme, effective_port):
+        netloc = hostname
+    else:
+        netloc = f"{hostname}:{effective_port}"
+
+    return f"{scheme}://{netloc}"
+
+
 # Define websocket compatibility helper inline
 async def connect_with_headers(uri, headers_dict):
     """Compatibility wrapper for websocket connections with headers and keepalive settings.
-    
-    IMPORTANT: Creates a fresh SSL context for EVERY connection to avoid cached
-    session issues that can cause reconnection failures. This mimics what happens
-    when you Ctrl+C and restart the process.
-    
+
+    IMPORTANT: For wss:// URLs we build a fresh SSL context for EVERY connection
+    to avoid cached session issues that can cause reconnection failures. This
+    mimics what happens when you Ctrl+C and restart the process.
+
     SSL Certificate Strategy:
-    Uses system certificate store by default, which automatically includes:
-    - Corporate SSL inspection certificates (installed by IT)
-    - Standard root CAs on properly configured machines
-    
-    Additionally loads certifi's CA bundle as a fallback for Windows machines
-    that may be missing root certificates like Let's Encrypt's ISRG Root X1.
+    - `truststore.inject_into_ssl()` (called at module import) routes Python's
+      ssl module through the OS trust store (macOS Keychain, Windows cert store,
+      Linux system store). This means locally-trusted CAs installed via
+      `mkcert -install` work with zero extra configuration.
+    - certifi's bundle is additionally loaded as a fallback for machines that
+      are missing standard root CAs (e.g. Windows boxes missing Let's Encrypt's
+      ISRG Root X1).
+
+    For ws:// URLs (plain, no TLS) we skip SSL entirely so local dev over
+    http://localhost:8080 style hosts Just Works.
     """
     import ssl
-    
-    # Create a FRESH SSL context for every connection attempt
-    # This is critical - the default context caches SSL sessions, and if a session
-    # gets into a bad state (e.g., server closed unexpectedly), it can poison
-    # future connections. Creating a fresh context ensures we start clean.
-    #
-    # Strategy: Use system certs (handles corporate SSL inspection) and also
-    # load certifi's bundle as additional trusted CAs (handles missing root certs).
-    ssl_context = ssl.create_default_context()  # Starts with system certificate store
-    
-    # Additionally load certifi's CA bundle to handle Windows machines missing root certs
-    # This is additive - we keep system certs AND add certifi's certs
-    try:
-        ca_file = certifi.where()
-        if os.path.exists(ca_file):
-            ssl_context.load_verify_locations(cafile=ca_file)
-            try:
-                debug_logger.debug("SSL", f"Using system certs + certifi bundle: {ca_file}")
-            except Exception:
-                pass
-    except Exception as e:
-        # Certifi not available - that's okay, system certs should work for most cases
-        try:
-            debug_logger.debug("SSL", f"Using system certs only (certifi unavailable: {e})")
-        except Exception:
-            pass
-    
+
+    is_tls = uri.lower().startswith("wss://")
+
     # Common kwargs for robustness across proxies
     ws_kwargs = {
         # Send pings to keep NATs and proxies alive
@@ -1452,9 +1718,39 @@ async def connect_with_headers(uri, headers_dict):
         "max_queue": 32,
         # Faster close handshakes
         "close_timeout": 3,
-        # Use our fresh SSL context (this is the key fix!)
-        "ssl": ssl_context,
     }
+
+    if is_tls:
+        # Create a FRESH SSL context for every connection attempt
+        # This is critical - the default context caches SSL sessions, and if a session
+        # gets into a bad state (e.g., server closed unexpectedly), it can poison
+        # future connections. Creating a fresh context ensures we start clean.
+        #
+        # With truststore injected, `ssl.create_default_context()` already pulls from
+        # the OS trust store. We also additively load certifi's bundle for systems
+        # missing standard root CAs.
+        ssl_context = ssl.create_default_context()
+
+        try:
+            ca_file = certifi.where()
+            if os.path.exists(ca_file):
+                ssl_context.load_verify_locations(cafile=ca_file)
+                try:
+                    debug_logger.debug("SSL", f"Using OS trust store + certifi bundle: {ca_file}")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                debug_logger.debug("SSL", f"Using OS trust store only (certifi unavailable: {e})")
+            except Exception:
+                pass
+
+        ws_kwargs["ssl"] = ssl_context
+    else:
+        try:
+            debug_logger.debug("WEBSOCKET", f"Plain ws:// (no TLS) for {uri}")
+        except Exception:
+            pass
     
     debug_logger.debug("WEBSOCKET", f"Connecting to {uri}",
                        ping_interval=ws_kwargs['ping_interval'],
@@ -1489,7 +1785,7 @@ async def connect_with_headers(uri, headers_dict):
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
 PID_FILE = "cyberdriver.pid.json"
-VERSION = "0.0.42"
+VERSION = "0.0.43"
 
 @dataclass
 class Config:
@@ -2205,6 +2501,67 @@ def execute_xdo_sequence(sequence: str):
                 pyautogui.keyUp(event.key)
 
 
+def execute_xdo_sequence_state_change(sequence: str, down: bool):
+    """Press down or release the keys in a single XDO-style key group.
+
+    Unlike ``execute_xdo_sequence`` — which performs a full press-and-release
+    for each group — this sends only the key-down half (``down=True``) or only
+    the key-up half (``down=False``), leaving the OS in a "held" state in
+    between. This lets callers hold a modifier (or any key) across multiple
+    HTTP requests, e.g. press Shift down, take other actions, then release.
+
+    Press order follows the user's sequence, with modifiers first, then
+    regular keys (matching ``XDOParser`` convention so shortcuts register
+    correctly if the caller presses a combo). Release order is reversed.
+
+    Only a single key group is accepted; space-separated multi-group
+    sequences (e.g. ``"ctrl+c ctrl+v"``) are rejected because the
+    press/release semantics are ambiguous for multi-group holds.
+
+    Args:
+        sequence: XDO-style key group, e.g. ``'shift'``, ``'ctrl+shift'``,
+                  ``'a'``, ``'ctrl+c'``.
+        down: ``True`` to press and hold; ``False`` to release.
+
+    Raises:
+        ValueError: if the sequence parses to zero or multiple groups, or
+                    contains no valid keys.
+    """
+    command_groups = XDOParser.parse(sequence)
+
+    if len(command_groups) != 1:
+        raise ValueError(
+            f"'down' requires a single key group; got {len(command_groups)} "
+            f"in {sequence!r}"
+        )
+
+    events = command_groups[0]
+    if not events:
+        raise ValueError(f"No valid keys in sequence: {sequence!r}")
+
+    # XDOParser emits a full press-then-release for each group:
+    #   modifiers down (in order), keys down+up, modifiers up (reversed).
+    # Filtering by event.down gives us exactly the half we want, already in
+    # the right order (user order for presses, reversed for releases).
+    target_events = [event for event in events if event.down == down]
+    if not target_events:
+        raise ValueError(f"No keys to {'press' if down else 'release'} in sequence: {sequence!r}")
+
+    if platform.system() == "Windows":
+        try:
+            for event in target_events:
+                _press_key_with_scancode(event.key, key_up=not event.down)
+            return
+        except Exception as e:
+            print(f"Warning: SendInput failed ({e}), falling back to PyAutoGUI")
+
+    for event in target_events:
+        if event.down:
+            pyautogui.keyDown(event.key)
+        else:
+            pyautogui.keyUp(event.key)
+
+
 # -----------------------------------------------------------------------------
 # PyAutoGUI Configuration
 # -----------------------------------------------------------------------------
@@ -2811,10 +3168,16 @@ def _set_connection_info(host: str, port: int) -> None:
 
 
 def _get_api_base_url() -> Optional[str]:
-    """Get the API base URL if connection info is available."""
-    if _connection_info["host"] and _connection_info["port"]:
-        protocol = "https" if _connection_info["port"] == 443 else "http"
-        return f"{protocol}://{_connection_info['host']}"
+    """Get the API base URL if connection info is available.
+
+    Honors scheme/port embedded in the original --host value (e.g.
+    http://localhost:8080 -> http://localhost:8080) instead of blindly
+    assuming https.
+    """
+    host = _connection_info.get("host")
+    port = _connection_info.get("port")
+    if host and port:
+        return build_api_base_url(host, port)
     return None
 
 
@@ -3883,13 +4246,38 @@ async def post_mouse_scroll(payload: Dict[str, Any]):
     return {}
 
 @app.post("/computer/input/keyboard/key")
-async def post_keyboard_key(payload: Dict[str, str]):
-    """Execute XDO-style key sequence (e.g., 'ctrl+c', 'alt+tab')."""
+async def post_keyboard_key(payload: Dict[str, Any]):
+    """Execute XDO-style key sequence (e.g., 'ctrl+c', 'alt+tab').
+
+    Payload:
+        - text (str, required): XDO-style key sequence.
+        - down (bool, optional): Controls press/release state.
+            * omitted / null -> full press-and-release (default)
+            * true           -> press keys down and leave them held
+            * false          -> release keys that are currently held
+
+        When 'down' is provided, 'text' must describe a single key group
+        (no space-separated multi-group sequences like 'ctrl+c ctrl+v').
+    """
     sequence = payload.get("text")
     if not sequence:
         raise HTTPException(status_code=400, detail="Missing 'text' field")
-    
-    execute_xdo_sequence(sequence)
+
+    down = payload.get("down")
+    if down is None:
+        execute_xdo_sequence(sequence)
+        return {}
+
+    if not isinstance(down, bool):
+        raise HTTPException(
+            status_code=400,
+            detail="'down' must be a boolean (true/false) or omitted",
+        )
+
+    try:
+        execute_xdo_sequence_state_change(sequence, down)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return {}
 
 
@@ -4979,6 +5367,10 @@ class TunnelClient:
                     print("   1. Your API key is correct (from Cyberdesk dashboard)")
                     print("   2. The API key hasn't been revoked or regenerated")
                     print("   3. Your organization has access to this service")
+                    try:
+                        _print_founder_support_hint()
+                    except Exception:
+                        pass
                     print(f"\n{'='*60}\n")
                     # Exit instead of retrying
                     sys.exit(1)
@@ -5072,13 +5464,23 @@ class TunnelClient:
                     print("   → See: https://docs.cyberdesk.io/cyberdriver/quickstart#tls-certificate-errors")
                     print("\nOn Windows, run the PowerShell certificate installation script from the docs.")
                     print("On macOS/Linux, ensure your system's CA certificates are up to date.")
-                    
+                    print("If you installed a local CA via `mkcert -install`, Cyberdriver now")
+                    print("picks it up automatically from your OS trust store (Keychain / Cert Store).")
+                    try:
+                        _print_founder_support_hint()
+                    except Exception:
+                        pass
+
                 elif "unauthorized" in error_msg or "401" in error_msg or "403" in error_msg:
                     print("\n⚠️  Authentication Error")
                     print("\n❌ Invalid API Key")
                     print("\nPlease check:")
                     print("   1. Your API key is correct (from Cyberdesk dashboard)")
                     print("   2. The API key hasn't been regenerated recently")
+                    try:
+                        _print_founder_support_hint()
+                    except Exception:
+                        pass
                     # Exit for auth errors - don't retry
                     sys.exit(1)
                 
@@ -5098,6 +5500,10 @@ class TunnelClient:
                     print("   1. Check your API key: --secret YOUR_KEY")
                     print("   2. Install TLS certificates: https://github.com/cyberdesk-hq/cyberdriver#tls-certificate-errors")
                     print("   3. Check your internet connection")
+                    try:
+                        _print_founder_support_hint()
+                    except Exception:
+                        pass
                 
                 # Track failures for backoff exhaustion
                 connection_duration = time.time() - connection_start
@@ -5140,14 +5546,10 @@ class TunnelClient:
     
     async def _connect_and_run(self):
         """Connect to control server and handle messages."""
-        # Clean up host
-        host = self.host
-        for prefix in ['http://', 'https://']:
-            if host.startswith(prefix):
-                host = host[len(prefix):]
-        host = host.rstrip('/')
-        
-        uri = f"wss://{host}:{self.port}/tunnel/ws"
+        # Build the WebSocket URL from the user-supplied host/port. This honors
+        # explicit scheme+port in the host (e.g. http://localhost:8080 -> plain
+        # ws://) so local dev can skip TLS entirely.
+        uri = build_tunnel_url(self.host, self.port)
         
         # Prepare headers
         headers = {
@@ -6950,16 +7352,123 @@ def main():
             # Pass log file path to child (env vars don't work with VBScript launcher)
             child_argv.append(f"--_stdio-log={stdio_log_path}")
 
-            # Show the nice banner in the *current* terminal (this is not the detached child).
+            # Show the connecting banner in the *current* terminal (this is not
+            # the detached child). We intentionally do NOT claim "Cyberdriver is
+            # running / you can close PowerShell" yet - we have to wait until
+            # the detached child actually connects to Cyberdesk Cloud. If it
+            # fails (bad API key, TLS problems, network, etc.) we need to
+            # surface that instead of lying to the user.
             with _suppress_print_timestamps():
                 print_banner(mode="connecting")
-                print("Cyberdriver is now running in the background.")
-                print("You can close PowerShell.")
-                print(f"Logs: {stdio_log_path}")
-                _print_prominent_stop_hint()
-                print("(You can also end cyberdriver.exe in Task Manager.)")
-                print()
-            _windows_relaunch_detached(child_argv, stdio_log_path)
+
+            # Record the log's current size BEFORE the child launches so we can
+            # tail only the new output (and not be fooled by markers from a
+            # previous run).
+            try:
+                start_offset = stdio_log_path.stat().st_size if stdio_log_path.exists() else 0
+            except Exception:
+                start_offset = 0
+
+            child_pid = _windows_relaunch_detached(child_argv, stdio_log_path)
+
+            with _suppress_print_timestamps():
+                print("Waiting for Cyberdriver to connect to Cyberdesk Cloud...")
+                sys.stdout.flush()
+
+            state, excerpt = _wait_for_child_connected(
+                stdio_log_path,
+                start_offset=start_offset,
+                child_pid=child_pid,
+                timeout_seconds=30.0,
+            )
+
+            with _suppress_print_timestamps():
+                if state == "connected":
+                    if _should_use_color():
+                        green = "\033[92m"
+                        bold = "\033[1m"
+                        reset = "\033[0m"
+                        print(f"{green}{bold}[OK] Cyberdriver is connected to Cyberdesk Cloud.{reset}")
+                    else:
+                        print("[OK] Cyberdriver is connected to Cyberdesk Cloud.")
+                    print("Cyberdriver is now running in the background.")
+                    print("You can close PowerShell.")
+                    print(f"Logs: {stdio_log_path}")
+                    _print_prominent_stop_hint()
+                    print("(You can also end cyberdriver.exe in Task Manager.)")
+                    print()
+                else:
+                    # Failure path - make it loud and helpful.
+                    red = bold = reset = yellow = ""
+                    if _should_use_color():
+                        red = "\033[91m"
+                        yellow = "\033[93m"
+                        bold = "\033[1m"
+                        reset = "\033[0m"
+
+                    header = f"{red}{bold}[X] Cyberdriver failed to connect to Cyberdesk Cloud.{reset}"
+                    print("")
+                    print(header)
+                    print("")
+
+                    if state == "auth_failed":
+                        print(f"{bold}What went wrong:{reset} Authentication was rejected by Cyberdesk.")
+                        print("")
+                        print("Fix-it checklist:")
+                        print("  1. Double-check your --secret value - copy it fresh from the Cyberdesk dashboard.")
+                        print("  2. Make sure the API key hasn't been revoked or regenerated.")
+                        print("  3. Confirm your organization still has an active Cyberdesk subscription.")
+                    elif state == "tls_failed":
+                        print(f"{bold}What went wrong:{reset} A TLS/SSL certificate error prevented the connection.")
+                        print("")
+                        print("Fix-it checklist:")
+                        print("  1. If you're on a corporate network, ask IT about SSL inspection / a proxy CA.")
+                        print("  2. Update Windows: Settings > Windows Update > Check for updates (root CAs ship via Windows Update).")
+                        print("  3. See: https://docs.cyberdesk.io/cyberdriver/quickstart#tls-certificate-errors")
+                        print("  4. If you're connecting to a local dev server with a self-signed cert, run:")
+                        print("       mkcert -install")
+                        print("     (Cyberdriver will automatically trust the local CA from the OS cert store.)")
+                    elif state == "child_exited":
+                        print(f"{bold}What went wrong:{reset} The background Cyberdriver process exited before connecting.")
+                        print("")
+                        print("Fix-it checklist:")
+                        print("  1. Re-run with --foreground to see the error in this window:")
+                        print("       cyberdriver join --secret YOUR_KEY --foreground")
+                        print("  2. Check the log file shown below for the stack trace.")
+                        print("  3. Antivirus / Defender may have quarantined an extraction file - try running as Administrator.")
+                    elif state == "timeout":
+                        print(f"{yellow}{bold}What happened:{reset} No successful connection was observed within 30 seconds.")
+                        print("")
+                        print("Cyberdriver is still running in the background and will keep retrying, but")
+                        print("something is preventing the handshake. Try:")
+                        print("  1. Verify internet access and that api.cyberdesk.io is reachable.")
+                        print("  2. If you're on a corporate / VPN network, check firewall rules for outbound 443/TCP.")
+                        print("  3. Run in the foreground to see what's happening live:")
+                        print("       cyberdriver stop")
+                        print("       cyberdriver join --secret YOUR_KEY --foreground")
+                    else:  # unknown_error
+                        print(f"{bold}What went wrong:{reset} An unexpected error occurred while starting Cyberdriver.")
+                        print("")
+                        print("Fix-it checklist:")
+                        print("  1. Re-run with --foreground to see the full error in this window:")
+                        print("       cyberdriver stop")
+                        print("       cyberdriver join --secret YOUR_KEY --foreground")
+                        print("  2. Inspect the log file shown below.")
+
+                    print("")
+                    print(f"{bold}Log file:{reset} {stdio_log_path}")
+                    print(f"(Run {bold}cyberdriver logs{reset} to tail it, or open the file in your editor.)")
+
+                    if excerpt:
+                        print("")
+                        print(f"{bold}Last output from Cyberdriver:{reset}")
+                        print("  " + "\n  ".join(excerpt.splitlines()[-12:]))
+
+                    _print_founder_support_hint()
+                    print("")
+                    print(f"{bold}If the issue is transient, Cyberdriver will keep retrying on its own.{reset}")
+                    print(f"Stop it anytime with: {bold}cyberdriver stop{reset}")
+                    print("")
 
             # Default UX: return immediately. If the user wants logs in this terminal,
             # they can opt-in with --tail.
@@ -6970,6 +7479,11 @@ def main():
                 except Exception:
                     pass
                 _follow_log_file(stdio_log_path)
+
+            # Exit code: 0 for success/timeout (process still running), 1 for
+            # hard failures the user almost certainly needs to fix.
+            if state in ("auth_failed", "child_exited", "unknown_error"):
+                sys.exit(1)
             return
         except Exception as e:
             print(f"\nWarning: Failed to start background process: {e}")
