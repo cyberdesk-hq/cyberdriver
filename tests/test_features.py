@@ -125,6 +125,7 @@ def _load_run_join_namespace(temp_home: Path, record: Dict[str, Any]):
             keepalive_manager=None,
             remote_keepalive_for_main_id=None,
             internal_request_token=None,
+            machine_name=None,
         ):
             record.setdefault("tunnels", []).append(
                 {
@@ -136,6 +137,7 @@ def _load_run_join_namespace(temp_home: Path, record: Dict[str, Any]):
                     "keepalive_manager": keepalive_manager,
                     "remote_keepalive_for_main_id": remote_keepalive_for_main_id,
                     "internal_request_token": internal_request_token,
+                    "machine_name": machine_name,
                 }
             )
 
@@ -426,6 +428,7 @@ class JoinFlowTests(unittest.TestCase):
             record["tunnels"][0]["internal_request_token"],
             "generated-tunnel-token",
         )
+        self.assertIsNone(record["tunnels"][0]["machine_name"])
         self.assertEqual(
             namespace["app"].state.tunnel_internal_token,
             "generated-tunnel-token",

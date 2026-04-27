@@ -7624,7 +7624,7 @@ def main():
             sanitized_name = sanitize_machine_name(raw_name)
             if raw_name is not None and sanitized_name is None:
                 print(
-                    "Warning: --name value was empty or contained control characters; "
+                    "Warning: --name value was empty or contained non-ASCII/control characters; "
                     "ignoring. Cyberdesk will assign a default name."
                 )
             elif sanitized_name is not None:
