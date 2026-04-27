@@ -1793,7 +1793,7 @@ async def connect_with_headers(uri, headers_dict):
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
 PID_FILE = "cyberdriver.pid.json"
-VERSION = "0.0.43"
+VERSION = "0.0.44"
 
 @dataclass
 class Config:
