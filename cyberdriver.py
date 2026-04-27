@@ -86,7 +86,15 @@ import certifi
 import httpx
 import mss
 import numpy as np
-import pyautogui
+
+# pyautogui is lazy-imported (see _ensure_pyautogui below). On Linux it
+# transitively imports `mouseinfo`, which opens an Xlib `Display()` connection
+# at import time. In headless environments (CI, fresh containers, AMI bake
+# steps, `cyberdriver --help` on a freshly provisioned VM) that crashes before
+# argparse even runs - blocking basic CLI introspection. We only need
+# pyautogui for runtime commands (`join`, `coords`), so we defer the import to
+# those code paths. See CYB-207 / GH#50.
+pyautogui: Any = None  # populated by _ensure_pyautogui()
 import pyperclip
 from PIL import Image
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -2595,11 +2603,25 @@ def execute_xdo_sequence_state_change(sequence: str, down: bool):
 # PyAutoGUI Configuration
 # -----------------------------------------------------------------------------
 
-# Disable PyAutoGUI's default pause between commands for better performance
-pyautogui.PAUSE = 0
-# Disable fail-safe for virtual display environments (RustDesk, RDP, etc.)
-# where display changes can trigger false positives
-pyautogui.FAILSAFE = False
+def _ensure_pyautogui():
+    """Lazily import pyautogui and apply runtime config.
+
+    See the import-site comment for why this is deferred. Idempotent: safe to
+    call from multiple entry points (`run_join`, `run_coords_capture`). Raises
+    the underlying exception if the import fails so the caller surfaces a
+    clear startup error instead of a confusing AttributeError later.
+    """
+    global pyautogui
+    if pyautogui is not None:
+        return pyautogui
+    import pyautogui as _pa
+    # Disable PyAutoGUI's default pause between commands for better performance.
+    _pa.PAUSE = 0
+    # Disable fail-safe for virtual display environments (RustDesk, RDP, etc.)
+    # where display changes can trigger false positives.
+    _pa.FAILSAFE = False
+    pyautogui = _pa
+    return pyautogui
 
 
 def _get_env_float(name: str, default: float, minimum: float = 0.0) -> float:
@@ -6439,6 +6461,10 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
                    debug_enabled: bool = False,
                    machine_name: Optional[str] = None):
     """Run both API server and tunnel client."""
+    # Bring up pyautogui (see _ensure_pyautogui). On Linux this requires a
+    # working X display; failures here surface a real "no DISPLAY" error
+    # instead of an opaque AttributeError later in the request hot path.
+    _ensure_pyautogui()
     # Ensure default transfer directory exists for file operations during join.
     transfers_dir = pathlib.Path.home() / "CyberdeskTransfers"
     try:

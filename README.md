@@ -385,7 +385,7 @@ Press Esc when done. You can right-click multiple times to try different locatio
 By default, Cyberdesk auto-generates an internal id for each machine but leaves the display `name` blank. You can set a human-readable name at join time with `--name`:
 
 ```bash
-cyberdriver join --secret YOUR_API_KEY --name "beacon-vm-12"
+cyberdriver join --secret YOUR_API_KEY --name "your-vm-12"
 ```
 
 The name is sent to Cyberdesk as the `X-CYBERDRIVER-NAME` HTTP header on the WebSocket handshake and stored on the Machine row. Names must be printable ASCII, max 128 chars (no control characters or non-ASCII).
