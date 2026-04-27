@@ -1800,6 +1800,35 @@ class Config:
         return cls(version=data["version"], fingerprint=data["fingerprint"])
 
 
+# Maximum length for a user-supplied machine name. Kept well under any
+# reasonable HTTP header size limit so we don't risk WS handshake rejection.
+MACHINE_NAME_MAX_LEN = 128
+
+
+def sanitize_machine_name(raw: Optional[str]) -> Optional[str]:
+    """Validate and clean a user-supplied --name value before sending it as a header.
+
+    Returns the cleaned name, or None if the input is empty/unset/invalid. We
+    strip surrounding whitespace, restrict to printable ASCII (HTTP headers
+    travel as latin-1 in the WS handshake and some proxies/CDNs reject
+    non-ASCII), reject control characters (CR/LF would allow header injection),
+    and cap the length. Customers wanting fancier display names can rename the
+    machine from the Cyberdesk dashboard after registration.
+    """
+    if raw is None:
+        return None
+    name = raw.strip()
+    if not name:
+        return None
+    # Printable ASCII only (0x20 space through 0x7E tilde). This rejects CR/LF,
+    # tabs, NULs, and any unicode beyond ASCII.
+    if not all(0x20 <= ord(ch) <= 0x7E for ch in name):
+        return None
+    if len(name) > MACHINE_NAME_MAX_LEN:
+        name = name[:MACHINE_NAME_MAX_LEN]
+    return name
+
+
 def get_config_dir() -> pathlib.Path:
     """Get the configuration directory path."""
     if platform.system() == "Windows":
@@ -5190,7 +5219,7 @@ class TunnelClient:
     IDEMPOTENCY_CACHE_TTL = 60.0  # Seconds to keep cached responses
     IDEMPOTENCY_CACHE_MAX_SIZE = 1000  # Maximum number of cached responses
     
-    def __init__(self, host: str, port: int, secret: str, target_port: int, config: Config, keepalive_manager: Optional["KeepAliveManager"] = None, remote_keepalive_for_main_id: Optional[str] = None, internal_request_token: Optional[str] = None):
+    def __init__(self, host: str, port: int, secret: str, target_port: int, config: Config, keepalive_manager: Optional["KeepAliveManager"] = None, remote_keepalive_for_main_id: Optional[str] = None, internal_request_token: Optional[str] = None, machine_name: Optional[str] = None):
         self.host = host
         self.port = port
         self.secret = secret
@@ -5203,6 +5232,7 @@ class TunnelClient:
         self.keepalive_manager = keepalive_manager
         self.remote_keepalive_for_main_id = remote_keepalive_for_main_id
         self.internal_request_token = internal_request_token
+        self.machine_name = machine_name
         
         # Idempotency cache: key -> (timestamp, response)
         # Used to prevent duplicate execution of actions when retries occur
@@ -5559,6 +5589,11 @@ class TunnelClient:
         }
         if self.remote_keepalive_for_main_id:
             headers["X-Remote-Keepalive-For"] = self.remote_keepalive_for_main_id
+        # Customer-supplied machine name (--name). Cyberdesk uses this to populate
+        # the Machine.name column, letting customers correlate parallel-provisioned
+        # VMs to dashboard rows without relying on cyberdesk's auto-generated id.
+        if self.machine_name:
+            headers["X-CYBERDRIVER-NAME"] = self.machine_name
         
         # Use compatibility wrapper for connection
         self._connection_attempt += 1
@@ -6401,7 +6436,8 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
                    keepalive_click_x: Optional[int] = None, keepalive_click_y: Optional[int] = None,
                    black_screen_recovery_enabled: bool = False,
                    black_screen_check_interval: float = 30.0,
-                   debug_enabled: bool = False):
+                   debug_enabled: bool = False,
+                   machine_name: Optional[str] = None):
     """Run both API server and tunnel client."""
     # Ensure default transfer directory exists for file operations during join.
     transfers_dir = pathlib.Path.home() / "CyberdeskTransfers"
@@ -6515,6 +6551,7 @@ async def run_join(host: str, port: int, secret: str, target_port: int, keepaliv
             keepalive_manager=keepalive_manager if keepalive_enabled else None,
             remote_keepalive_for_main_id=register_as_keepalive_for,
             internal_request_token=tunnel_internal_token,
+            machine_name=machine_name,
         )
 
     async def start_tunnel():
@@ -7184,6 +7221,16 @@ def main():
     join_parser.add_argument("--add-persistent-display", action="store_true", help="Install and enable Amyuni virtual display driver for persistent display (Windows only, requires admin)")
     join_parser.add_argument("--interactive", action="store_true", help="Interactive CLI to Disable/Re-enable without exiting")
     join_parser.add_argument("--register-as-keepalive-for", type=str, default=None, help="Register this instance as the remote keepalive (host) for MAIN_MACHINE_ID")
+    join_parser.add_argument(
+        "--name",
+        type=str,
+        default=None,
+        help=(
+            "Human-readable name for this machine (e.g. \"beacon-vm-12\"). "
+            "Sent to Cyberdesk on connect via the X-CYBERDRIVER-NAME header. "
+            "Useful for identifying machines provisioned in parallel from the same image."
+        ),
+    )
     join_parser.add_argument("--debug", action="store_true", help="Enable debug logging to ~/.cyberdriver/logs/ (daily log files)")
     join_parser.add_argument("--experimental-space", action="store_true", help="Send space key via VK code instead of scan code (may fix issues with some apps like Cerner)")
     join_parser.add_argument(
@@ -7570,7 +7617,19 @@ def main():
                 global debug_logger
                 debug_logger = DebugLogger.initialize(enabled=True)
                 print(f"✓ Debug logging enabled. Logs will be written to: {debug_logger.log_dir}")
-            
+
+            # Sanitize and surface the user-supplied machine name (if any) so it's
+            # visible in startup logs alongside other join-time settings.
+            raw_name = getattr(args, "name", None)
+            sanitized_name = sanitize_machine_name(raw_name)
+            if raw_name is not None and sanitized_name is None:
+                print(
+                    "Warning: --name value was empty or contained control characters; "
+                    "ignoring. Cyberdesk will assign a default name."
+                )
+            elif sanitized_name is not None:
+                print(f"✓ Machine name: {sanitized_name}")
+
             asyncio.run(run_join(
                 args.host,
                 args.port,
@@ -7585,6 +7644,7 @@ def main():
                 black_screen_recovery_enabled=bool(getattr(args, "black_screen_recovery", False)),
                 black_screen_check_interval=float(getattr(args, "black_screen_check_interval", 30.0)),
                 debug_enabled=debug_enabled,
+                machine_name=sanitized_name,
             ))
     except KeyboardInterrupt:
         print("\n\nKeyboard interrupt received. Shutting down...")

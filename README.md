@@ -380,6 +380,32 @@ Use with keepalive:
 
 Press Esc when done. You can right-click multiple times to try different locations. Regular left-clicks work normally and won't be captured. On trackpad, use two-finger click/tap for right-click.
 
+## Naming Machines
+
+By default, Cyberdesk auto-generates an internal id for each machine but leaves the display `name` blank. You can set a human-readable name at join time with `--name`:
+
+```bash
+cyberdriver join --secret YOUR_API_KEY --name "beacon-vm-12"
+```
+
+The name is sent to Cyberdesk as the `X-CYBERDRIVER-NAME` HTTP header on the WebSocket handshake and stored on the Machine row. Names must be printable ASCII, max 128 chars (no control characters or non-ASCII).
+
+### Use case: parallel provisioning
+
+When you spin up many VMs at once from the same image (AMI, snapshot, golden VM, etc.), each cyberdriver generates its own random fingerprint, so machines are correctly distinct in the dashboard - but they all have `name: null` by default, which makes them indistinguishable to your provisioning code. Pass `--name` from your start script with a value your code already knows:
+
+```bash
+# Example: AWS user-data that names each VM after its instance id
+INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+cyberdriver join --secret "$API_KEY" --name "$INSTANCE_ID"
+```
+
+Then look up the machine via the Cyberdesk API by name. To make lookup deterministic, ensure the names you supply are unique within your organization (e.g. include a UUID, instance id, or batch+index).
+
+### Renaming later
+
+Names can also be changed from the Cyberdesk dashboard. If you want a stable handle for your own systems, store the Cyberdesk machine `id` after the first lookup and key your records on that.
+
 ## Configuration
 
 Configuration is stored in:
