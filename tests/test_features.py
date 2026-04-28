@@ -181,6 +181,7 @@ def _load_run_join_namespace(temp_home: Path, record: Dict[str, Any]):
         "KeepAliveManager": _KeepAliveManager,
         "BlackScreenRecoveryManager": _BlackScreenRecoveryManager,
         "TunnelClient": _TunnelClient,
+        "_ensure_pyautogui": lambda: None,
         "_set_connection_info": _fake_set_connection_info,
         "pathlib": types.SimpleNamespace(Path=_PathProxy),
         "print": lambda *args, **kwargs: None,
