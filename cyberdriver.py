@@ -1,6 +1,8 @@
 """
 Cyberdriver: A comprehensive remote computer control tool
 =========================================================
+Date: June 30, 2026
+
 This module provides a feature-complete implementation for remote computer control.
 It includes all features from the original Zig implementation:
 
@@ -1793,7 +1795,7 @@ async def connect_with_headers(uri, headers_dict):
 CONFIG_DIR = ".cyberdriver"
 CONFIG_FILE = "config.json"
 PID_FILE = "cyberdriver.pid.json"
-VERSION = "0.0.44"
+VERSION = "0.0.45"
 
 @dataclass
 class Config:
